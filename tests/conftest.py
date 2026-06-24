@@ -12,8 +12,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from devassist.devassist.config import Config  # noqa: E402
-from devassist.devassist.tools.base import ToolContext  # noqa: E402
+from devassist.config import Config  # noqa: E402
+from devassist.tools.base import ToolContext  # noqa: E402
 
 
 def resolve_access_key() -> str | None:

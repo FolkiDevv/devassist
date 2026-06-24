@@ -7,8 +7,6 @@
 
 from __future__ import annotations
 
-from typing import Optional
-
 from rich.box import HEAVY, ROUNDED
 from rich.console import Console as RichConsole
 from rich.console import Group
@@ -19,13 +17,13 @@ from rich.table import Table
 from rich.text import Text
 
 # ------------------------------- палитра ------------------------------- #
-BRAND = "#A78BFA"        # фиолетовый — бренд
-ACCENT = "#22D3EE"       # бирюзовый — акценты/пути
-OK = "#34D399"           # зелёный — успех
-WARN = "#FBBF24"         # жёлтый — предупреждение/подтверждение
-DANGER = "#F87171"       # красный — ошибки/опасность
-MUTED = "#7C7C8A"        # серый — второстепенное
-USER = "#93C5FD"         # голубой — пользователь
+BRAND = "#A78BFA"  # фиолетовый — бренд
+ACCENT = "#22D3EE"  # бирюзовый — акценты/пути
+OK = "#34D399"  # зелёный — успех
+WARN = "#FBBF24"  # жёлтый — предупреждение/подтверждение
+DANGER = "#F87171"  # красный — ошибки/опасность
+MUTED = "#7C7C8A"  # серый — второстепенное
+USER = "#93C5FD"  # голубой — пользователь
 
 ICON_TOOL = "●"
 ICON_OK = "✔"
@@ -96,8 +94,12 @@ class Console:
         )
         hint = Text("  ", style=MUTED)
         for i, (cmd, desc) in enumerate(
-            [("/help", "справка"), ("/model", "сменить модель"),
-             ("/clear", "сброс"), ("/exit", "выход")]
+            [
+                ("/help", "справка"),
+                ("/model", "сменить модель"),
+                ("/clear", "сброс"),
+                ("/exit", "выход"),
+            ]
         ):
             if i:
                 hint.append("   ", style=MUTED)
@@ -170,12 +172,15 @@ class Console:
             line.append(summary, style=DANGER)
         self._c.print(line)
 
-    def diff(self, diff_text: str, *, title: Optional[str] = None) -> None:
+    def diff(self, diff_text: str, *, title: str | None = None) -> None:
         if not diff_text.strip():
             return
         syntax = Syntax(
-            diff_text.rstrip(), "diff", theme="ansi_dark",
-            background_color="default", word_wrap=True,
+            diff_text.rstrip(),
+            "diff",
+            theme="ansi_dark",
+            background_color="default",
+            word_wrap=True,
         )
         self._c.print(
             Panel(
@@ -218,9 +223,7 @@ class Console:
     # -------------------------- подтверждения --------------------------- #
     def confirm(self, question: str, *, dangerous: bool = False) -> bool:
         if self._assume_yes:
-            self._c.print(
-                Text(f"  {ICON_ARROW} {question} → авто-подтверждено", style=MUTED)
-            )
+            self._c.print(Text(f"  {ICON_ARROW} {question} → авто-подтверждено", style=MUTED))
             return True
         color = DANGER if dangerous else WARN
         title = "⚠ ОПАСНАЯ ОПЕРАЦИЯ" if dangerous else "Подтверждение"

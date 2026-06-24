@@ -4,12 +4,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from devassist.devassist.agent.loop import Agent
-from devassist.devassist.agent.session import Session
-from devassist.devassist.config import Config
-from devassist.devassist.llm.base import LLMProvider
-from devassist.devassist.llm.types import AssistantTurn, FunctionCall, Message, ToolSpec
-from devassist.devassist.ui.console import Console
+from devassist.agent.loop import Agent
+from devassist.agent.session import Session
+from devassist.config import Config
+from devassist.llm.base import LLMProvider
+from devassist.llm.types import AssistantTurn, FunctionCall, Message
+from devassist.ui.console import Console
 
 
 class ScriptedProvider(LLMProvider):
@@ -35,7 +35,7 @@ class ScriptedProvider(LLMProvider):
 
 def _agent(provider, tmp_path: Path, **cfg_kw) -> Agent:
     cfg = Config(access_key="x", project_root=tmp_path, stream=False, **cfg_kw)
-    from devassist.devassist.tools.base import build_default_registry
+    from devassist.tools.base import build_default_registry
 
     ui = Console(no_color=True, assume_yes=True)
     return Agent(provider, build_default_registry(), cfg, ui, session=Session(tmp_path))
@@ -44,7 +44,8 @@ def _agent(provider, tmp_path: Path, **cfg_kw) -> Agent:
 def _tool_turn(name, args):
     return AssistantTurn(
         message=Message(
-            role="assistant", content="",
+            role="assistant",
+            content="",
             function_call=FunctionCall(name=name, arguments=args),
         ),
         finish_reason="function_call",
@@ -73,10 +74,12 @@ def test_loop_completes_on_text(tmp_path):
 
 def test_loop_runs_tool_then_finishes(tmp_path):
     (tmp_path / "f.txt").write_text("hello", encoding="utf-8")
-    provider = ScriptedProvider([
-        _tool_turn("read_file", {"path": "f.txt"}),
-        AssistantTurn(message=Message(role="assistant", content="прочитал")),
-    ])
+    provider = ScriptedProvider(
+        [
+            _tool_turn("read_file", {"path": "f.txt"}),
+            AssistantTurn(message=Message(role="assistant", content="прочитал")),
+        ]
+    )
     agent = _agent(provider, tmp_path)
     final = agent.run_turn("прочитай f.txt")
     assert final == "прочитал"

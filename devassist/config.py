@@ -15,7 +15,6 @@ import os
 import ssl
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Union
 
 # URL по умолчанию для каждой схемы авторизации.
 DEFAULT_OAUTH_URL = "https://gigachat.devices.sberbank.ru/api/v1"
@@ -57,9 +56,9 @@ class Config:
     #     Bearer-токен на auth_url, запросы идут с заголовком Authorization;
     #   * mTLS (внутренний контур): заданы cert+key -> клиентский сертификат
     #     предъявляется на TLS-уровне, токен и заголовок Authorization не нужны.
-    access_key: Optional[str] = None
-    cert: Optional[str] = None  # путь к клиентскому сертификату (mTLS, PEM)
-    key: Optional[str] = None  # путь к приватному ключу (mTLS)
+    access_key: str | None = None
+    cert: str | None = None  # путь к клиентскому сертификату (mTLS, PEM)
+    key: str | None = None  # путь к приватному ключу (mTLS)
     scope: str = "GIGACHAT_API_PERS"
     model: str = "GigaChat-3-Ultra"
     auth_url: str = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
@@ -79,11 +78,11 @@ class Config:
     def load(
         cls,
         *,
-        project_root: Optional[Path] = None,
-        model: Optional[str] = None,
+        project_root: Path | None = None,
+        model: str | None = None,
         auto_approve: bool = False,
         stream: bool = True,
-    ) -> "Config":
+    ) -> Config:
         root = Path(project_root or Path.cwd()).resolve()
         # .env ищем в корне проекта, затем в cwd
         for candidate in {root / ".env", Path.cwd() / ".env"}:
@@ -131,7 +130,7 @@ class Config:
             return "mtls"
         return "none"
 
-    def build_ssl_verify(self) -> Union[ssl.SSLContext, bool]:
+    def build_ssl_verify(self) -> ssl.SSLContext | bool:
         """Значение для httpx ``verify=``.
 
         Для mTLS строит SSL-контекст с клиентским сертификатом (cert+key); файлы

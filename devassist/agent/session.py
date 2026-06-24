@@ -7,12 +7,11 @@
 
 from __future__ import annotations
 
-from typing import List, Optional
-
-from devassist.devassist.agent.prompts import SYSTEM_PROMPT
-from devassist.devassist.context import build_project_context
-from devassist.devassist.llm.types import FunctionCall, Message
 from pathlib import Path
+
+from devassist.agent.prompts import SYSTEM_PROMPT
+from devassist.context import build_project_context
+from devassist.llm.types import Message
 
 
 class Session:
@@ -20,7 +19,7 @@ class Session:
         context = build_project_context(project_root)
         system = f"{SYSTEM_PROMPT}\n\n=== КОНТЕКСТ ПРОЕКТА ===\n{context}"
         self._system = Message(role="system", content=system)
-        self._history: List[Message] = []
+        self._history: list[Message] = []
         self._max_messages = max_messages
 
     # ------------------------------------------------------------------ #
@@ -34,7 +33,7 @@ class Session:
         self._history.append(Message(role="function", name=name, content=content))
 
     # ------------------------------------------------------------------ #
-    def messages(self) -> List[Message]:
+    def messages(self) -> list[Message]:
         """Сообщения для отправки модели (системный + усечённая история)."""
         history = self._history
         if len(history) > self._max_messages:

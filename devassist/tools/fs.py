@@ -6,12 +6,11 @@ import difflib
 import fnmatch
 import re
 from pathlib import Path
-from typing import List, Optional, Tuple
 
 from pydantic import BaseModel, Field
 
-from devassist.devassist.security import RiskLevel, resolve_in_root
-from devassist.devassist.tools.base import Tool, ToolContext, ToolError, ToolResult
+from devassist.security import RiskLevel, resolve_in_root
+from devassist.tools.base import Tool, ToolContext, ToolError, ToolResult
 
 MAX_READ_BYTES = 400_000
 
@@ -59,16 +58,16 @@ def _strip_line_numbers(s: str) -> str:
     чтобы фрагмент совпал с реальным файлом.
     """
     lines = s.split("\n")
-    nonempty = [l for l in lines if l.strip()]
+    nonempty = [ln for ln in lines if ln.strip()]
     if not nonempty:
         return s
-    marked = sum(1 for l in nonempty if _LINE_NUM_RE.match(l))
+    marked = sum(1 for ln in nonempty if _LINE_NUM_RE.match(ln))
     if marked < max(2, 0.6 * len(nonempty)):
         return s
-    return "\n".join(_LINE_NUM_RE.sub("", l) for l in lines)
+    return "\n".join(_LINE_NUM_RE.sub("", ln) for ln in lines)
 
 
-def repair_escaped_content(content: str) -> Tuple[str, bool]:
+def repair_escaped_content(content: str) -> tuple[str, bool]:
     """Чинит «двойную экранизацию», которую иногда выдаёт модель.
 
     Слабые модели порой кладут в write_file одну физическую строку, где все
@@ -89,9 +88,9 @@ def repair_escaped_content(content: str) -> Tuple[str, bool]:
             .replace("\\\\", "\\")
         )
         lines = fixed.split("\n")
-        nonempty = [l for l in lines if l.strip()]
-        if nonempty and all(re.match(r"^\d+\t", l) for l in nonempty):
-            lines = [re.sub(r"^\d+\t", "", l) for l in lines]
+        nonempty = [ln for ln in lines if ln.strip()]
+        if nonempty and all(re.match(r"^\d+\t", ln) for ln in nonempty):
+            lines = [re.sub(r"^\d+\t", "", ln) for ln in lines]
             fixed = "\n".join(lines)
         return fixed, True
     return content, False
@@ -102,7 +101,7 @@ def _numbered_excerpt(text: str, max_lines: int = 60) -> str:
     lines = text.splitlines()
     shown = lines[:max_lines]
     width = len(str(len(shown)))
-    body = "\n".join(f"{str(i + 1).rjust(width)}\t{l}" for i, l in enumerate(shown))
+    body = "\n".join(f"{str(i + 1).rjust(width)}\t{ln}" for i, ln in enumerate(shown))
     if len(lines) > max_lines:
         body += f"\n… (ещё {len(lines) - max_lines} строк)"
     return body
@@ -137,7 +136,7 @@ def _tolerant_find(text: str, pattern: str):
     # От более строгой нормализации (только хвостовые пробелы) к более мягкой
     # (полный strip — игнор отступов). Берём первый режим с уникальным совпадением.
     for norm in (lambda s: s.rstrip(), lambda s: s.strip()):
-        target = [norm(l) for l in pat_lines]
+        target = [norm(ln) for ln in pat_lines]
         hits = [
             i
             for i in range(len(contents) - n + 1)
@@ -156,10 +155,10 @@ def _tolerant_find(text: str, pattern: str):
 # --------------------------------------------------------------------------- #
 class ReadFileParams(BaseModel):
     path: str = Field(description="Путь к файлу относительно корня проекта")
-    start_line: Optional[int] = Field(
+    start_line: int | None = Field(
         default=None, description="Начальная строка (1-индексация), включительно"
     )
-    end_line: Optional[int] = Field(
+    end_line: int | None = Field(
         default=None, description="Конечная строка (1-индексация), включительно"
     )
 
@@ -185,8 +184,8 @@ class ReadFileTool(Tool):
             )
         try:
             text = p.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            raise ToolError(f"Файл не является текстовым (UTF-8): {params.path}")
+        except UnicodeDecodeError as e:
+            raise ToolError(f"Файл не является текстовым (UTF-8): {params.path}") from e
 
         lines = text.splitlines()
         start = (params.start_line or 1) - 1
@@ -233,7 +232,7 @@ class WriteFileTool(Tool):
                 return ""
         return ""
 
-    def preview(self, params: WriteFileParams, ctx: ToolContext) -> Optional[str]:
+    def preview(self, params: WriteFileParams, ctx: ToolContext) -> str | None:
         old = self._old_content(ctx, params)
         content, _ = repair_escaped_content(params.content)
         return make_diff(old, content, params.path) or "(новый пустой файл)"
@@ -266,9 +265,7 @@ class EditFileParams(BaseModel):
         description="Точный фрагмент, который нужно заменить (должен встречаться)"
     )
     new_string: str = Field(description="Текст замены")
-    replace_all: bool = Field(
-        default=False, description="Заменить все вхождения, а не только одно"
-    )
+    replace_all: bool = Field(default=False, description="Заменить все вхождения, а не только одно")
 
 
 class EditFileTool(Tool):
@@ -291,8 +288,8 @@ class EditFileTool(Tool):
             raise ToolError(f"Файл не найден: {params.path}")
         try:
             old = p.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            raise ToolError(f"Файл не текстовый: {params.path}")
+        except UnicodeDecodeError as e:
+            raise ToolError(f"Файл не текстовый: {params.path}") from e
         if params.old_string == params.new_string:
             raise ToolError("old_string и new_string совпадают — нечего менять.")
 
@@ -305,10 +302,10 @@ class EditFileTool(Tool):
             return _strip_line_numbers(_unescape_simple(s))
 
         transforms = [
-            lambda s: s,                # как прислано
-            _unescape_simple,           # снять экранизацию \n/\"
-            _strip_line_numbers,        # снять префиксы номеров строк
-            both,                       # и то, и другое
+            lambda s: s,  # как прислано
+            _unescape_simple,  # снять экранизацию \n/\"
+            _strip_line_numbers,  # снять префиксы номеров строк
+            both,  # и то, и другое
         ]
 
         seen = set()
@@ -339,11 +336,10 @@ class EditFileTool(Tool):
         # Не найдено — даём модели контекст файла, чтобы скопировать точно.
         raise ToolError(
             "old_string не найден в файле (ни точно, ни с поправкой на пробелы). "
-            "Скопируйте фрагмент дословно из содержимого ниже:\n\n"
-            + _numbered_excerpt(old)
+            "Скопируйте фрагмент дословно из содержимого ниже:\n\n" + _numbered_excerpt(old)
         )
 
-    def preview(self, params: EditFileParams, ctx: ToolContext) -> Optional[str]:
+    def preview(self, params: EditFileParams, ctx: ToolContext) -> str | None:
         _, old, new, _ = self._compute(params, ctx)
         return make_diff(old, new, params.path)
 
@@ -374,27 +370,21 @@ class ListDirTool(Tool):
         p = resolve_in_root(ctx.root, params.path)
         if not p.is_dir():
             raise ToolError(f"Не директория: {params.path}")
-        entries = sorted(
-            p.iterdir(), key=lambda e: (e.is_file(), e.name.lower())
-        )
+        entries = sorted(p.iterdir(), key=lambda e: (e.is_file(), e.name.lower()))
         lines = []
         for e in entries:
             if e.name.startswith(".") and e.name not in (".env.example",):
                 continue
             lines.append(f"{e.name}/" if e.is_dir() else e.name)
         body = "\n".join(lines) if lines else "(пусто)"
-        return ToolResult(
-            content=body, summary=f"{_rel(ctx, p)}: {len(lines)} элементов"
-        )
+        return ToolResult(content=body, summary=f"{_rel(ctx, p)}: {len(lines)} элементов")
 
 
 # --------------------------------------------------------------------------- #
 # find_files
 # --------------------------------------------------------------------------- #
 class FindFilesParams(BaseModel):
-    pattern: str = Field(
-        description="Glob-шаблон имени, например '*.py' или 'src/**/*.ts'"
-    )
+    pattern: str = Field(description="Glob-шаблон имени, например '*.py' или 'src/**/*.ts'")
     max_results: int = Field(default=200, description="Максимум результатов")
 
 
@@ -411,7 +401,7 @@ class FindFilesTool(Tool):
 
     def run(self, params: FindFilesParams, ctx: ToolContext) -> ToolResult:
         root = ctx.root
-        results: List[str] = []
+        results: list[str] = []
         # Поддержка как 'glob' от корня, так и простого имени-шаблона рекурсивно.
         pattern = params.pattern
         candidates = root.rglob("*") if "/" not in pattern else root.glob(pattern)

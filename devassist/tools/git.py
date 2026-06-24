@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import subprocess
-from typing import List, Optional
 
 from pydantic import BaseModel, Field
 
-from devassist.devassist.security import RiskLevel
-from devassist.devassist.tools.base import Tool, ToolContext, ToolError, ToolResult
+from devassist.security import RiskLevel
+from devassist.tools.base import Tool, ToolContext, ToolError, ToolResult
 
 # Разрешённые подкоманды. Деструктивные (reset --hard, clean, push --force)
 # намеренно не входят — их при необходимости вызывают через run_shell с
@@ -24,7 +23,7 @@ class GitParams(BaseModel):
             "checkout, switch, restore, stash"
         )
     )
-    args: List[str] = Field(
+    args: list[str] = Field(
         default_factory=list,
         description="Дополнительные аргументы, например ['-m', 'сообщение'] для commit",
     )
@@ -46,11 +45,10 @@ class GitTool(Tool):
         sub = params.subcommand
         if sub not in _READ_ONLY and sub not in _WRITE:
             raise ToolError(
-                f"Подкоманда git '{sub}' не разрешена. Доступно: "
-                f"{sorted(_READ_ONLY | _WRITE)}."
+                f"Подкоманда git '{sub}' не разрешена. Доступно: {sorted(_READ_ONLY | _WRITE)}."
             )
 
-    def preview(self, params: GitParams, ctx: ToolContext) -> Optional[str]:
+    def preview(self, params: GitParams, ctx: ToolContext) -> str | None:
         if self.risk(params, ctx) >= RiskLevel.WRITE:
             return f"$ git {params.subcommand} {' '.join(params.args)}"
         return None
@@ -65,14 +63,12 @@ class GitTool(Tool):
             proc = subprocess.run(
                 cmd, cwd=str(ctx.root), capture_output=True, text=True, timeout=60
             )
-        except FileNotFoundError:
-            raise ToolError("git не установлен или недоступен в PATH.")
+        except FileNotFoundError as e:
+            raise ToolError("git не установлен или недоступен в PATH.") from e
         except subprocess.TimeoutExpired:
             return ToolResult(content="git: таймаут", ok=False, summary="git таймаут")
 
-        out = (proc.stdout or "") + (
-            ("\n[stderr]\n" + proc.stderr) if proc.stderr else ""
-        )
+        out = (proc.stdout or "") + (("\n[stderr]\n" + proc.stderr) if proc.stderr else "")
         out = out.strip() or "(нет вывода)"
         if len(out) > 30_000:
             out = out[:30_000] + "\n...(обрезано)"

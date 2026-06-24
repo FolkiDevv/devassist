@@ -7,9 +7,9 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Callable, List, Optional, Sequence
+from collections.abc import Callable, Sequence
 
-from devassist.devassist.llm.types import AssistantTurn, Message, ToolSpec
+from devassist.llm.types import AssistantTurn, Message, ToolSpec
 
 
 class LLMProvider(ABC):
@@ -24,7 +24,7 @@ class LLMProvider(ABC):
     def complete(
         self,
         messages: Sequence[Message],
-        tools: Optional[Sequence[ToolSpec]] = None,
+        tools: Sequence[ToolSpec] | None = None,
         *,
         temperature: float = 0.2,
     ) -> AssistantTurn:
@@ -37,10 +37,10 @@ class LLMProvider(ABC):
     def stream(
         self,
         messages: Sequence[Message],
-        tools: Optional[Sequence[ToolSpec]] = None,
+        tools: Sequence[ToolSpec] | None = None,
         *,
         temperature: float = 0.2,
-        on_delta: Optional[Callable[[str], None]] = None,
+        on_delta: Callable[[str], None] | None = None,
     ) -> AssistantTurn:
         """Потоковая версия complete().
 

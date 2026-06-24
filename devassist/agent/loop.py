@@ -9,16 +9,18 @@
 
 from __future__ import annotations
 
-from typing import Optional
-
-from devassist.devassist.agent.session import Session
-from devassist.devassist.config import Config
-from devassist.devassist.llm.base import LLMProvider
-from devassist.devassist.llm.types import Message
-from devassist.devassist.security import RiskLevel
-from devassist.devassist.tools.base import ToolContext, ToolError, ToolResult
-from devassist.devassist.tools.base import ToolRegistry  # type: ignore
-from devassist.devassist.ui.console import Console
+from devassist.agent.session import Session
+from devassist.config import Config
+from devassist.llm.base import LLMProvider
+from devassist.llm.types import Message
+from devassist.security import RiskLevel
+from devassist.tools.base import (
+    ToolContext,
+    ToolError,
+    ToolRegistry,  # type: ignore
+    ToolResult,
+)
+from devassist.ui.console import Console
 
 
 class Agent:
@@ -28,7 +30,7 @@ class Agent:
         registry: ToolRegistry,
         config: Config,
         ui: Console,
-        session: Optional[Session] = None,
+        session: Session | None = None,
     ):
         self._provider = provider
         self._registry = registry
@@ -52,7 +54,7 @@ class Agent:
         total_tokens = 0
         consecutive_failures = 0
 
-        for step in range(self._cfg.max_steps):
+        for _step in range(self._cfg.max_steps):
             steps += 1
             turn = self._next_turn(specs)
             msg = turn.message
@@ -124,9 +126,7 @@ class Agent:
 
         if tool is None:
             self._ui.tool_call(name, "(неизвестный инструмент)")
-            self._session.add_function_result(
-                name, f"ОШИБКА: инструмент '{name}' не существует."
-            )
+            self._session.add_function_result(name, f"ОШИБКА: инструмент '{name}' не существует.")
             return False
 
         # 1) Валидация параметров
@@ -134,9 +134,7 @@ class Agent:
             params = tool.parse(raw_args)
         except Exception as e:  # ошибка схемы — возвращаем модели
             self._ui.tool_call(name, "(неверные аргументы)")
-            self._session.add_function_result(
-                name, f"ОШИБКА валидации аргументов: {e}"
-            )
+            self._session.add_function_result(name, f"ОШИБКА валидации аргументов: {e}")
             return False
 
         # 2) Краткая сводка вызова
@@ -159,9 +157,7 @@ class Agent:
                     self._ui.output_block(preview)
             dangerous = risk >= RiskLevel.DANGEROUS
             question = (
-                f"Выполнить опасную операцию '{name}'?"
-                if dangerous
-                else f"Применить '{name}'?"
+                f"Выполнить опасную операцию '{name}'?" if dangerous else f"Применить '{name}'?"
             )
             if not self._ui.confirm(question, dangerous=dangerous):
                 self._ui.tool_result("отклонено пользователем", ok=False)
@@ -195,8 +191,14 @@ class Agent:
             if self._cfg.auto_approve:
                 title = getattr(params, "path", None) or "изменения"
                 self._ui.diff(result.display, title=str(title))
-        elif result.display and name in ("run_shell", "git", "search_content",
-                                         "read_file", "list_dir", "find_files"):
+        elif result.display and name in (
+            "run_shell",
+            "git",
+            "search_content",
+            "read_file",
+            "list_dir",
+            "find_files",
+        ):
             self._ui.output_block(result.display[:2000], title=self._output_title(name, params))
 
         self._session.add_function_result(name, result.as_function_content())
@@ -206,15 +208,15 @@ class Agent:
     def _output_title(name: str, params) -> str:
         d = params.model_dump()
         if name == "run_shell":
-            return f"$ {str(d.get('command',''))[:60]}"
+            return f"$ {str(d.get('command', ''))[:60]}"
         if name == "git":
-            return f"git {d.get('subcommand','')}"
+            return f"git {d.get('subcommand', '')}"
         if name == "search_content":
-            return f"поиск: /{d.get('pattern','')}/"
+            return f"поиск: /{d.get('pattern', '')}/"
         if name in ("read_file", "list_dir"):
             return str(d.get("path", ""))
         if name == "find_files":
-            return f"файлы: {d.get('pattern','')}"
+            return f"файлы: {d.get('pattern', '')}"
         return "вывод"
 
     # ------------------------------------------------------------------ #

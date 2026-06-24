@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from devassist.devassist.cli import is_repl_command
+from devassist.cli import is_repl_command
 
 
 @pytest.mark.parametrize(
@@ -18,10 +18,10 @@ def test_recognised_commands(line):
 @pytest.mark.parametrize(
     "line",
     [
-        "/home/kestrel/repos/devassist",   # абсолютный путь — НЕ команда
+        "/home/kestrel/repos/devassist",  # абсолютный путь — НЕ команда
         "/usr/bin/python3 запусти это",
-        "/",                                 # просто слеш
-        "проанализируй /home/kestrel/x",     # путь внутри запроса
+        "/",  # просто слеш
+        "проанализируй /home/kestrel/x",  # путь внутри запроса
         "посмотри код",
         "",
     ],

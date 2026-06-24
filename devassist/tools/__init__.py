@@ -1,6 +1,6 @@
 """Инструменты агента и их реестр."""
 
-from devassist.devassist.tools.base import (
+from devassist.tools.base import (
     Tool,
     ToolContext,
     ToolError,

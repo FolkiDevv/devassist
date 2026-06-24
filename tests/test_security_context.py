@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from devassist.devassist.context import build_file_tree, build_project_context, read_memory
-from devassist.devassist.security import (
+from devassist.context import build_file_tree, build_project_context, read_memory
+from devassist.security import (
     RiskLevel,
     SandboxError,
     classify_shell_command,

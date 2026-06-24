@@ -19,13 +19,14 @@ from __future__ import annotations
 import json
 import time
 import uuid
-from typing import Any, Callable, Dict, List, Optional, Sequence
+from collections.abc import Callable, Sequence
+from typing import Any
 
 import httpx
 
-from devassist.devassist.config import Config
-from devassist.devassist.llm.base import LLMProvider
-from devassist.devassist.llm.types import AssistantTurn, FunctionCall, Message, ToolSpec
+from devassist.config import Config
+from devassist.llm.base import LLMProvider
+from devassist.llm.types import AssistantTurn, FunctionCall, Message, ToolSpec
 
 
 class GigaChatError(RuntimeError):
@@ -54,7 +55,7 @@ class GigaChatProvider(LLMProvider):
         # в режиме OAuth — булев флаг проверки серверного сертификата.
         self._client = httpx.Client(verify=config.build_ssl_verify(), timeout=config.timeout)
         self._mtls = config.auth_mode == "mtls"
-        self._token: Optional[str] = None
+        self._token: str | None = None
         self._token_exp: float = 0.0  # unix-время истечения токена
         self._max_retries = 5  # повторы при транзиентных сбоях (сеть/429/5xx)
 
@@ -65,7 +66,7 @@ class GigaChatProvider(LLMProvider):
     def close(self) -> None:
         self._client.close()
 
-    def __enter__(self) -> "GigaChatProvider":
+    def __enter__(self) -> GigaChatProvider:
         return self
 
     def __exit__(self, *exc: Any) -> None:
@@ -74,9 +75,7 @@ class GigaChatProvider(LLMProvider):
     # ------------------------------------------------------------------ #
     # Сетевой слой с повторами
     # ------------------------------------------------------------------ #
-    def _request_with_retry(
-        self, do_request: Callable[[], httpx.Response]
-    ) -> httpx.Response:
+    def _request_with_retry(self, do_request: Callable[[], httpx.Response]) -> httpx.Response:
         """Выполняет HTTP-запрос, повторяя транзиентные сбои.
 
         Повторяем (с экспоненциальной задержкой):
@@ -86,7 +85,7 @@ class GigaChatProvider(LLMProvider):
         вызывающая сторона.
         """
         delay = 1.0
-        last_exc: Optional[Exception] = None
+        last_exc: Exception | None = None
         for attempt in range(self._max_retries):
             try:
                 resp = do_request()
@@ -154,7 +153,7 @@ class GigaChatProvider(LLMProvider):
         self._token_exp = (exp_ms / 1000.0) if exp_ms else (time.time() + 25 * 60)
         return self._token
 
-    def _auth_headers(self, *, force: bool = False) -> Dict[str, str]:
+    def _auth_headers(self, *, force: bool = False) -> dict[str, str]:
         """Заголовок авторизации для текущей схемы.
 
         В режиме mTLS — пустой словарь (клиента авторизует сертификат на
@@ -180,11 +179,11 @@ class GigaChatProvider(LLMProvider):
             return json.dumps({"result": text}, ensure_ascii=False)
 
     @classmethod
-    def _message_to_payload(cls, msg: Message) -> Dict[str, Any]:
+    def _message_to_payload(cls, msg: Message) -> dict[str, Any]:
         content = msg.content or ""
         if msg.role == "function":
             content = cls._as_json_content(content)
-        out: Dict[str, Any] = {"role": msg.role, "content": content}
+        out: dict[str, Any] = {"role": msg.role, "content": content}
         if msg.name is not None:
             out["name"] = msg.name
         if msg.function_call is not None:
@@ -197,7 +196,7 @@ class GigaChatProvider(LLMProvider):
         return out
 
     @staticmethod
-    def _tool_to_payload(tool: ToolSpec) -> Dict[str, Any]:
+    def _tool_to_payload(tool: ToolSpec) -> dict[str, Any]:
         return {
             "name": tool.name,
             "description": tool.description,
@@ -205,7 +204,7 @@ class GigaChatProvider(LLMProvider):
         }
 
     @staticmethod
-    def _build_function_call(fc_raw: Optional[Dict[str, Any]]) -> Optional[FunctionCall]:
+    def _build_function_call(fc_raw: dict[str, Any] | None) -> FunctionCall | None:
         if not fc_raw:
             return None
         args = fc_raw.get("arguments", {})
@@ -217,7 +216,7 @@ class GigaChatProvider(LLMProvider):
                 args = {}
         return FunctionCall(name=fc_raw["name"], arguments=args or {})
 
-    def _parse_response(self, data: Dict[str, Any]) -> AssistantTurn:
+    def _parse_response(self, data: dict[str, Any]) -> AssistantTurn:
         try:
             choice = data["choices"][0]
             raw = choice["message"]
@@ -244,11 +243,11 @@ class GigaChatProvider(LLMProvider):
     def complete(
         self,
         messages: Sequence[Message],
-        tools: Optional[Sequence[ToolSpec]] = None,
+        tools: Sequence[ToolSpec] | None = None,
         *,
         temperature: float = 0.2,
     ) -> AssistantTurn:
-        payload: Dict[str, Any] = {
+        payload: dict[str, Any] = {
             "model": self._cfg.model,
             "messages": [self._message_to_payload(m) for m in messages],
             "temperature": temperature,
@@ -273,9 +272,7 @@ class GigaChatProvider(LLMProvider):
         try:
             resp.raise_for_status()
         except httpx.HTTPStatusError as e:
-            raise GigaChatError(
-                f"GigaChat вернул {resp.status_code}: {resp.text}"
-            ) from e
+            raise GigaChatError(f"GigaChat вернул {resp.status_code}: {resp.text}") from e
 
         return self._parse_response(resp.json())
 
@@ -285,10 +282,10 @@ class GigaChatProvider(LLMProvider):
     def stream(
         self,
         messages: Sequence[Message],
-        tools: Optional[Sequence[ToolSpec]] = None,
+        tools: Sequence[ToolSpec] | None = None,
         *,
         temperature: float = 0.2,
-        on_delta: Optional[Callable[[str], None]] = None,
+        on_delta: Callable[[str], None] | None = None,
     ) -> AssistantTurn:
         """Потоковая генерация. Вызывает on_delta(text) на каждый кусок текста и
         возвращает финальный AssistantTurn (идентичный complete()).
@@ -298,7 +295,7 @@ class GigaChatProvider(LLMProvider):
         функции — целиком в одном чанке (``delta.function_call`` + finish_reason).
         """
         emit = on_delta or (lambda _s: None)
-        payload: Dict[str, Any] = {
+        payload: dict[str, Any] = {
             "model": self._cfg.model,
             "messages": [self._message_to_payload(m) for m in messages],
             "temperature": temperature,
@@ -310,7 +307,7 @@ class GigaChatProvider(LLMProvider):
 
         url = f"{self._cfg.base_url}/chat/completions"
         delay = 1.0
-        last_exc: Optional[Exception] = None
+        last_exc: Exception | None = None
         refreshed = False
 
         for attempt in range(self._max_retries):
@@ -321,36 +318,27 @@ class GigaChatProvider(LLMProvider):
             }
             emitted = False
             try:
-                with self._client.stream(
-                    "POST", url, json=payload, headers=headers
-                ) as resp:
+                with self._client.stream("POST", url, json=payload, headers=headers) as resp:
                     if resp.status_code == 401 and not self._mtls and not refreshed:
                         resp.read()
                         self._ensure_token(force=True)
                         refreshed = True
                         continue
-                    if (
-                        resp.status_code in _RETRY_STATUS
-                        and attempt < self._max_retries - 1
-                    ):
+                    if resp.status_code in _RETRY_STATUS and attempt < self._max_retries - 1:
                         resp.read()
                         time.sleep(self._retry_after(resp, delay))
                         delay = min(delay * 2, 8.0)
                         continue
                     if resp.status_code >= 400:
                         resp.read()
-                        raise GigaChatError(
-                            f"GigaChat вернул {resp.status_code}: {resp.text}"
-                        )
+                        raise GigaChatError(f"GigaChat вернул {resp.status_code}: {resp.text}")
                     turn, emitted = self._consume_sse(resp, emit)
                     return turn
             except _RETRYABLE_EXC as e:
                 last_exc = e
                 if emitted:
                     # часть текста уже отдана пользователю — повтор приведёт к дублю
-                    raise GigaChatError(
-                        f"Сетевой сбой во время потоковой передачи: {e}"
-                    ) from e
+                    raise GigaChatError(f"Сетевой сбой во время потоковой передачи: {e}") from e
                 if attempt < self._max_retries - 1:
                     time.sleep(delay)
                     delay = min(delay * 2, 8.0)
@@ -365,11 +353,11 @@ class GigaChatProvider(LLMProvider):
 
         Возвращает (AssistantTurn, emitted_flag).
         """
-        content_parts: List[str] = []
+        content_parts: list[str] = []
         function_call = None
-        state_id: Optional[str] = None
+        state_id: str | None = None
         finish_reason = "stop"
-        usage: Dict[str, Any] = {}
+        usage: dict[str, Any] = {}
         emitted = False
 
         for raw_line in resp.iter_lines():
@@ -411,7 +399,7 @@ class GigaChatProvider(LLMProvider):
             emitted,
         )
 
-    def list_models(self) -> List[str]:
+    def list_models(self) -> list[str]:
         """Список доступных моделей (для диагностики/выбора)."""
         resp = self._request_with_retry(
             lambda: self._client.get(

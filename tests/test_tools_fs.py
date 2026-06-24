@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import pytest
 
-from devassist.devassist.security import SandboxError
-from devassist.devassist.tools.base import ToolError
-from devassist.devassist.tools.fs import (
+from devassist.security import SandboxError
+from devassist.tools.base import ToolError
+from devassist.tools.fs import (
     EditFileTool,
     FindFilesTool,
     ListDirTool,
@@ -88,8 +88,13 @@ def test_edit_tolerant_trailing_whitespace(ctx):
     w.run(w.parse({"path": "t.py", "content": "def f():   \n    return 1   \n"}), ctx)
     e = EditFileTool()
     res = e.run(
-        e.parse({"path": "t.py", "old_string": "def f():\n    return 1",
-                 "new_string": "def f():\n    return 2"}),
+        e.parse(
+            {
+                "path": "t.py",
+                "old_string": "def f():\n    return 1",
+                "new_string": "def f():\n    return 2",
+            }
+        ),
         ctx,
     )
     assert res.ok
@@ -102,8 +107,7 @@ def test_edit_tolerant_indentation(ctx):
     w.run(w.parse({"path": "i.py", "content": "class A:\n        x = 1\n        y = 2\n"}), ctx)
     e = EditFileTool()
     res = e.run(
-        e.parse({"path": "i.py", "old_string": "x = 1\ny = 2",
-                 "new_string": "x = 10\ny = 20"}),
+        e.parse({"path": "i.py", "old_string": "x = 1\ny = 2", "new_string": "x = 10\ny = 20"}),
         ctx,
     )
     assert res.ok
@@ -114,14 +118,19 @@ def test_edit_tolerant_indentation(ctx):
 def test_edit_with_double_escaped_old_string(ctx):
     # модель прислала old_string с литеральными \n (двойная экранизация)
     w = WriteFileTool()
-    w.run(w.parse({"path": "m.py", "content": "def a():\n    return 1\n\ndef b():\n    return 2\n"}), ctx)
+    w.run(
+        w.parse({"path": "m.py", "content": "def a():\n    return 1\n\ndef b():\n    return 2\n"}),
+        ctx,
+    )
     e = EditFileTool()
     res = e.run(
-        e.parse({
-            "path": "m.py",
-            "old_string": "def b():\\n    return 2",
-            "new_string": "def b():\\n    return 22",
-        }),
+        e.parse(
+            {
+                "path": "m.py",
+                "old_string": "def b():\\n    return 2",
+                "new_string": "def b():\\n    return 22",
+            }
+        ),
         ctx,
     )
     assert res.ok
@@ -131,14 +140,24 @@ def test_edit_with_double_escaped_old_string(ctx):
 def test_edit_old_string_with_line_number_prefixes(ctx):
     # модель скопировала old_string ВМЕСТЕ с префиксами номеров строк read_file
     w = WriteFileTool()
-    w.run(w.parse({"path": "k.py", "content": "def add(a, b):\n    return a + b\n\ndef divide(a, b):\n    return a / b\n"}), ctx)
+    w.run(
+        w.parse(
+            {
+                "path": "k.py",
+                "content": "def add(a, b):\n    return a + b\n\ndef divide(a, b):\n    return a / b\n",
+            }
+        ),
+        ctx,
+    )
     e = EditFileTool()
     res = e.run(
-        e.parse({
-            "path": "k.py",
-            "old_string": "4\tdef divide(a, b):\n5\t    return a / b",
-            "new_string": "4\tdef divide(a, b):\n5\t    return a / b\n6\t\n7\tdef power(b, e):\n8\t    return b ** e",
-        }),
+        e.parse(
+            {
+                "path": "k.py",
+                "old_string": "4\tdef divide(a, b):\n5\t    return a / b",
+                "new_string": "4\tdef divide(a, b):\n5\t    return a / b\n6\t\n7\tdef power(b, e):\n8\t    return b ** e",
+            }
+        ),
         ctx,
     )
     assert res.ok
@@ -170,8 +189,8 @@ def test_list_dir(ctx):
     w = WriteFileTool()
     w.run(w.parse({"path": "src/main.py", "content": "pass"}), ctx)
     w.run(w.parse({"path": "readme.md", "content": "# hi"}), ctx)
-    l = ListDirTool()
-    out = l.run(l.parse({"path": "."}), ctx)
+    lister = ListDirTool()
+    out = lister.run(lister.parse({"path": "."}), ctx)
     assert "src/" in out.content
     assert "readme.md" in out.content
 
@@ -195,14 +214,14 @@ def test_repair_double_escaped_content():
 
 
 def test_repair_strips_line_numbers():
-    broken = '1\\timport os\\n2\\tx = 1\\n3\\tprint(x)'
+    broken = "1\\timport os\\n2\\tx = 1\\n3\\tprint(x)"
     fixed, repaired = repair_escaped_content(broken)
     assert repaired is True
     assert fixed == "import os\nx = 1\nprint(x)"
 
 
 def test_repair_leaves_normal_content_untouched():
-    normal = 'def f():\n    return 1\n'
+    normal = "def f():\n    return 1\n"
     fixed, repaired = repair_escaped_content(normal)
     assert repaired is False
     assert fixed == normal

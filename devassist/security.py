@@ -17,8 +17,8 @@ from pathlib import Path
 
 
 class RiskLevel(IntEnum):
-    SAFE = 0       # чтение, поиск — без подтверждения
-    WRITE = 1      # изменение ФС (запись/редактирование/коммит)
+    SAFE = 0  # чтение, поиск — без подтверждения
+    WRITE = 1  # изменение ФС (запись/редактирование/коммит)
     DANGEROUS = 2  # потенциально разрушительные команды
 
 
@@ -39,27 +39,26 @@ def resolve_in_root(root: Path, path: str | Path) -> Path:
     resolved = p.resolve()
     if resolved != root and root not in resolved.parents:
         raise SandboxError(
-            f"Путь '{path}' выходит за пределы корня проекта ({root}). "
-            "Операция запрещена."
+            f"Путь '{path}' выходит за пределы корня проекта ({root}). Операция запрещена."
         )
     return resolved
 
 
 # Шаблоны заведомо опасных shell-конструкций.
 _DANGEROUS_PATTERNS = [
-    r"\brm\s+(-[a-zA-Z]*\s+)*-?[rf]",   # rm -rf и вариации
+    r"\brm\s+(-[a-zA-Z]*\s+)*-?[rf]",  # rm -rf и вариации
     r"\bsudo\b",
     r"\bmkfs\b",
     r"\bdd\s+if=",
     r">\s*/dev/sd",
-    r":\(\)\s*\{",                       # fork-бомба
+    r":\(\)\s*\{",  # fork-бомба
     r"\bchmod\s+-R\b",
     r"\bchown\s+-R\b",
     r"\bgit\s+push\b.*--force",
     r"\bgit\s+reset\s+--hard\b",
     r"\bgit\s+clean\b",
     r"\bshutdown\b|\breboot\b",
-    r"\bcurl\b|\bwget\b",                # сетевые загрузки запрещены политикой
+    r"\bcurl\b|\bwget\b",  # сетевые загрузки запрещены политикой
     r"\bnc\b|\bnetcat\b",
 ]
 _DANGEROUS_RE = re.compile("|".join(_DANGEROUS_PATTERNS), re.IGNORECASE)

@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import json
 
-from devassist.devassist.config import Config
-from devassist.devassist.llm.gigachat import GigaChatProvider
-from devassist.devassist.llm.types import FunctionCall, Message
+from devassist.config import Config
+from devassist.llm.gigachat import GigaChatProvider
+from devassist.llm.types import FunctionCall, Message
 
 
 def _provider() -> GigaChatProvider:
@@ -29,9 +29,7 @@ def test_function_content_wrapped_as_json():
 
 def test_function_content_valid_json_passthrough():
     p = _provider()
-    payload = p._message_to_payload(
-        Message(role="function", name="x", content='{"a": 1}')
-    )
+    payload = p._message_to_payload(Message(role="function", name="x", content='{"a": 1}'))
     assert json.loads(payload["content"]) == {"a": 1}
     p.close()
 

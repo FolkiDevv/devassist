@@ -1,4 +1,4 @@
-from devassist.devassist.cli import main
+from devassist.cli import main
 
 if __name__ == "__main__":
     raise SystemExit(main())

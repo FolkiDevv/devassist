@@ -6,7 +6,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -17,7 +17,7 @@ class FunctionCall(BaseModel):
     """Запрос модели на вызов инструмента."""
 
     name: str
-    arguments: Dict[str, Any] = Field(default_factory=dict)
+    arguments: dict[str, Any] = Field(default_factory=dict)
 
 
 class Message(BaseModel):
@@ -30,11 +30,11 @@ class Message(BaseModel):
 
     role: Role
     content: str = ""
-    name: Optional[str] = None  # имя функции для role="function"
-    function_call: Optional[FunctionCall] = None
+    name: str | None = None  # имя функции для role="function"
+    function_call: FunctionCall | None = None
     # Непрозрачный идентификатор состояния функций GigaChat — нужно
     # возвращать вместе с assistant-сообщением, чтобы сохранить контекст.
-    functions_state_id: Optional[str] = None
+    functions_state_id: str | None = None
 
 
 class ToolSpec(BaseModel):
@@ -42,7 +42,7 @@ class ToolSpec(BaseModel):
 
     name: str
     description: str
-    parameters: Dict[str, Any]
+    parameters: dict[str, Any]
 
 
 class AssistantTurn(BaseModel):
@@ -50,7 +50,7 @@ class AssistantTurn(BaseModel):
 
     message: Message
     finish_reason: str = "stop"
-    usage: Dict[str, Any] = Field(default_factory=dict)
+    usage: dict[str, Any] = Field(default_factory=dict)
 
     @property
     def wants_tool(self) -> bool:

@@ -10,15 +10,15 @@ from __future__ import annotations
 
 import argparse
 import re
-import sys
 from pathlib import Path
 
 from devassist import __version__
-from devassist.devassist.agent.loop import Agent
-from devassist.devassist.config import Config
-from devassist.devassist.llm.gigachat import GigaChatError, GigaChatProvider
-from devassist.devassist.tools.base import build_default_registry
-from devassist.devassist.ui.console import Console
+from devassist.agent.loop import Agent
+from devassist.config import Config
+from devassist.llm.gigachat import GigaChatError, GigaChatProvider
+from devassist.tools.base import build_default_registry
+from devassist.ui.console import Console
+
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
@@ -27,21 +27,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("-p", "--prompt", help="Одноразовый запрос (без интерактива)")
     p.add_argument("-m", "--model", help="Модель GigaChat (переопределяет конфиг)")
+    p.add_argument("-C", "--dir", default=".", help="Корень проекта (по умолчанию текущая папка)")
     p.add_argument(
-        "-C", "--dir", default=".", help="Корень проекта (по умолчанию текущая папка)"
-    )
-    p.add_argument(
-        "-y", "--yes", action="store_true",
+        "-y",
+        "--yes",
+        action="store_true",
         help="Авто-подтверждение всех операций (используйте осознанно)",
     )
     p.add_argument("--no-color", action="store_true", help="Отключить цвет")
     p.add_argument(
-        "--no-stream", action="store_true",
+        "--no-stream",
+        action="store_true",
         help="Отключить потоковый вывод (ответ печатается целиком в конце)",
     )
-    p.add_argument(
-        "--list-models", action="store_true", help="Показать доступные модели и выйти"
-    )
+    p.add_argument("--list-models", action="store_true", help="Показать доступные модели и выйти")
     p.add_argument("--version", action="version", version=f"devassist {__version__}")
     return p
 
@@ -69,12 +68,11 @@ def run_repl(agent: Agent, ui: Console, config: Config) -> int:
         def read_input() -> str:
             return psession.prompt("devassist› ")
     except Exception:  # prompt_toolkit недоступен — простой input()
+
         def read_input() -> str:
             return input("devassist> ")
 
-    ui.banner(
-        version=__version__, model=config.model, root=str(config.project_root)
-    )
+    ui.banner(version=__version__, model=config.model, root=str(config.project_root))
 
     while True:
         try:
@@ -136,7 +134,7 @@ def _handle_command(line: str, agent: Agent, ui: Console, config: Config) -> boo
         else:
             ui.info(f"текущая модель: {config.model}")
     elif cmd == "/clear":
-        from devassist.devassist.agent.session import Session
+        from devassist.agent.session import Session
 
         agent._session = Session(config.project_root)  # noqa: SLF001
         ui.info("история очищена")

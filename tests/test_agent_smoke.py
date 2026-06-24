@@ -13,10 +13,10 @@ from dataclasses import replace
 
 import pytest
 
-from devassist.devassist.agent.loop import Agent
-from devassist.devassist.llm.gigachat import GigaChatProvider
-from devassist.devassist.tools.base import build_default_registry
-from devassist.devassist.ui.console import Console
+from devassist.agent.loop import Agent
+from devassist.llm.gigachat import GigaChatProvider
+from devassist.tools.base import build_default_registry
+from devassist.ui.console import Console
 
 pytestmark = pytest.mark.live
 
@@ -53,9 +53,7 @@ def test_end_to_end_mini_task(live_config, tmp_path):
 def test_agent_reads_and_edits_existing_file(live_config, tmp_path):
     """Агент читает существующий файл и вносит точечную правку."""
     (tmp_path / "version.txt").write_text("version = 1.0.0\n", encoding="utf-8")
-    cfg = replace(
-        live_config, project_root=tmp_path, auto_approve=True, max_steps=12
-    )
+    cfg = replace(live_config, project_root=tmp_path, auto_approve=True, max_steps=12)
     provider = GigaChatProvider(cfg)
     ui = Console(no_color=True, assume_yes=True)
     agent = Agent(provider, build_default_registry(), cfg, ui)

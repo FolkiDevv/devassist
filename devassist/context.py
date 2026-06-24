@@ -9,27 +9,33 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List
 
 MEMORY_FILENAME = "DEVASSIST.md"
 _IGNORE_DIRS = {
-    ".git", "__pycache__", "node_modules", ".venv", "venv",
-    ".pytest_cache", ".mypy_cache", "dist", "build", ".idea", ".devassist",
+    ".git",
+    "__pycache__",
+    "node_modules",
+    ".venv",
+    "venv",
+    ".pytest_cache",
+    ".mypy_cache",
+    "dist",
+    "build",
+    ".idea",
+    ".devassist",
 }
 _MAX_ENTRIES = 200
 
 
 def build_file_tree(root: Path, max_entries: int = _MAX_ENTRIES) -> str:
     """Компактное дерево проекта (отсортированное, с обрезкой)."""
-    lines: List[str] = []
+    lines: list[str] = []
     count = 0
 
     def walk(directory: Path, prefix: str) -> None:
         nonlocal count
         try:
-            entries = sorted(
-                directory.iterdir(), key=lambda e: (e.is_file(), e.name.lower())
-            )
+            entries = sorted(directory.iterdir(), key=lambda e: (e.is_file(), e.name.lower()))
         except OSError:
             return
         for e in entries:

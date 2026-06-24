@@ -6,11 +6,11 @@ import subprocess
 
 import pytest
 
-from devassist.devassist.tools.base import ToolError
-from devassist.devassist.tools.fs import WriteFileTool
-from devassist.devassist.tools.git import GitTool
-from devassist.devassist.tools.search import SearchContentTool
-from devassist.devassist.tools.shell import RunShellTool
+from devassist.tools.base import ToolError
+from devassist.tools.fs import WriteFileTool
+from devassist.tools.git import GitTool
+from devassist.tools.search import SearchContentTool
+from devassist.tools.shell import RunShellTool
 
 
 def _write(ctx, path, content):
@@ -65,7 +65,7 @@ def test_shell_runs_in_project_root(ctx):
 
 
 def test_shell_dangerous_classification(ctx):
-    from devassist.devassist.security import RiskLevel
+    from devassist.security import RiskLevel
 
     sh = RunShellTool()
     safe = sh.parse({"command": "ls -la"})

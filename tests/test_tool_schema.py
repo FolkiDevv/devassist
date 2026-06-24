@@ -7,7 +7,7 @@ GigaChat не принимает union-типы (anyOf/oneOf), которые py
 
 from __future__ import annotations
 
-from devassist.devassist.tools.base import build_default_registry
+from devassist.tools.base import build_default_registry
 
 
 def test_all_tool_schemas_are_gigachat_compatible():

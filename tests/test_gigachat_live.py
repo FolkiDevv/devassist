@@ -13,8 +13,8 @@ from __future__ import annotations
 
 import pytest
 
-from devassist.devassist.llm.gigachat import GigaChatProvider
-from devassist.devassist.llm.types import Message, ToolSpec
+from devassist.llm.gigachat import GigaChatProvider
+from devassist.llm.types import Message, ToolSpec
 
 pytestmark = pytest.mark.live
 

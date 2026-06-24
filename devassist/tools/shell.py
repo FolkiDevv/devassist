@@ -6,8 +6,8 @@ import subprocess
 
 from pydantic import BaseModel, Field
 
-from devassist.devassist.security import RiskLevel, classify_shell_command
-from devassist.devassist.tools.base import Tool, ToolContext, ToolResult
+from devassist.security import RiskLevel, classify_shell_command
+from devassist.tools.base import Tool, ToolContext, ToolResult
 
 _MAX_OUTPUT = 30_000
 

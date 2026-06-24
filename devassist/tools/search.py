@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import re
-from typing import List, Optional
 
 from pydantic import BaseModel, Field
 
-from devassist.devassist.security import resolve_in_root
-from devassist.devassist.tools.base import Tool, ToolContext, ToolError, ToolResult
+from devassist.security import resolve_in_root
+from devassist.tools.base import Tool, ToolContext, ToolError, ToolResult
 
 _IGNORE_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", ".pytest_cache"}
 _MAX_MATCHES = 200
@@ -17,7 +16,7 @@ _MAX_MATCHES = 200
 class SearchContentParams(BaseModel):
     pattern: str = Field(description="Регулярное выражение для поиска по содержимому")
     path: str = Field(default=".", description="Директория для поиска (от корня проекта)")
-    glob: Optional[str] = Field(
+    glob: str | None = Field(
         default=None, description="Ограничить поиск файлами по glob, например '*.py'"
     )
     ignore_case: bool = Field(default=False, description="Игнорировать регистр")
@@ -40,12 +39,12 @@ class SearchContentTool(Tool):
         try:
             regex = re.compile(params.pattern, flags)
         except re.error as e:
-            raise ToolError(f"Некорректное регулярное выражение: {e}")
+            raise ToolError(f"Некорректное регулярное выражение: {e}") from e
 
         import fnmatch
 
         files = base.rglob("*") if base.is_dir() else [base]
-        matches: List[str] = []
+        matches: list[str] = []
         scanned = 0
         for f in files:
             if not f.is_file():
