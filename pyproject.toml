@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "devassist"
+version = "0.1.0"
+description = "Локальный CLI-агент для программирования на базе GigaChat (аналог Claude Code)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: Other/Proprietary License",
+    "Operating System :: OS Independent",
+    "Private :: Do Not Upload",
+]
+dependencies = [
+    "httpx>=0.27",
+    "pydantic>=2.5",
+    "rich>=13.0",
+    "prompt_toolkit>=3.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "ruff>=0.5"]
+
+[project.scripts]
+devassist = "devassist.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["devassist*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+# E,F — pyflakes/pycodestyle; I — isort; UP — pyupgrade; B — bugbear; W — warnings.
+select = ["E", "F", "I", "UP", "B", "W"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501"]
+
+[tool.pytest.ini_options]
+markers = [
+    "live: тесты, реально обращающиеся к API GigaChat (нужен GIGACHAT_ACCESS_KEY)",
+]
+testpaths = ["tests"]

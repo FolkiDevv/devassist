@@ -1,0 +1,54 @@
+"""Абстрактный интерфейс LLM-провайдера.
+
+Агент работает только через этот интерфейс, поэтому добавление нового
+провайдера (другой модели/вендора) сводится к реализации одного класса.
+"""
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from typing import Callable, List, Optional, Sequence
+
+from devassist.devassist.llm.types import AssistantTurn, Message, ToolSpec
+
+
+class LLMProvider(ABC):
+    """Минимальный контракт провайдера для агентного цикла."""
+
+    @property
+    @abstractmethod
+    def model(self) -> str:
+        """Идентификатор текущей модели."""
+
+    @abstractmethod
+    def complete(
+        self,
+        messages: Sequence[Message],
+        tools: Optional[Sequence[ToolSpec]] = None,
+        *,
+        temperature: float = 0.2,
+    ) -> AssistantTurn:
+        """Один проход модели.
+
+        Принимает историю диалога и (опционально) доступные инструменты,
+        возвращает ход ассистента: либо текст, либо запрос на вызов функции.
+        """
+
+    def stream(
+        self,
+        messages: Sequence[Message],
+        tools: Optional[Sequence[ToolSpec]] = None,
+        *,
+        temperature: float = 0.2,
+        on_delta: Optional[Callable[[str], None]] = None,
+    ) -> AssistantTurn:
+        """Потоковая версия complete().
+
+        Базовая реализация не стримит, а вызывает complete() и отдаёт весь текст
+        одним куском — провайдеры без поддержки SSE работают без изменений.
+        Провайдеры с потоком (GigaChat) переопределяют метод.
+        """
+        turn = self.complete(messages, tools, temperature=temperature)
+        if on_delta and turn.message.content:
+            on_delta(turn.message.content)
+        return turn
