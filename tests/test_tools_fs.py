@@ -33,7 +33,8 @@ def test_write_overwrite_and_diff(ctx):
     w.run(w.parse({"path": "f.txt", "content": "old\n"}), ctx)
     params = w.parse({"path": "f.txt", "content": "new\n"})
     preview = w.preview(params, ctx)
-    assert "-old" in preview and "+new" in preview
+    assert preview.kind == "diff"
+    assert "-old" in preview.text and "+new" in preview.text
     res = w.run(params, ctx)
     assert "перезаписан" in res.summary
 

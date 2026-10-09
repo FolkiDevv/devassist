@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 
 from devassist.project.files import glob_match, walk_files
 from devassist.security import RiskLevel, resolve_in_root
-from devassist.tools.base import Tool, ToolContext, ToolError, ToolResult
+from devassist.tools.base import Display, Tool, ToolContext, ToolError, ToolResult
 
 # Жёсткий предел размера читаемого файла (дальше — только search_content).
 MAX_READ_BYTES = 20_000_000
@@ -260,10 +260,11 @@ class WriteFileTool(Tool):
                 return ""
         return ""
 
-    def preview(self, params: WriteFileParams, ctx: ToolContext) -> str | None:
+    def preview(self, params: WriteFileParams, ctx: ToolContext) -> Display | None:
         old = self._old_content(ctx, params)
         content, _ = repair_escaped_content(params.content)
-        return make_diff(old, content, params.path) or "(новый пустой файл)"
+        diff = make_diff(old, content, params.path) or "(новый пустой файл)"
+        return Display(diff, kind="diff", title=params.path)
 
     def run(self, params: WriteFileParams, ctx: ToolContext) -> ToolResult:
         p = resolve_in_root(ctx.root, params.path)
@@ -280,7 +281,7 @@ class WriteFileTool(Tool):
         return ToolResult(
             content=f"Файл {verb}: {params.path} ({n} строк).{note}",
             summary=f"{verb} {_rel(ctx, p)}{note}",
-            display=make_diff(old, content, params.path),
+            display=Display(make_diff(old, content, params.path), kind="diff", title=params.path),
         )
 
 
@@ -367,9 +368,9 @@ class EditFileTool(Tool):
             "Скопируйте фрагмент дословно из содержимого ниже:\n\n" + _numbered_excerpt(old)
         )
 
-    def preview(self, params: EditFileParams, ctx: ToolContext) -> str | None:
+    def preview(self, params: EditFileParams, ctx: ToolContext) -> Display | None:
         _, old, new, _ = self._compute(params, ctx)
-        return make_diff(old, new, params.path)
+        return Display(make_diff(old, new, params.path), kind="diff", title=params.path)
 
     def run(self, params: EditFileParams, ctx: ToolContext) -> ToolResult:
         p, old, new, count = self._compute(params, ctx)
@@ -378,7 +379,7 @@ class EditFileTool(Tool):
         return ToolResult(
             content=f"Отредактирован {params.path}: заменено вхождений — {replaced}.",
             summary=f"изменён {_rel(ctx, p)}",
-            display=make_diff(old, new, params.path),
+            display=Display(make_diff(old, new, params.path), kind="diff", title=params.path),
         )
 
 

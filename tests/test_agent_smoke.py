@@ -30,7 +30,7 @@ def test_end_to_end_mini_task(live_config, tmp_path):
         max_steps=14,
     )
     provider = GigaChatProvider(cfg)
-    ui = Console(no_color=True, assume_yes=True)
+    ui = Console(no_color=True)
     agent = Agent(provider, build_default_registry(), cfg, ui)
 
     try:
@@ -55,7 +55,7 @@ def test_agent_reads_and_edits_existing_file(live_config, tmp_path):
     (tmp_path / "version.txt").write_text("version = 1.0.0\n", encoding="utf-8")
     cfg = replace(live_config, project_root=tmp_path, auto_approve=True, max_steps=12)
     provider = GigaChatProvider(cfg)
-    ui = Console(no_color=True, assume_yes=True)
+    ui = Console(no_color=True)
     agent = Agent(provider, build_default_registry(), cfg, ui)
     try:
         agent.run_turn(

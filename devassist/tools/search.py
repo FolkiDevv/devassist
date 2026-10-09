@@ -36,6 +36,10 @@ class SearchContentTool(Tool):
     )
     Params = SearchContentParams
 
+    def describe(self, params: SearchContentParams) -> str:
+        where = f" в {params.path}" if params.path not in ("", ".") else ""
+        return f"/{params.pattern}/{where}"
+
     def run(self, params: SearchContentParams, ctx: ToolContext) -> ToolResult:
         base = resolve_in_root(ctx.root, params.path)
         if not base.exists():

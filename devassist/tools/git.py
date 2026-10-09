@@ -5,7 +5,7 @@ from __future__ import annotations
 from pydantic import BaseModel, Field
 
 from devassist.security import RiskLevel
-from devassist.tools.base import Tool, ToolContext, ToolError, ToolResult
+from devassist.tools.base import Display, Tool, ToolContext, ToolError, ToolResult
 from devassist.tools.process import run_process, truncate_middle
 
 # Разрешённые подкоманды. Деструктивные (reset --hard, clean, push --force)
@@ -114,11 +114,14 @@ class GitTool(Tool):
             if _is_forbidden(arg):
                 raise ToolError(f"Опция '{arg}' запрещена политикой безопасности devassist.")
 
-    def preview(self, params: GitParams, ctx: ToolContext) -> str | None:
+    def describe(self, params: GitParams) -> str:
+        return f"{params.subcommand} {' '.join(params.args)}".strip()
+
+    def preview(self, params: GitParams, ctx: ToolContext) -> Display | None:
         # Сначала валидация: недопустимую команду не предлагаем подтверждать.
         self._check(params)
         if self.risk(params, ctx) >= RiskLevel.WRITE:
-            return f"$ git {params.subcommand} {' '.join(params.args)}".rstrip()
+            return Display(f"$ git {self.describe(params)}", title="команда")
         return None
 
     def run(self, params: GitParams, ctx: ToolContext) -> ToolResult:
@@ -140,5 +143,5 @@ class GitTool(Tool):
             content=f"exit code: {res.returncode}\n{out}",
             ok=res.returncode == 0,
             summary=f"git {params.subcommand} → код {res.returncode}",
-            display=out,
+            display=Display(out, title=f"git {params.subcommand}"),
         )

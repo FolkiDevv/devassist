@@ -147,7 +147,7 @@ def _handle_command(line: str, agent: Agent, ui: Console, config: Config) -> boo
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     root = Path(args.dir).resolve()
-    ui = Console(no_color=args.no_color, assume_yes=args.yes)
+    ui = Console(no_color=args.no_color)
     try:
         config = Config.load(
             project_root=root,

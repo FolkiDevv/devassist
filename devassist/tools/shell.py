@@ -5,7 +5,7 @@ from __future__ import annotations
 from pydantic import BaseModel, Field
 
 from devassist.security import RiskLevel, classify_shell_command
-from devassist.tools.base import Tool, ToolContext, ToolResult
+from devassist.tools.base import Display, Tool, ToolContext, ToolResult
 from devassist.tools.process import run_process, truncate_middle
 
 _MAX_OUTPUT = 30_000
@@ -31,8 +31,11 @@ class RunShellTool(Tool):
     def risk(self, params: RunShellParams, ctx: ToolContext) -> RiskLevel:
         return classify_shell_command(params.command)
 
-    def preview(self, params: RunShellParams, ctx: ToolContext) -> str:
-        return f"$ {params.command}"
+    def describe(self, params: RunShellParams) -> str:
+        return params.command[:70]
+
+    def preview(self, params: RunShellParams, ctx: ToolContext) -> Display:
+        return Display(f"$ {params.command}", title="команда")
 
     def run(self, params: RunShellParams, ctx: ToolContext) -> ToolResult:
         timeout = min(max(params.timeout, MIN_TIMEOUT), MAX_TIMEOUT)
@@ -62,5 +65,5 @@ class RunShellTool(Tool):
             content=content,
             ok=res.returncode == 0 and not res.timed_out,
             summary=summary,
-            display=combined,  # пусто → UI не покажет блок вывода
+            display=Display(combined, title=f"$ {params.command[:60]}") if combined else None,
         )
