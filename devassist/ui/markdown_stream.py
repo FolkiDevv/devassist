@@ -12,10 +12,12 @@
 
 Границы блоков определяет тот же парсер, которым rich рендерит Markdown
 (``Markdown.parsed``), поэтому они совпадают с тем, как блок будет нарисован.
-Чтобы отступы между блоками совпали с рендером целиком, завершённая часть каждый
-раз рендерится заново как префикс документа, и наружу отдаются только ещё не
-напечатанные строки. В итоге «поток» печатает ровно то же, что рендер всего
-ответа сразу (проверяется тестом).
+Отступ перед блоком у rich зависит только от вида предыдущего блока, поэтому новые
+завершённые блоки рендерятся вместе с последним уже напечатанным (как контекст),
+и наружу отдаются строки после него. Стоимость — размер блока, а не всего ответа
+(раньше каждый новый блок перерисовывал весь префикс: O(n²) на длинных ответах с
+кодом). В итоге «поток» печатает ровно то же, что рендер всего ответа сразу
+(проверяется тестом на посимвольной и случайной нарезке).
 
 Известное ограничение: ссылки-сноски (``[1]: url``), определённые ниже места
 использования, в уже напечатанной части останутся текстом.
@@ -46,23 +48,32 @@ def block_start_lines(source: str) -> list[int]:
     return starts
 
 
-def complete_prefix_length(text: str) -> int:
-    """Длина (в символах) префикса ``text``, состоящего из завершённых блоков.
+def _line_offset(text: str, line: int) -> int:
+    offset = 0
+    for _ in range(line):
+        offset = text.index("\n", offset) + 1
+    return offset
+
+
+def complete_blocks(text: str) -> tuple[int, int]:
+    """(начало последнего завершённого блока, конец завершённой части) в символах.
 
     Разбирается только часть до последнего перевода строки: незаконченная строка
     может поменять смысл предыдущих (``#`` — заголовок, ``#тег`` — продолжение абзаца).
+    Нет завершённых блоков — ``(0, 0)``.
     """
     full = text[: text.rfind("\n") + 1]
     if not full:
-        return 0
+        return 0, 0
     starts = block_start_lines(full)
     if len(starts) < 2:
-        return 0
-    last = starts[-1]
-    offset = 0
-    for _ in range(last):
-        offset = full.index("\n", offset) + 1
-    return offset
+        return 0, 0
+    return _line_offset(full, starts[-2]), _line_offset(full, starts[-1])
+
+
+def complete_prefix_length(text: str) -> int:
+    """Длина (в символах) префикса ``text``, состоящего из завершённых блоков."""
+    return complete_blocks(text)[1]
 
 
 def _is_blank(line: list[Segment]) -> bool:
@@ -79,8 +90,9 @@ class MarkdownStream:
     def __init__(self, console: Console, *, width: int | None = None):
         self._console = console
         self._options = console.options.update_width(width or console.width)
-        # (весь текст, длина завершённой части, сколько строк уже отдано)
-        self._state: tuple[str, int, int] = ("", 0, 0)
+        # (весь текст, длина завершённой части, сколько строк уже отдано,
+        #  начало последнего завершённого блока — контекст для следующих)
+        self._state: tuple[str, int, int, int] = ("", 0, 0, 0)
         self._tail_cache: tuple[str, int, Lines] | None = None
 
     @property
@@ -90,22 +102,31 @@ class MarkdownStream:
     def render(self, source: str) -> Lines:
         return self._console.render_lines(Markdown(source), self._options, pad=False)
 
+    def _after_context(self, text: str, anchor: int, committed: int, end: int) -> Lines:
+        """Строки ``text[committed:end]`` так, как они выглядят после уже напечатанного.
+
+        Рендерится вместе с последним напечатанным блоком ``text[anchor:committed]``
+        (от него зависит отступ), его строки отбрасываются.
+        """
+        context = len(self.render(text[anchor:committed])) if committed > anchor else 0
+        return self.render(text[anchor:end])[context:]
+
     def feed(self, delta: str) -> Lines:
         """Добавляет кусок текста. Возвращает новые окончательные строки (часто — ни одной)."""
-        text, committed, printed = self._state
+        text, committed, printed, anchor = self._state
         text += delta
         if "\n" in delta:
-            boundary = complete_prefix_length(text)
+            last_block, boundary = complete_blocks(text)
             if boundary > committed:
-                lines = self.render(text[:boundary])
-                self._state = (text, boundary, len(lines))
-                return lines[printed:]
-        self._state = (text, committed, printed)
+                lines = self._after_context(text, anchor, committed, boundary)
+                self._state = (text, boundary, printed + len(lines), last_block)
+                return lines
+        self._state = (text, committed, printed, anchor)
         return []
 
     def tail_lines(self) -> Lines:
         """Строки незавершённого хвоста (для временной области). Потокобезопасно."""
-        text, committed, printed = self._state
+        text, committed, printed, _anchor = self._state
         tail = text[committed:]
         cached = self._tail_cache
         if cached is not None and cached[0] == tail and cached[1] == printed:
@@ -120,10 +141,10 @@ class MarkdownStream:
 
     def finish(self) -> Lines:
         """Завершает ответ: оставшиеся ненапечатанные строки."""
-        text, _committed, printed = self._state
+        text, committed, printed, anchor = self._state
         if not text.strip():
-            self._state = (text, len(text), printed)
+            self._state = (text, len(text), printed, anchor)
             return []
-        lines = self.render(text)
-        self._state = (text, len(text), len(lines))
-        return lines[printed:]
+        lines = self._after_context(text, anchor, committed, len(text))
+        self._state = (text, len(text), printed + len(lines), anchor)
+        return lines
