@@ -122,9 +122,11 @@ tools.base`; `agent → llm, tools, project`; `tools → project, security, erro
 | 5. Сжатие контекста | `Usage`, `Conversation.last_usage`, `estimate_tokens`, `Config.context_budget_tokens`, единственная точка сборки запроса `Agent._build_request()` | `Agent.compact()` + промпт суммаризации, автозапуск по порогу, `/compact` |
 | 6. AGENTS.md | `INSTRUCTION_FILES` + `load_instructions()` | Добавить имя в список; определить приоритет и вложенные `AGENTS.md` в подкаталогах |
 
-## 5. Порядок выполнения реорганизации
+## 5. Порядок выполнения реорганизации (выполнено)
 
 Каждый шаг — отдельный коммит, после которого зелёные `make lint` и `make test`.
+Все проблемы из раздела 2.1–2.2 закрыты соответствующими шагами; пункты
+раздела 2.3 остаются открытыми.
 
 0. Переход на uv (`uv.lock`, `dependency-groups`).
 1. Этот отчёт.
