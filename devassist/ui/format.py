@@ -44,5 +44,8 @@ def clip_lines(
     lines = [line if len(line) <= max_line else line[: max_line - 1] + "…" for line in lines]
     result = "\n".join(lines)
     if len(result) > max_chars:
-        result = result[: max_chars - 1] + "…"
+        # Конец важнее начала (итог команды) — делим бюджет, пропуск посередине.
+        head_chars = (max_chars - 1) // 2
+        tail_chars = max_chars - 1 - head_chars
+        result = result[:head_chars] + "…" + result[len(result) - tail_chars :]
     return result

@@ -180,6 +180,10 @@ def test_format_helpers():
     ]
     assert clip_lines("a\nb") == "a\nb"
     assert len(clip_lines("x" * 10_000)) <= 300
+    long_lines = "\n".join(f"{i:03d} " + "x" * 290 for i in range(40)) + "\nИТОГ: 3 failed"
+    clipped = clip_lines(long_lines)
+    assert len(clipped) <= 4000
+    assert clipped.startswith("000") and clipped.endswith("ИТОГ: 3 failed")
 
 
 def test_animation_thread_stops():
