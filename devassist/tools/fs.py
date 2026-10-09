@@ -184,6 +184,8 @@ class ReadFileTool(Tool):
             raise ToolError(f"Файл не найден: {params.path}")
         if p.is_dir():
             raise ToolError(f"Это директория, а не файл: {params.path}")
+        if not p.is_file():  # FIFO/сокет/устройство — чтение может заблокироваться
+            raise ToolError(f"Не обычный файл (FIFO, сокет или устройство): {params.path}")
         if p.stat().st_size > MAX_READ_BYTES:
             raise ToolError(
                 f"Файл слишком большой (>{MAX_READ_BYTES} байт). Используйте search_content."

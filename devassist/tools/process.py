@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import codecs
 import os
 import signal
 import subprocess
@@ -109,11 +110,19 @@ def _kill_group(proc: subprocess.Popen) -> None:
 
 
 def _pump(stream, capture: _Capture) -> None:
+    """Читает канал по мере поступления данных (os.read не ждёт заполнения буфера).
+
+    Поэтому вывод сохраняется, даже если канал так и не закрылся (его держит
+    потомок, ушедший из группы процессов).
+    """
+    decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+    fd = stream.fileno()
     try:
-        for chunk in iter(lambda: stream.read(4096), ""):
-            capture.add(chunk)
+        while chunk := os.read(fd, 65536):
+            capture.add(decoder.decode(chunk))
     except (OSError, ValueError):
         pass
+    capture.add(decoder.decode(b"", final=True))
 
 
 def run_process(
@@ -139,8 +148,6 @@ def run_process(
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        encoding="utf-8",
-        errors="replace",
         **kwargs,
     )
     out, err = _Capture(), _Capture()
@@ -172,7 +179,13 @@ def run_process(
         proc.wait()
         raise
     finally:
-        for stream in (proc.stdout, proc.stderr):
+        for stream, reader in zip((proc.stdout, proc.stderr), readers, strict=True):
+            # Если вывод держит потомок, сбежавший из группы (setsid), поток-читатель
+            # всё ещё заблокирован в read(), и close() ждал бы ту же блокировку
+            # бесконечно. Такой поток не закрываем: читатель — daemon, канал
+            # закроется, когда потомок завершится.
+            if reader.is_alive():
+                continue
             try:
                 stream.close()  # type: ignore[union-attr]
             except OSError:

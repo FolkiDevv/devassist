@@ -42,10 +42,11 @@ class Agent:
         self._provider = provider
         self._registry = registry
         self._cfg = config
-        self._events = events or AgentEvents()
-        self._workspace = workspace or Workspace(config.project_root)
+        # `is None`, а не `or`: пустой Conversation ложен (__len__ == 0).
+        self._events = AgentEvents() if events is None else events
+        self._workspace = Workspace(config.project_root) if workspace is None else workspace
         self._ctx = ToolContext(workspace=self._workspace)
-        self._conversation = conversation or Conversation()
+        self._conversation = Conversation() if conversation is None else conversation
         self._model = config.model
         self._system_prompt: str | None = None  # строится лениво, сбрасывается в reset()
 

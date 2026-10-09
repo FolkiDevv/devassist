@@ -258,3 +258,24 @@ def test_read_empty_range(ctx):
     (ctx.root / "s.txt").write_text("a\nb", encoding="utf-8")
     assert "всего строк: 2" in _read(ctx, path="s.txt", start_line=10).content
     assert _read(ctx, path="s.txt").content.startswith("1\ta")
+
+
+@posix_only
+def test_shell_returns_when_escaped_child_holds_output(ctx):
+    # Потомок ушёл в свою сессию (setsid) и держит stdout: раньше close()
+    # потока зависал на блокировке читателя.
+    import shutil
+
+    if not shutil.which("setsid"):
+        pytest.skip("нет setsid")
+    started = time.monotonic()
+    res = _sh(ctx, "setsid sleep 5 & echo started", timeout=30)
+    assert "started" in res.content
+    assert time.monotonic() - started < 4.5
+
+
+@posix_only
+def test_read_fifo_rejected(ctx):
+    os.mkfifo(ctx.root / "pipe")
+    with pytest.raises(ToolError):
+        _read(ctx, path="pipe")

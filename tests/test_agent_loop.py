@@ -236,3 +236,15 @@ def test_long_turn_keeps_current_task_in_context(tmp_path):
         assert contents == ["ТЕКУЩАЯ ЗАДАЧА"]
         _assert_well_formed(request["messages"])
     assert len(provider.requests[-1]["messages"]) < len(agent.conversation) + 1
+
+
+def test_empty_conversation_instance_is_used(tmp_path):
+    from devassist.agent.conversation import Conversation
+
+    conv = Conversation()  # пустой — ложен по __len__
+    cfg = Config(access_key="x", project_root=tmp_path, stream=False)
+    agent = Agent(
+        ScriptedProvider([text_turn("ок")]), build_default_registry(), cfg, conversation=conv
+    )
+    agent.run_turn("x")
+    assert agent.conversation is conv and len(conv) == 2

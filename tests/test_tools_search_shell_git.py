@@ -147,3 +147,14 @@ def test_git_disallowed_subcommand(git_repo):
     g = GitTool()
     with pytest.raises(ToolError):
         g.run(g.parse({"subcommand": "push"}), git_repo)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="FIFO")
+def test_search_skips_fifo(ctx):
+    import os
+
+    os.mkfifo(ctx.root / "pipe")
+    _write(ctx, "a.txt", "needle")
+    s = SearchContentTool()
+    out = s.run(s.parse({"pattern": "needle"}), ctx).content
+    assert "a.txt" in out

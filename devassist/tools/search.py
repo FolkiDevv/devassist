@@ -63,6 +63,9 @@ class SearchContentTool(Tool):
             if walking and is_secret_file(f.name):
                 continue
             try:
+                # FIFO, сокеты, устройства: открытие на чтение может заблокироваться
+                if not f.is_file():
+                    continue
                 if f.stat().st_size > _MAX_FILE_BYTES:
                     skipped += 1
                     continue
