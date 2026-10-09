@@ -605,3 +605,62 @@ def test_edit_tolerant_does_not_add_blank_lines(ctx):
     (ctx.root / "c.py").write_text("a = 1  \nb = 2\n", encoding="utf-8")
     _edit(ctx, "c.py", "\na = 1\nb = 2", "\na = 10\nb = 2")
     assert (ctx.root / "c.py").read_text() == "a = 10\nb = 2\n"
+
+
+# ------------------------- не-UTF-8, бинарные, не файлы ------------------------- #
+@pytest.mark.parametrize(
+    "data", [b"\x89PNG\r\n\x1a\n\x00\x00", "привет, мир\n".encode("cp1251")], ids=["bin", "cp1251"]
+)
+def test_write_and_edit_refuse_binary_and_non_utf8(ctx, data):
+    (ctx.root / "f.dat").write_bytes(data)
+    w, e = WriteFileTool(), EditFileTool()
+    write = w.parse({"path": "f.dat", "content": "новое\n"})
+    edit = e.parse({"path": "f.dat", "old_string": "x", "new_string": "y"})
+    for tool, params in ((w, write), (e, edit)):
+        for call in (tool.preview, tool.run):
+            with pytest.raises(ToolError, match="Бинарный|не в UTF-8"):
+                call(params, ctx)
+    assert (ctx.root / "f.dat").read_bytes() == data
+
+
+def test_write_refuses_directory_in_preview(ctx):
+    (ctx.root / "d").mkdir()
+    w = WriteFileTool()
+    with pytest.raises(ToolError, match="директория"):
+        w.preview(w.parse({"path": "d", "content": "x"}), ctx)
+
+
+@pytest.mark.skipif(not hasattr(__import__("os"), "mkfifo"), reason="FIFO")
+def test_write_refuses_fifo(ctx):
+    import os
+
+    os.mkfifo(ctx.root / "pipe")
+    w = WriteFileTool()
+    with pytest.raises(ToolError, match="Не обычный файл"):
+        w.run(w.parse({"path": "pipe", "content": "x"}), ctx)
+
+
+def test_write_preview_reports_unchanged_content(ctx):
+    (ctx.root / "same.txt").write_text("a\n", encoding="utf-8")
+    w = WriteFileTool()
+    assert w.preview(w.parse({"path": "same.txt", "content": "a\n"}), ctx).text == "(без изменений)"
+    assert w.preview(w.parse({"path": "new.txt", "content": ""}), ctx).text == "(новый пустой файл)"
+
+
+def test_read_range_reports_total_lines(ctx):
+    (ctx.root / "r.txt").write_text("".join(f"l{i}\n" for i in range(1, 11)), encoding="utf-8")
+    r = ReadFileTool()
+    out = r.run(r.parse({"path": "r.txt", "start_line": 1, "end_line": 3}), ctx).content
+    assert out.endswith("… показаны строки 1–3 из 10. Продолжение: start_line=4.")
+    tail = r.run(r.parse({"path": "r.txt", "start_line": 9}), ctx).content
+    assert tail.endswith("… показаны строки 9–10 из 10.")
+    whole = r.run(r.parse({"path": "r.txt"}), ctx).content
+    assert "показаны строки" not in whole
+
+
+def test_read_cp1251_file(ctx):
+    (ctx.root / "old.txt").write_bytes("Привет\r\nмир\r\n".encode("cp1251"))
+    r = ReadFileTool()
+    res = r.run(r.parse({"path": "old.txt"}), ctx)
+    assert "1\tПривет" in res.content and "2\tмир" in res.content
+    assert "показан как cp1251" in res.content and "cp1251" in res.summary

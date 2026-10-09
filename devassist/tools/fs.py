@@ -93,11 +93,6 @@ def decode_text(raw: str) -> TextFile:
     return TextFile(text, eol, bom, mixed)
 
 
-def read_text_file(path: Path) -> TextFile:
-    """Текстовый (UTF-8) файл; иначе ``UnicodeDecodeError``."""
-    return decode_text(path.read_bytes().decode("utf-8"))
-
-
 def write_atomic(path: Path, data: bytes) -> None:
     """Записывает файл целиком или не трогает его вовсе.
 
@@ -122,6 +117,30 @@ def write_atomic(path: Path, data: bytes) -> None:
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise
+
+
+def load_existing(path: Path, shown: str) -> TextFile:
+    """Существующий файл для правки или перезаписи; иначе ToolError.
+
+    Каталог, FIFO/устройство, бинарный и не-UTF-8 файл не правятся: превью
+    выглядело бы как создание нового файла, а запись в UTF-8 испортила бы
+    содержимое (или зависла бы на FIFO).
+    """
+    if path.is_dir():
+        raise ToolError(f"Это директория, а не файл: {shown}")
+    if not path.is_file():
+        raise ToolError(f"Не обычный файл (FIFO, сокет или устройство): {shown}")
+    data = path.read_bytes()
+    if b"\0" in data[:_BINARY_PROBE]:
+        raise ToolError(f"Бинарный файл — write_file/edit_file меняют только текст: {shown}")
+    try:
+        return decode_text(data.decode("utf-8"))
+    except UnicodeDecodeError:
+        raise ToolError(
+            f"Файл не в UTF-8 (например, cp1251): {shown}. write_file/edit_file его не "
+            "меняют, чтобы не испортить кодировку; перекодировать можно через run_shell "
+            "(iconv -f cp1251 -t utf-8)."
+        ) from None
 
 
 def _lines(text: str) -> list[str]:
@@ -456,43 +475,69 @@ class ReadFileTool(Tool):
                 raise ToolError(f"Бинарный файл, чтение не поддерживается: {params.path}")
 
         start = max(params.start_line or 1, 1)
-        end = params.end_line
-        selected: list[tuple[int, str]] = []
-        budget = MAX_READ_CHARS
-        total = 0
-        stopped_at: int | None = None  # первая строка, которая не поместилась
+        encoding_note = ""
         try:
-            with p.open(encoding="utf-8") as fh:
-                for total, raw in enumerate(fh, start=1):
-                    if total < start or (end is not None and total > end):
-                        continue
-                    if stopped_at is not None:
-                        continue  # досчитываем общее число строк
-                    line = raw.rstrip("\r\n")
-                    if len(line) > MAX_LINE_CHARS:
-                        line = line[:MAX_LINE_CHARS] + " …[строка обрезана]"
-                    if len(selected) >= MAX_READ_LINES or len(line) + 1 > budget:
-                        stopped_at = total
-                        continue
-                    selected.append((total, line))
-                    budget -= len(line) + 1
-        except UnicodeDecodeError as e:
-            raise ToolError(f"Файл не является текстовым (UTF-8): {params.path}") from e
+            selected, total, stopped_at = _select_lines(p, start, params.end_line, "utf-8")
+        except UnicodeDecodeError:
+            # Чаще всего — старый русский текст в cp1251: показать его полезнее отказа.
+            selected, total, stopped_at = _select_lines(p, start, params.end_line, "cp1251")
+            encoding_note = CP1251_NOTE + "\n"
 
         if not selected:
             numbered = "(пусто)" if total == 0 else f"(нет строк в диапазоне; всего строк: {total})"
         else:
             width = len(str(selected[-1][0]))
             numbered = "\n".join(f"{str(n).rjust(width)}\t{line}" for n, line in selected)
+        first = selected[0][0] if selected else start
         if stopped_at is not None:
             numbered += (
-                f"\n… показаны строки {selected[0][0] if selected else start}–"
-                f"{stopped_at - 1} из {total}. Продолжение: start_line={stopped_at}."
+                f"\n… показаны строки {first}–{stopped_at - 1} из {total}. "
+                f"Продолжение: start_line={stopped_at}."
             )
+        elif selected and (first > 1 or selected[-1][0] < total):
+            last = selected[-1][0]
+            numbered += f"\n… показаны строки {first}–{last} из {total}."
+            if last < total:
+                numbered += f" Продолжение: start_line={last + 1}."
+        encoding = " · cp1251" if encoding_note else ""
         return ToolResult(
-            content=numbered,
-            summary=f"прочитан {_rel(ctx, p)} ({len(selected)} строк)",
+            content=encoding_note + numbered,
+            summary=f"прочитан {_rel(ctx, p)} ({len(selected)} строк){encoding}",
         )
+
+
+CP1251_NOTE = "(файл не в UTF-8 — показан как cp1251; edit_file и write_file такие файлы не меняют)"
+
+
+def _select_lines(
+    path: Path, start: int, end: int | None, encoding: str
+) -> tuple[list[tuple[int, str]], int, int | None]:
+    """Строки ``start..end`` в пределах лимитов чтения.
+
+    Возвращает (выбранные (номер, строка), всего строк в файле, первая строка,
+    не поместившаяся в лимит, или None). Для UTF-8 — ``UnicodeDecodeError`` на
+    неверных байтах, иначе неверные байты заменяются.
+    """
+    selected: list[tuple[int, str]] = []
+    budget = MAX_READ_CHARS
+    total = 0
+    stopped_at: int | None = None
+    errors = "strict" if encoding == "utf-8" else "replace"
+    with path.open(encoding=encoding, errors=errors) as fh:
+        for total, raw in enumerate(fh, start=1):
+            if total < start or (end is not None and total > end):
+                continue
+            if stopped_at is not None:
+                continue  # досчитываем общее число строк
+            line = raw.rstrip("\r\n")
+            if len(line) > MAX_LINE_CHARS:
+                line = line[:MAX_LINE_CHARS] + " …[строка обрезана]"
+            if len(selected) >= MAX_READ_LINES or len(line) + 1 > budget:
+                stopped_at = total
+                continue
+            selected.append((total, line))
+            budget -= len(line) + 1
+    return selected, total, stopped_at
 
 
 # --------------------------------------------------------------------------- #
@@ -515,16 +560,6 @@ class WriteFileTool(Tool):
     def risk(self, params: WriteFileParams, ctx: ToolContext) -> RiskLevel:
         return RiskLevel.WRITE
 
-    @staticmethod
-    def _existing(p: Path) -> TextFile | None:
-        """Текущее содержимое файла (None — файла нет)."""
-        if not p.is_file():
-            return None
-        try:
-            return read_text_file(p)
-        except UnicodeDecodeError:
-            return TextFile("")
-
     def _prepare(
         self, params: WriteFileParams, ctx: ToolContext
     ) -> tuple[Path, TextFile | None, TextFile, bool]:
@@ -533,7 +568,7 @@ class WriteFileTool(Tool):
         Существующий файл сохраняет свои переводы строк и BOM; новый — как прислано.
         """
         p = _writable_path(ctx, params.path)
-        old = self._existing(p)
+        old = load_existing(p, params.path) if p.exists() else None
         content, repaired = repair_escaped_content(params.content)
         new = decode_text(content)
         if old is not None:
@@ -542,13 +577,13 @@ class WriteFileTool(Tool):
 
     def preview(self, params: WriteFileParams, ctx: ToolContext) -> Display | None:
         _, old, new, _ = self._prepare(params, ctx)
-        diff = make_diff(old.text if old else "", new.text, params.path) or "(новый пустой файл)"
+        diff = make_diff(old.text if old else "", new.text, params.path)
+        if not diff:
+            diff = "(без изменений)" if old is not None else "(новый пустой файл)"
         return Display(diff, kind="diff", title=f"{params.path}{new.eol_note()}")
 
     def run(self, params: WriteFileParams, ctx: ToolContext) -> ToolResult:
         p, old, new, repaired = self._prepare(params, ctx)
-        if p.is_dir():
-            raise ToolError(f"Это директория: {params.path}")
         p.parent.mkdir(parents=True, exist_ok=True)
         write_atomic(p, new.encode())
         verb = "перезаписан" if old is not None else "создан"
@@ -594,12 +629,9 @@ class EditFileTool(Tool):
 
     def _compute(self, params: EditFileParams, ctx: ToolContext):
         p = _writable_path(ctx, params.path)
-        if not p.is_file():
+        if not p.exists():
             raise ToolError(f"Файл не найден: {params.path}")
-        try:
-            file = read_text_file(p)
-        except UnicodeDecodeError as e:
-            raise ToolError(f"Файл не текстовый: {params.path}") from e
+        file = load_existing(p, params.path)
         old = file.text
         # Сравнение и правка — в виде с \n; переводы строк файла вернёт запись.
         old_param = params.old_string.replace("\r\n", "\n")

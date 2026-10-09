@@ -230,7 +230,8 @@ def test_read_large_file_with_range(ctx):
     (ctx.root / "big.txt").write_text("\n".join(lines), encoding="utf-8")
     out = _read(ctx, path="big.txt", start_line=5000, end_line=5002).content
     assert "line 5000 " in out and "line 5002 " in out and "line 5003 " not in out
-    assert "показаны" not in out
+    # диапазон показан целиком, но файл длиннее — модель знает, где продолжить
+    assert out.endswith("… показаны строки 5000–5002 из 6000. Продолжение: start_line=5003.")
 
 
 def test_read_without_range_is_capped(ctx):
