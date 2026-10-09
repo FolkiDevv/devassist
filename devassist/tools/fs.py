@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import difflib
+import os
 import re
+import shutil
+import tempfile
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from pydantic import BaseModel, Field
@@ -29,6 +33,107 @@ def _rel(ctx: ToolContext, path: Path) -> str:
         return str(path.relative_to(ctx.root))
     except ValueError:
         return str(path)
+
+
+# --------------------------------------------------------------------------- #
+# Текст файла: переводы строк, BOM, атомарная запись
+# --------------------------------------------------------------------------- #
+_BOM = "﻿"
+_EOL_NAMES = {"\n": "LF", "\r\n": "CRLF", "\r": "CR"}
+
+
+@dataclass(frozen=True)
+class TextFile:
+    """Текст файла с переводами строк ``\\n`` и исходное оформление файла.
+
+    Инструменты сопоставляют, сравнивают и правят текст только в виде с ``\\n``, а
+    при записи возвращают файлу его переводы строк (``eol``) и BOM — правка одной
+    строки CRLF-файла не превращается в дифф на весь файл.
+    """
+
+    text: str
+    eol: str = "\n"
+    bom: bool = False
+    mixed: bool = False  # в файле были разные окончания строк — запишутся как ``eol``
+
+    def encode(self, text: str | None = None) -> bytes:
+        body = self.text if text is None else text
+        if self.eol != "\n":
+            body = body.replace("\n", self.eol)
+        return ((_BOM if self.bom else "") + body).encode("utf-8")
+
+    def eol_note(self) -> str:
+        """Пометка для результата: окончания строк файла будут выровнены."""
+        if not self.mixed:
+            return ""
+        return f" (окончания строк приведены к {_EOL_NAMES[self.eol]})"
+
+
+def decode_text(raw: str) -> TextFile:
+    """Разбор текста: преобладающий перевод строки, BOM, вид с ``\\n``.
+
+    Одиночный ``\\r`` считается переводом строки, только если он преобладает
+    (старые файлы Mac); иначе это обычный символ и сохраняется как есть.
+    """
+    bom = raw.startswith(_BOM)
+    if bom:
+        raw = raw[1:]
+    crlf = raw.count("\r\n")
+    counts = {"\n": raw.count("\n") - crlf, "\r\n": crlf, "\r": raw.count("\r") - crlf}
+    eol = max(("\n", "\r\n", "\r"), key=lambda k: (counts[k], k == "\n"))
+    if counts[eol] == 0:
+        eol = "\n"
+    if eol == "\r":
+        text = raw.replace("\r\n", "\n").replace("\r", "\n")
+        mixed = counts["\n"] + counts["\r\n"] > 0
+    else:
+        text = raw.replace("\r\n", "\n")
+        mixed = counts["\n"] > 0 and counts["\r\n"] > 0
+    return TextFile(text, eol, bom, mixed)
+
+
+def read_text_file(path: Path) -> TextFile:
+    """Текстовый (UTF-8) файл; иначе ``UnicodeDecodeError``."""
+    return decode_text(path.read_bytes().decode("utf-8"))
+
+
+def write_atomic(path: Path, data: bytes) -> None:
+    """Записывает файл целиком или не трогает его вовсе.
+
+    Существующий файл заменяется через временный файл в том же каталоге
+    (``os.replace``) с прежними правами: прерывание (Esc, Ctrl+C) или нехватка
+    места посреди записи не оставят его пустым или обрезанным. Если во временный
+    файл писать нельзя (каталог без права записи), пишем напрямую.
+    """
+    if not path.exists():
+        path.write_bytes(data)
+        return
+    try:
+        fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    except PermissionError:
+        path.write_bytes(data)
+        return
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        shutil.copymode(path, tmp)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
+def _lines(text: str) -> list[str]:
+    """Строки с окончаниями — только по ``\\n``.
+
+    ``str.splitlines`` режет ещё и по ``\\x0c``, ``\\x85``, ``\\u2028`` — номера строк
+    разошлись бы с ``read_file``, а строки диффа склеились бы.
+    """
+    parts = text.split("\n")
+    lines = [part + "\n" for part in parts[:-1]]
+    if parts[-1]:
+        lines.append(parts[-1])
+    return lines
 
 
 def _git_dirs(root: Path) -> list[Path]:
@@ -89,14 +194,15 @@ def _writable_path(ctx: ToolContext, path: str) -> Path:
     return p
 
 
+_NO_NEWLINE = "\\ No newline at end of file\n"
+
+
 def make_diff(old: str, new: str, path: str) -> str:
-    diff = difflib.unified_diff(
-        old.splitlines(keepends=True),
-        new.splitlines(keepends=True),
-        fromfile=f"a/{path}",
-        tofile=f"b/{path}",
-    )
-    return "".join(diff)
+    """Unified diff двух текстов (с ``\\n``), как у git: последняя строка без
+    перевода строки помечается ``\\ No newline at end of file``, а не склеивается
+    со следующей строкой диффа."""
+    diff = difflib.unified_diff(_lines(old), _lines(new), fromfile=f"a/{path}", tofile=f"b/{path}")
+    return "".join(line if line.endswith("\n") else f"{line}\n{_NO_NEWLINE}" for line in diff)
 
 
 def _unescape_simple(s: str) -> str:
@@ -165,7 +271,7 @@ def repair_escaped_content(content: str) -> tuple[str, bool]:
 
 def _numbered_excerpt(text: str, max_lines: int = 60) -> str:
     """Содержимое файла с номерами строк (для подсказки при неудачном edit)."""
-    lines = text.splitlines()
+    lines = [line.rstrip("\n") for line in _lines(text)]
     shown = lines[:max_lines]
     width = len(str(len(shown)))
     body = "\n".join(f"{str(i + 1).rjust(width)}\t{ln}" for i, ln in enumerate(shown))
@@ -181,7 +287,7 @@ def _tolerant_find(text: str, pattern: str):
     совпадении, иначе None. Используется как запасной вариант, когда точное
     совпадение не найдено (модель часто слегка путает отступы/хвостовые пробелы).
     """
-    raw = text.splitlines(keepends=True)
+    raw = _lines(text)
     if not raw:
         return None
     offsets = []
@@ -189,9 +295,9 @@ def _tolerant_find(text: str, pattern: str):
     for ln in raw:
         offsets.append(pos)
         pos += len(ln)
-    contents = [ln.rstrip("\r\n") for ln in raw]
+    contents = [ln.rstrip("\n") for ln in raw]
 
-    pat_lines = pattern.splitlines()
+    pat_lines = pattern.split("\n")
     while pat_lines and not pat_lines[0].strip():
         pat_lines.pop(0)
     while pat_lines and not pat_lines[-1].strip():
@@ -315,37 +421,53 @@ class WriteFileTool(Tool):
     def risk(self, params: WriteFileParams, ctx: ToolContext) -> RiskLevel:
         return RiskLevel.WRITE
 
-    def _old_content(self, ctx: ToolContext, params: WriteFileParams) -> str:
+    @staticmethod
+    def _existing(p: Path) -> TextFile | None:
+        """Текущее содержимое файла (None — файла нет)."""
+        if not p.is_file():
+            return None
+        try:
+            return read_text_file(p)
+        except UnicodeDecodeError:
+            return TextFile("")
+
+    def _prepare(
+        self, params: WriteFileParams, ctx: ToolContext
+    ) -> tuple[Path, TextFile | None, TextFile, bool]:
+        """Путь, прежний текст и новый текст с оформлением, с которым он запишется.
+
+        Существующий файл сохраняет свои переводы строк и BOM; новый — как прислано.
+        """
         p = _writable_path(ctx, params.path)
-        if p.is_file():
-            try:
-                return p.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
-                return ""
-        return ""
+        old = self._existing(p)
+        content, repaired = repair_escaped_content(params.content)
+        new = decode_text(content)
+        if old is not None:
+            new = TextFile(new.text, old.eol, old.bom, old.mixed)
+        return p, old, new, repaired
 
     def preview(self, params: WriteFileParams, ctx: ToolContext) -> Display | None:
-        old = self._old_content(ctx, params)
-        content, _ = repair_escaped_content(params.content)
-        diff = make_diff(old, content, params.path) or "(новый пустой файл)"
-        return Display(diff, kind="diff", title=params.path)
+        _, old, new, _ = self._prepare(params, ctx)
+        diff = make_diff(old.text if old else "", new.text, params.path) or "(новый пустой файл)"
+        return Display(diff, kind="diff", title=f"{params.path}{new.eol_note()}")
 
     def run(self, params: WriteFileParams, ctx: ToolContext) -> ToolResult:
-        p = _writable_path(ctx, params.path)
+        p, old, new, repaired = self._prepare(params, ctx)
         if p.is_dir():
             raise ToolError(f"Это директория: {params.path}")
-        existed = p.is_file()
-        old = self._old_content(ctx, params)
-        content, repaired = repair_escaped_content(params.content)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(content, encoding="utf-8")
-        verb = "перезаписан" if existed else "создан"
-        n = len(content.splitlines())
-        note = " (автокоррекция экранирования)" if repaired else ""
+        write_atomic(p, new.encode())
+        verb = "перезаписан" if old is not None else "создан"
+        n = len(_lines(new.text))
+        note = (" (автокоррекция экранирования)" if repaired else "") + new.eol_note()
         return ToolResult(
             content=f"Файл {verb}: {params.path} ({n} строк).{note}",
             summary=f"{verb} {_rel(ctx, p)}{note}",
-            display=Display(make_diff(old, content, params.path), kind="diff", title=params.path),
+            display=Display(
+                make_diff(old.text if old else "", new.text, params.path),
+                kind="diff",
+                title=params.path,
+            ),
         )
 
 
@@ -381,10 +503,14 @@ class EditFileTool(Tool):
         if not p.is_file():
             raise ToolError(f"Файл не найден: {params.path}")
         try:
-            old = p.read_text(encoding="utf-8")
+            file = read_text_file(p)
         except UnicodeDecodeError as e:
             raise ToolError(f"Файл не текстовый: {params.path}") from e
-        if params.old_string == params.new_string:
+        old = file.text
+        # Сравнение и правка — в виде с \n; переводы строк файла вернёт запись.
+        old_param = params.old_string.replace("\r\n", "\n")
+        new_param = params.new_string.replace("\r\n", "\n")
+        if old_param == new_param:
             raise ToolError("old_string и new_string совпадают — нечего менять.")
 
         # Слабые модели часто слегка искажают old_string: экранируют переносы
@@ -404,17 +530,17 @@ class EditFileTool(Tool):
 
         seen = set()
         for tf in transforms:
-            old_string = tf(params.old_string)
+            old_string = tf(old_param)
             if old_string in seen:
                 continue
             seen.add(old_string)
-            new_string = tf(params.new_string)
+            new_string = tf(new_param)
 
             # Тир 1: точное совпадение.
             count = old.count(old_string)
             if count == 1 or (count > 1 and params.replace_all):
                 new = old.replace(old_string, new_string)
-                return p, old, new, count
+                return p, file, new, count
             if count > 1 and not params.replace_all:
                 raise ToolError(
                     f"old_string встречается {count} раз. Добавьте контекста, чтобы "
@@ -425,7 +551,7 @@ class EditFileTool(Tool):
             if span is not None:
                 start, end = span
                 new = old[:start] + new_string + old[end:]
-                return p, old, new, 1
+                return p, file, new, 1
 
         # Не найдено — даём модели контекст файла, чтобы скопировать точно.
         raise ToolError(
@@ -434,17 +560,22 @@ class EditFileTool(Tool):
         )
 
     def preview(self, params: EditFileParams, ctx: ToolContext) -> Display | None:
-        _, old, new, _ = self._compute(params, ctx)
-        return Display(make_diff(old, new, params.path), kind="diff", title=params.path)
+        _, file, new, _ = self._compute(params, ctx)
+        return Display(
+            make_diff(file.text, new, params.path),
+            kind="diff",
+            title=f"{params.path}{file.eol_note()}",
+        )
 
     def run(self, params: EditFileParams, ctx: ToolContext) -> ToolResult:
-        p, old, new, count = self._compute(params, ctx)
-        p.write_text(new, encoding="utf-8")
+        p, file, new, count = self._compute(params, ctx)
+        write_atomic(p, file.encode(new))
         replaced = count if params.replace_all else 1
+        note = file.eol_note()
         return ToolResult(
-            content=f"Отредактирован {params.path}: заменено вхождений — {replaced}.",
-            summary=f"изменён {_rel(ctx, p)}",
-            display=Display(make_diff(old, new, params.path), kind="diff", title=params.path),
+            content=f"Отредактирован {params.path}: заменено вхождений — {replaced}.{note}",
+            summary=f"изменён {_rel(ctx, p)}{note}",
+            display=Display(make_diff(file.text, new, params.path), kind="diff", title=params.path),
         )
 
 

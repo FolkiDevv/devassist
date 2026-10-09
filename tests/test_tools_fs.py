@@ -443,3 +443,99 @@ def test_git_config_write_rejected_in_accept_edits_mode(tmp_path):
     assert events.confirms == []
     assert (tmp_path / ".git" / "config").read_text(encoding="utf-8") == "[core]\n"
     assert "Внутренности git" in provider.requests[-1]["messages"][-1].content
+
+
+# ------------------------- переводы строк, BOM, запись ------------------------- #
+def _edit(ctx, path, old, new, **kw):
+    e = EditFileTool()
+    return e.run(e.parse({"path": path, "old_string": old, "new_string": new, **kw}), ctx)
+
+
+def test_edit_keeps_crlf_line_endings(ctx):
+    (ctx.root / "w.txt").write_bytes(b"one\r\ntwo\r\nthree\r\n")
+    _edit(ctx, "w.txt", "two", "TWO")
+    assert (ctx.root / "w.txt").read_bytes() == b"one\r\nTWO\r\nthree\r\n"
+    # многострочный фрагмент от модели — с \n; несторогое совпадение (хвостовые пробелы)
+    _edit(ctx, "w.txt", "one\nTWO", "1\n2")
+    assert (ctx.root / "w.txt").read_bytes() == b"1\r\n2\r\nthree\r\n"
+    (ctx.root / "t.txt").write_bytes(b"a  \r\nb\r\nc\r\n")
+    _edit(ctx, "t.txt", "a\nb", "x\ny")
+    assert (ctx.root / "t.txt").read_bytes() == b"x\r\ny\r\nc\r\n"
+
+
+def test_write_over_crlf_file_keeps_its_line_endings(ctx):
+    (ctx.root / "w.bat").write_bytes(b"@echo off\r\necho 1\r\n")
+    w = WriteFileTool()
+    params = w.parse({"path": "w.bat", "content": "@echo off\necho 2\n"})
+    preview = w.preview(params, ctx)
+    assert "\r" not in preview.text and "-echo 1\n+echo 2\n" in preview.text
+    w.run(params, ctx)
+    assert (ctx.root / "w.bat").read_bytes() == b"@echo off\r\necho 2\r\n"
+
+
+def test_new_files_and_lf_files_stay_lf(ctx):
+    w = WriteFileTool()
+    w.run(w.parse({"path": "n.py", "content": "a = 1\nb = 2\n"}), ctx)
+    assert (ctx.root / "n.py").read_bytes() == b"a = 1\nb = 2\n"
+    _edit(ctx, "n.py", "b = 2", "b = 3")
+    assert (ctx.root / "n.py").read_bytes() == b"a = 1\nb = 3\n"
+
+
+def test_edit_keeps_bom(ctx):
+    (ctx.root / "b.cs").write_bytes("﻿using System;\r\nclass A {}\r\n".encode())
+    _edit(ctx, "b.cs", "using System;", "using System.IO;")
+    assert (ctx.root / "b.cs").read_bytes() == "﻿using System.IO;\r\nclass A {}\r\n".encode()
+
+
+def test_mixed_line_endings_are_unified_with_a_note(ctx):
+    (ctx.root / "m.txt").write_bytes(b"a\r\nb\r\nc\nd\r\n")
+    res = _edit(ctx, "m.txt", "a", "A")
+    assert (ctx.root / "m.txt").read_bytes() == b"A\r\nb\r\nc\r\nd\r\n"
+    assert "приведены к CRLF" in res.content
+
+
+def test_make_diff_marks_missing_final_newline():
+    from devassist.tools.fs import make_diff
+
+    assert make_diff("a", "b", "x") == (
+        "--- a/x\n+++ b/x\n@@ -1 +1 @@\n"
+        "-a\n\\ No newline at end of file\n+b\n\\ No newline at end of file\n"
+    )
+    assert make_diff("a\n", "a\nb", "x").endswith("+b\n\\ No newline at end of file\n")
+
+
+def test_make_diff_splits_only_on_newlines():
+    """\\x0c, \\x85, \\u2028 — не переводы строк: строки диффа не склеиваются."""
+    from devassist.tools.fs import make_diff
+
+    diff = make_diff("a\x0cb\nc d\nend\n", "a\x0cb\nC d\nend\n", "x")
+    lines = [line for line in diff.split("\n")[2:] if line]
+    assert lines and all(line[:1] in " +-@\\" for line in lines)
+    assert "-c d" in diff and "+C d" in diff
+
+
+def test_interrupted_write_leaves_file_intact(ctx, monkeypatch):
+    import os
+
+    (ctx.root / "k.py").write_text("x = 1\n", encoding="utf-8")
+
+    def interrupted(src, dst):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(os, "replace", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        _edit(ctx, "k.py", "x = 1", "x = 2")
+    assert (ctx.root / "k.py").read_text(encoding="utf-8") == "x = 1\n"
+    assert sorted(p.name for p in ctx.root.iterdir()) == ["k.py"]  # временный файл убран
+
+
+def test_edit_keeps_file_mode(ctx):
+    import os
+
+    if os.name == "nt":
+        pytest.skip("права POSIX")
+    script = ctx.root / "run.sh"
+    script.write_text("echo 1\n", encoding="utf-8")
+    script.chmod(0o755)
+    _edit(ctx, "run.sh", "echo 1", "echo 2")
+    assert script.stat().st_mode & 0o777 == 0o755
