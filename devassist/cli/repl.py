@@ -68,8 +68,9 @@ def run_repl(
 
     while True:
         try:
-            line = (read(default=typeahead) if typeahead else read()).strip()
-            typeahead = ""
+            # Набранное во время хода подставляется один раз: Ctrl+C его сбрасывает.
+            default, typeahead = typeahead, ""
+            line = (read(default=default) if default else read()).strip()
         except EOFError:
             ui.system("\nдо встречи!")
             return 0

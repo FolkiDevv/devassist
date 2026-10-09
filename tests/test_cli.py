@@ -225,3 +225,44 @@ def test_repl_prefills_typeahead_and_uses_esc(cli_env, capsys):
     assert esc.entered == 1  # ход — внутри перехвата Esc, команды — нет
     assert calls == [{}, {"default": "набрано во время хода"}]
     assert ui._interrupt_hint == "Esc — прервать"
+
+
+def test_ctrl_c_discards_prefilled_typeahead(cli_env):
+    import contextlib
+
+    agent, ui, commands, _, _ = cli_env
+
+    class FakeEsc:
+        enabled = True
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return None
+
+        def paused(self):
+            return contextlib.nullcontext()
+
+        def take_typeahead(self):
+            return "набрано"
+
+    calls = []
+    answers = ["привет", KeyboardInterrupt(), "/exit"]
+
+    def read(**kwargs):
+        calls.append(kwargs)
+        item = answers.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    run_repl(agent, ui, commands, read_input=read, interrupt=FakeEsc())
+    assert calls == [{}, {"default": "набрано"}, {}]
+
+
+def test_plain_reader_keeps_typeahead(monkeypatch):
+    from devassist.cli import prompt
+
+    monkeypatch.setattr("builtins.input", lambda p: " и ещё")
+    assert prompt._read_plain("набрано") == "набрано и ещё"

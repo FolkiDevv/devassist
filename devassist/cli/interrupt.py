@@ -49,24 +49,26 @@ class KeyParser:
         self._more_pending = more_pending
         self._decoder = codecs.getincrementaldecoder("utf-8")(errors="ignore")
         self._text: list[str] = []
-        self._in_sequence = False
+        # Разбор ESC-последовательности: "" — обычный текст; "esc" — после ESC;
+        # "csi" — ESC [ … до финального байта; "ss3" — ESC O + один байт;
+        # "alt" — хвост многобайтного символа после ESC (Alt+буква).
+        self._state = ""
 
     def feed(self, data: bytes) -> None:
         i = 0
         while i < len(data):
             byte = data[i]
-            if self._in_sequence and byte != _ESC:
-                # CSI/SS3: ESC [ ... <финальный байт 0x40–0x7E>
-                if 0x40 <= byte <= 0x7E and byte not in (0x5B, 0x4F):
-                    self._in_sequence = False
+            if byte == _ESC:
+                if i + 1 < len(data) or self._more_pending():
+                    self._state = "esc"  # стрелка, Alt+клавиша и т.п.
+                else:
+                    self._state = ""
+                    self._on_escape()
                 i += 1
                 continue
-            if byte == _ESC:
-                self._in_sequence = False
-                if i + 1 < len(data) or self._more_pending():
-                    self._in_sequence = True  # стрелка, Alt+клавиша и т.п.
-                else:
-                    self._on_escape()
+            if self._state:
+                if not self._skip_sequence_byte(byte):
+                    continue  # байт не относится к последовательности — разобрать заново
                 i += 1
                 continue
             if byte in _ERASE:
@@ -79,6 +81,31 @@ class KeyParser:
                 j += 1
             self._text.extend(self._decoder.decode(data[i:j]))
             i = j
+
+    def _skip_sequence_byte(self, byte: int) -> bool:
+        """Поглощает байт ESC-последовательности. False — последовательность кончилась
+        раньше, и байт нужно обработать как обычный."""
+        state = self._state
+        if state == "esc":
+            if byte == 0x5B:  # [
+                self._state = "csi"
+            elif byte == 0x4F:  # O
+                self._state = "ss3"
+            else:  # Alt+символ: сам символ отбрасываем целиком
+                self._state = "alt" if byte >= 0xC0 else ""
+            return True
+        if state == "csi":
+            if 0x40 <= byte <= 0x7E:  # финальный байт; параметры — 0x20–0x3F
+                self._state = ""
+            return True
+        if state == "ss3":
+            self._state = ""
+            return True
+        # "alt": байты продолжения UTF-8
+        if 0x80 <= byte <= 0xBF:
+            return True
+        self._state = ""
+        return False
 
     def take_text(self) -> str:
         """Набранный текст (без завершающих переводов строк); буфер очищается."""
@@ -196,7 +223,9 @@ class EscInterrupt:
                 continue
             data = self._read()
             if not data:
-                break  # EOF
+                if os.name == "posix":
+                    break  # EOF
+                continue  # Windows: прочитаны только стрелки/F-клавиши
             self._parser.feed(data)
         self._idle.set()
 

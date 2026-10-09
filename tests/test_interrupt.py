@@ -116,3 +116,20 @@ def test_disabled_without_terminal(tmp_path):
         with esc, esc.paused():
             pass
         assert esc.take_typeahead() == ""
+
+
+@pytest.mark.parametrize(
+    ("keys", "text"),
+    [
+        (b"\x1b1hello", "hello"),  # Alt+1
+        (b"\x1bxhello", "hello"),  # Alt+x
+        ("\x1bжhello".encode(), "hello"),  # Alt+многобайтная буква
+        (b"\x1b[1;5Cok", "ok"),  # Ctrl+стрелка с параметрами
+        (b"\x1bOPok", "ok"),  # F1
+        (b"\x1b[200~paste\x1b[201~", "paste"),  # bracketed paste
+    ],
+)
+def test_text_after_sequences_is_kept(keys, text):
+    parser, hits = _parser()
+    parser.feed(keys)
+    assert hits == [] and parser.take_text() == text

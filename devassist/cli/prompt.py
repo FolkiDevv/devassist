@@ -204,7 +204,9 @@ def create_prompt_session(
 
 
 def _read_plain(default: str = "") -> str:
-    return input(PLAIN_PROMPT)
+    """``input()`` не умеет заполнять строку: набранное заранее печатается после
+    приглашения и приклеивается к введённому."""
+    return default + input(PLAIN_PROMPT + default)
 
 
 def make_input_reader(
