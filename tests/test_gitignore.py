@@ -136,3 +136,18 @@ def test_find_and_search_tools_respect_gitignore(tmp_path):
     assert found.content == "src/a.py"
     hits = SearchContentTool().run(SearchContentParams(pattern="needle"), ctx)
     assert "src/a.py:1" in hits.content and "dist-web" not in hits.content
+
+
+def test_is_excluded_matches_walk_decision(tmp_path):
+    from devassist.project.files import is_excluded
+
+    _make(tmp_path, ".gitignore", "out/\n*.log\n")
+    _make(tmp_path, "pkg/.gitignore", "local.py\n")
+    for rel in ("a.py", "out/x.py", "pkg/local.py", "pkg/ok.py", "node_modules/m.js", "b.log"):
+        _make(tmp_path, rel)
+    walked = set(_rels(tmp_path))
+    for rel in ("a.py", "out/x.py", "pkg/local.py", "pkg/ok.py", "node_modules/m.js", "b.log"):
+        assert is_excluded(tmp_path, tmp_path.resolve() / rel) is (rel not in walked), rel
+    assert is_excluded(tmp_path, tmp_path.resolve() / "out")
+    assert not is_excluded(tmp_path, tmp_path.resolve())
+    assert is_excluded(tmp_path, tmp_path.parent)

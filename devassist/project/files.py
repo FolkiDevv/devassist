@@ -56,6 +56,36 @@ def is_within(root: Path, path: Path) -> bool:
     return resolved == root or root in resolved.parents
 
 
+def is_excluded(root: Path, path: Path) -> bool:
+    """``path`` (внутри ``root``) лежит в служебном каталоге или исключён ``.gitignore``.
+
+    Проверка того же решения, что принимает :func:`walk_files`, для одного пути.
+    Путь вне корня считается исключённым.
+    """
+    root = root.resolve()
+    try:
+        rel = path.relative_to(root).as_posix()
+    except ValueError:
+        return True
+    if rel == ".":
+        return False
+    parts = rel.split("/")
+    if any(is_ignored_dir(part) for part in parts[:-1]):
+        return True
+    is_last_dir = path.is_dir() and not path.is_symlink()
+    if is_last_dir and is_ignored_dir(parts[-1]):
+        return True
+    stack = root_stack(root)
+    for i in range(len(parts)):
+        sub = "/".join(parts[: i + 1])
+        is_dir = i < len(parts) - 1 or is_last_dir
+        if stack.is_ignored(sub, is_dir):
+            return True
+        if i < len(parts) - 1:
+            stack = stack.enter(root, sub)
+    return False
+
+
 def _rel_dir(root: Path, directory: Path) -> str:
     """Каталог относительно корня в POSIX-виде; сам корень — пустая строка."""
     rel = directory.relative_to(root).as_posix()
