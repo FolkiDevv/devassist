@@ -12,6 +12,7 @@ from __future__ import annotations
 from devassist import __version__
 from devassist.agent.loop import Agent
 from devassist.cli.commands import CommandContext, CommandRegistry, is_repl_command
+from devassist.cli.indexing import ensure_index
 from devassist.cli.interrupt import EscInterrupt
 from devassist.cli.prompt import InputReader, StatusInfo, make_input_reader
 from devassist.llm.base import LLMError
@@ -44,9 +45,11 @@ def run_repl(
     *,
     read_input: InputReader | None = None,
     interrupt: EscInterrupt | None = None,
+    index_on_start: bool = True,
 ) -> int:
     """``interrupt`` подменяется в тестах; по умолчанию Esc слушается только вместе с
-    настоящей строкой ввода (``read_input is None``)."""
+    настоящей строкой ввода (``read_input is None``). ``index_on_start`` — до первого
+    ввода построить индекс проекта, если его нет (:func:`~devassist.cli.indexing.ensure_index`)."""
     if interrupt is None:
         interrupt = EscInterrupt(enabled=None if read_input is None else False)
     esc = esc_interrupt_for(ui, interrupt)
@@ -63,8 +66,11 @@ def run_repl(
         hints=[(cmd.name, cmd.summary) for cmd in commands],
         auto_approve=agent.config.auto_approve,
     )
-    ctx = CommandContext(agent=agent, ui=ui, commands=commands)
-    typeahead = ""  # набранное во время хода — в следующую строку ввода
+    # Ввод не принимается, пока строится индекс (Esc/Ctrl+C — отменить построение).
+    if index_on_start:
+        ensure_index(agent.workspace, ui, esc)
+    ctx = CommandContext(agent=agent, ui=ui, commands=commands, interrupt=esc)
+    typeahead = esc.take_typeahead()  # набранное во время хода — в следующую строку ввода
 
     while True:
         try:
@@ -83,6 +89,7 @@ def run_repl(
         if is_repl_command(line):
             if not commands.dispatch(line, ctx):
                 return 0
+            typeahead = esc.take_typeahead()
             continue
 
         try:
