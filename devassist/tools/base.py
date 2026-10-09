@@ -217,6 +217,7 @@ def build_default_registry() -> ToolRegistry:
         WriteFileTool,
     )
     from devassist.tools.git import GitTool
+    from devassist.tools.index import FileOutlineTool, FindSymbolTool
     from devassist.tools.search import SearchContentTool
     from devassist.tools.shell import RunShellTool
 
@@ -228,6 +229,8 @@ def build_default_registry() -> ToolRegistry:
         ListDirTool(),
         FindFilesTool(),
         SearchContentTool(),
+        FindSymbolTool(),
+        FileOutlineTool(),
         RunShellTool(),
         GitTool(),
         AskUserTool(),

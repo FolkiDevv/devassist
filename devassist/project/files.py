@@ -37,6 +37,9 @@ IGNORE_DIRS: frozenset[str] = frozenset(
 )
 
 
+TREE_TRUNCATED = "... (дерево обрезано)"
+
+
 def is_ignored_dir(name: str) -> bool:
     """Каталог служебный (VCS, кеши, окружения, сборка) — не обходим его."""
     return name in IGNORE_DIRS or name.endswith(".egg-info")
@@ -188,5 +191,5 @@ def build_file_tree(root: Path, max_entries: int = 200) -> str:
 
     walk(root, "", root_stack(root), "")
     if count >= max_entries:
-        lines.append("... (дерево обрезано)")
+        lines.append(TREE_TRUNCATED)
     return "\n".join(lines)
