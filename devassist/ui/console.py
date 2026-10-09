@@ -44,6 +44,7 @@ from devassist.llm.types import Message
 from devassist.tools.ask_user import format_answer
 from devassist.tools.base import Display, ToolResult
 from devassist.tools.questions import Answer, Question, QuestionsUnavailable
+from devassist.ui import banner as banner_art
 from devassist.ui.format import SKIPPED_MARK, clip_lines, format_tokens, format_when, plural
 from devassist.ui.markdown import Markdown
 from devassist.ui.markdown_stream import MarkdownStream
@@ -284,21 +285,17 @@ class Console(AgentEvents):
         auto_approve: bool = False,
     ) -> None:
         """Приветственная панель; ``hints`` — пары (команда, краткое описание)."""
-        logo = Text()
-        logo.append(f"{ICON_BRAND} ", style=f"bold {BRAND}")
-        logo.append("dev", style=f"bold {BRAND}")
-        logo.append("assist", style="bold")
-        logo.append(f"  v{version}", style=MUTED)
-
-        subtitle = Text("AI-ассистент разработчика · работает на GigaChat", style=MUTED)
-
-        meta = Table.grid(padding=(0, 1))
-        meta.add_column(style=MUTED, justify="right")
-        meta.add_column()
-        meta.add_row("модель", Text(model, style=f"bold {ACCENT}"))
-        meta.add_row("проект", Text(root))
-
-        body = Group(logo, subtitle, Text(""), meta)
+        info = Group(
+            banner_art.title(),
+            Text(f"v{version}", style=MUTED),
+            Text(""),
+            Text.assemble(("модель ", MUTED), (model, f"bold {ACCENT}")),
+            Text.assemble(("проект ", MUTED), root),
+        )
+        body = Table.grid(padding=(0, 3))
+        body.add_column(vertical="middle", no_wrap=True)
+        body.add_column(vertical="middle")
+        body.add_row(banner_art.rocket(), info)
         self._c.print(Panel(body, box=ROUNDED, border_style=BRAND, padding=(1, 2), expand=False))
         hint = Text("  ", style=MUTED)
         for i, (cmd, desc) in enumerate(hints):
