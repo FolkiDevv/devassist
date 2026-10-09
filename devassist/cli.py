@@ -14,7 +14,7 @@ from pathlib import Path
 
 from devassist import __version__
 from devassist.agent.loop import Agent
-from devassist.config import Config
+from devassist.config import Config, ConfigError
 from devassist.llm.base import LLMError
 from devassist.llm.gigachat import GigaChatProvider
 from devassist.tools.base import build_default_registry
@@ -147,13 +147,17 @@ def _handle_command(line: str, agent: Agent, ui: Console, config: Config) -> boo
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     root = Path(args.dir).resolve()
-    config = Config.load(
-        project_root=root,
-        model=args.model,
-        auto_approve=args.yes,
-        stream=not args.no_stream,
-    )
     ui = Console(no_color=args.no_color, assume_yes=args.yes)
+    try:
+        config = Config.load(
+            project_root=root,
+            model=args.model,
+            auto_approve=args.yes,
+            stream=not args.no_stream,
+        )
+    except ConfigError as e:
+        ui.error(f"ошибка конфигурации: {e}")
+        return 1
 
     try:
         config.require_credentials()
