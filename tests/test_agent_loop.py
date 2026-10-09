@@ -8,7 +8,6 @@ import pytest
 from fakes import FakeTool, RecordingEvents, ScriptedProvider, text_turn, tool_turn
 
 from devassist.agent.loop import Agent
-from devassist.agent.session import Session
 from devassist.config import Config
 from devassist.errors import ToolError
 from devassist.llm.types import Usage
@@ -23,7 +22,6 @@ def _agent(provider, tmp_path: Path, *, events=None, registry=None, **cfg_kw) ->
         registry or build_default_registry(),
         cfg,
         events or RecordingEvents(),
-        session=Session(tmp_path),
     )
 
 
@@ -67,7 +65,7 @@ def test_streaming_events_wrap_each_request(tmp_path):
     provider = ScriptedProvider([text_turn("поток")])
     events = RecordingEvents()
     cfg = Config(access_key="x", project_root=tmp_path, stream=True)
-    agent = Agent(provider, build_default_registry(), cfg, events, session=Session(tmp_path))
+    agent = Agent(provider, build_default_registry(), cfg, events)
     agent.run_turn("hi")
     kinds = [k for k, _ in events.events]
     assert kinds == ["stream_start", "delta", "stream_end"]
@@ -85,7 +83,7 @@ def test_write_outside_sandbox_does_not_crash_without_auto_approve(tmp_path):
     assert agent.run_turn("запиши файл") == "не вышло"
     assert not (tmp_path / "escape.txt").exists()
     assert events.confirms == []  # невыполнимую операцию не предлагаем подтверждать
-    results = [m for m in agent.session.messages() if m.role == "function"]
+    results = [m for m in agent.conversation.messages if m.role == "function"]
     assert "за пределы" in results[-1].content
 
 
@@ -117,7 +115,7 @@ def test_rejection_does_not_run_and_tells_model(tmp_path):
     assert tool.runs == 0
     call, preview, dangerous = events.confirms[0]
     assert call.name == "fake_write" and preview.kind == "diff" and dangerous is False
-    function_msgs = [m for m in agent.session.messages() if m.role == "function"]
+    function_msgs = [m for m in agent.conversation.messages if m.role == "function"]
     assert "ОТКЛОНИЛ" in function_msgs[-1].content
 
 
@@ -169,3 +167,72 @@ def test_turn_stats_split_billed_and_context(tmp_path):
     assert (stats.steps, stats.tool_calls) == (2, 1)
     assert stats.billed_tokens == 260
     assert stats.context_tokens == 150
+
+
+def _assert_well_formed(messages):
+    for i, m in enumerate(messages):
+        if m.role == "function":
+            prev = messages[i - 1]
+            assert prev.role == "assistant" and prev.function_call is not None
+
+
+def test_ctrl_c_during_tool_repairs_history(tmp_path):
+    def interrupted():
+        raise KeyboardInterrupt
+
+    tool = FakeTool(run=interrupted)
+    provider = ScriptedProvider([tool_turn("fake_write", {}), text_turn("снова тут")])
+    agent = _agent(provider, tmp_path, registry=_registry_with(tool))
+    with pytest.raises(KeyboardInterrupt):
+        agent.run_turn("x")
+    assert agent.conversation.pending_call() is None
+    # следующий ход отправляет корректную историю
+    assert agent.run_turn("продолжай") == "снова тут"
+    _assert_well_formed(provider.requests[-1]["messages"])
+
+
+def test_set_model_is_passed_to_provider(tmp_path):
+    provider = ScriptedProvider([text_turn("a"), text_turn("b")])
+    agent = _agent(provider, tmp_path)
+    agent.run_turn("1")
+    agent.set_model("GigaChat-2-Max")
+    agent.run_turn("2")
+    assert [r["model"] for r in provider.requests] == [agent._cfg.model, "GigaChat-2-Max"]
+    with pytest.raises(ValueError):
+        agent.set_model("  ")
+
+
+def test_reset_rebuilds_system_prompt(tmp_path):
+    provider = ScriptedProvider([text_turn("a"), text_turn("b")])
+    agent = _agent(provider, tmp_path)
+    agent.run_turn("1")
+    (tmp_path / "new_file.py").write_text("x", encoding="utf-8")
+    agent.reset()
+    assert len(agent.conversation) == 0
+    agent.run_turn("2")
+    system = provider.requests[-1]["messages"][0]
+    assert system.role == "system" and "new_file.py" in system.content
+    assert [m.role for m in provider.requests[-1]["messages"]] == ["system", "user"]
+
+
+def test_constructor_has_no_filesystem_side_effects(tmp_path, monkeypatch):
+    import devassist.agent.loop as loop
+
+    def boom(_ws):
+        raise AssertionError("системный промпт собран в конструкторе")
+
+    monkeypatch.setattr(loop, "build_system_prompt", boom)
+    _agent(ScriptedProvider(), tmp_path)  # не падает
+
+
+def test_long_turn_keeps_current_task_in_context(tmp_path):
+    (tmp_path / "big.txt").write_text("y" * 5000, encoding="utf-8")
+    steps = [tool_turn("read_file", {"path": "big.txt"}) for _ in range(6)] + [text_turn("ок")]
+    provider = ScriptedProvider(steps)
+    agent = _agent(provider, tmp_path, context_budget_tokens=4000)
+    agent.run_turn("ТЕКУЩАЯ ЗАДАЧА")
+    for request in provider.requests:
+        contents = [m.content for m in request["messages"] if m.role == "user"]
+        assert contents == ["ТЕКУЩАЯ ЗАДАЧА"]
+        _assert_well_formed(request["messages"])
+    assert len(provider.requests[-1]["messages"]) < len(agent.conversation) + 1

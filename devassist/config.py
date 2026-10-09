@@ -115,9 +115,13 @@ def _env_float(env: Mapping[str, str], name: str, default: float, *, lo: float, 
     return value
 
 
-@dataclass
+@dataclass(frozen=True)
 class Config:
-    """Сводная конфигурация приложения."""
+    """Сводная конфигурация приложения. Неизменяема после загрузки.
+
+    Состояние, меняющееся во время работы (например, текущая модель после
+    ``/model``), хранится в агенте, а не здесь.
+    """
 
     # --- GigaChat ---
     # Две схемы авторизации (выбирается автоматически по наличию реквизитов):
@@ -142,6 +146,9 @@ class Config:
     max_tool_failures: int = 4  # стоп при N неудачных вызовах подряд (анти-залипание)
     temperature: float = 0.2
     stream: bool = True  # потоковый (посимвольный) вывод ответа модели
+    # Бюджет контекста (оценка в токенах), в который укладывается история при
+    # отправке модели. Старые сообщения сверх бюджета отбрасываются.
+    context_budget_tokens: int = 60_000
 
     @classmethod
     def load(
@@ -185,6 +192,7 @@ class Config:
             auto_approve=auto_approve,
             stream=stream,
             temperature=_env_float(env, "DEVASSIST_TEMPERATURE", 0.2, lo=0.0, hi=2.0),
+            context_budget_tokens=_env_int(env, "DEVASSIST_CONTEXT_TOKENS", 60_000, minimum=4_000),
         )
 
     @property

@@ -130,14 +130,12 @@ def _handle_command(line: str, agent: Agent, ui: Console, config: Config) -> boo
         )
     elif cmd == "/model":
         if arg:
-            config.model = arg
+            agent.set_model(arg)
             ui.info(f"модель теперь: {arg} (применится со следующего запроса)")
         else:
-            ui.info(f"текущая модель: {config.model}")
+            ui.info(f"текущая модель: {agent.model}")
     elif cmd == "/clear":
-        from devassist.agent.session import Session
-
-        agent._session = Session(config.project_root)  # noqa: SLF001
+        agent.reset()
         ui.info("история очищена")
     else:
         ui.error(f"неизвестная команда: {cmd}")
