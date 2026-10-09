@@ -95,7 +95,7 @@ class _LiveView:
         self._tail = tail
         self._hint = hint
         self._started = time.monotonic()
-        self._spinner = Spinner("dots", style=BRAND)
+        self._spinner = Spinner("dots12", style=BRAND)
 
     def __rich_console__(self, console: RichConsole, options: ConsoleOptions) -> RenderResult:
         elapsed = int(time.monotonic() - self._started)
