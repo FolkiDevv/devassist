@@ -248,3 +248,87 @@ def test_empty_conversation_instance_is_used(tmp_path):
     )
     agent.run_turn("x")
     assert agent.conversation is conv and len(conv) == 2
+
+
+# ------------------------- события для индикаторов ------------------------- #
+def _kinds(events) -> list[str]:
+    return [k for k, _ in events.events]
+
+
+@pytest.mark.parametrize("error", [None, ToolError("нельзя"), ValueError("сбой")])
+def test_tool_start_end_bracket_run(tmp_path, error):
+    def run():
+        if error is not None:
+            raise error
+        return ToolResult(content="ok", summary="ok")
+
+    tool = FakeTool(run=run)
+    provider = ScriptedProvider([tool_turn("fake_write", {}), text_turn("ок")])
+    events = RecordingEvents()
+    _agent(provider, tmp_path, events=events, registry=_registry_with(tool)).run_turn("x")
+    kinds = _kinds(events)
+    start = kinds.index("tool_start")
+    assert kinds[start : start + 3] == ["tool_start", "tool_end", "tool_result"]
+
+
+def test_tool_end_called_on_ctrl_c(tmp_path):
+    def interrupted():
+        raise KeyboardInterrupt
+
+    tool = FakeTool(run=interrupted)
+    events = RecordingEvents()
+    agent = _agent(
+        ScriptedProvider([tool_turn("fake_write", {})]),
+        tmp_path,
+        events=events,
+        registry=_registry_with(tool),
+    )
+    with pytest.raises(KeyboardInterrupt):
+        agent.run_turn("x")
+    assert _kinds(events)[-2:] == ["tool_start", "tool_end"]
+
+
+def test_rejected_tool_is_not_started(tmp_path):
+    tool = FakeTool()
+    provider = ScriptedProvider([tool_turn("fake_write", {}), text_turn("ок")])
+    events = RecordingEvents(confirm_answer=False)
+    _agent(
+        provider, tmp_path, events=events, registry=_registry_with(tool), auto_approve=False
+    ).run_turn("x")
+    assert "tool_start" not in _kinds(events)
+
+
+def test_non_stream_mode_signals_waiting(tmp_path):
+    events = RecordingEvents()
+    _agent(ScriptedProvider([text_turn("ответ")]), tmp_path, events=events).run_turn("x")
+    assert _kinds(events) == ["stream_start", "stream_end", "text"]
+
+
+def test_non_stream_error_still_ends_waiting(tmp_path):
+    from devassist.llm.base import LLMError
+
+    events = RecordingEvents()
+    agent = _agent(ScriptedProvider([LLMError("сеть")]), tmp_path, events=events)
+    with pytest.raises(LLMError):
+        agent.run_turn("x")
+    assert _kinds(events) == ["stream_start", "stream_end"]
+
+
+def test_session_counters(tmp_path):
+    provider = ScriptedProvider(
+        [
+            text_turn("a", Usage(prompt_tokens=100, completion_tokens=10)),
+            text_turn("b", Usage(prompt_tokens=200, completion_tokens=20)),
+        ]
+    )
+    events = RecordingEvents()
+    agent = _agent(provider, tmp_path, events=events)
+    assert agent.context_tokens == 0
+    agent.run_turn("1")
+    assert agent.context_tokens == 110 and agent.billed_tokens == 110
+    agent.reset()
+    assert agent.context_tokens == 0 and agent.billed_tokens == 110
+    agent.run_turn("2")
+    assert agent.context_tokens == 220 and agent.billed_tokens == 330
+    assert events.stats[-1].duration_s >= 0
+    assert agent.config.context_budget_tokens > 0

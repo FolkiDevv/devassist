@@ -12,6 +12,8 @@
 
 from __future__ import annotations
 
+import time
+
 from pydantic import BaseModel
 
 from devassist.agent.context_window import estimate_tokens, fit_history
@@ -49,6 +51,7 @@ class Agent:
         self._conversation = Conversation() if conversation is None else conversation
         self._model = config.model
         self._system_prompt: str | None = None  # строится лениво, сбрасывается в reset()
+        self._billed_tokens = 0  # потрачено за сессию (reset() не сбрасывает)
 
     # ------------------------------------------------------------------ #
     @property
@@ -62,6 +65,21 @@ class Agent:
     @property
     def model(self) -> str:
         return self._model
+
+    @property
+    def config(self) -> Config:
+        return self._cfg
+
+    @property
+    def context_tokens(self) -> int:
+        """Размер контекста по последнему обращению к модели (0 — диалог пуст)."""
+        usage = self._conversation.last_usage
+        return usage.prompt_tokens + usage.completion_tokens if usage else 0
+
+    @property
+    def billed_tokens(self) -> int:
+        """Токены, оплаченные за сессию (сумма по всем обращениям, включая прерванные ходы)."""
+        return self._billed_tokens
 
     def set_model(self, name: str) -> None:
         """Сменить модель (действует со следующего обращения)."""
@@ -93,6 +111,7 @@ class Agent:
         specs = self._registry.specs()
         guard = LoopGuard(max_steps=self._cfg.max_steps, max_failures=self._cfg.max_tool_failures)
         stats = TurnStats()
+        started = time.monotonic()
         final_text = ""
 
         while True:
@@ -104,6 +123,7 @@ class Agent:
                 self._conversation.add_assistant(msg, turn.usage)
                 stats.prompt_tokens += turn.usage.prompt_tokens
                 stats.completion_tokens += turn.usage.completion_tokens
+                self._billed_tokens += turn.usage.prompt_tokens + turn.usage.completion_tokens
                 stats.context_tokens = turn.usage.prompt_tokens + turn.usage.completion_tokens
 
                 if not turn.wants_tool:
@@ -121,6 +141,7 @@ class Agent:
                 self._events.on_notice(stop.message, level="error")
                 break
 
+        stats.duration_s = time.monotonic() - started
         self._events.on_turn_end(stats)
         return final_text
 
@@ -142,9 +163,9 @@ class Agent:
     def _next_turn(self, specs: list[ToolSpec]) -> AssistantTurn:
         """Один проход модели с выводом текста (потоковым или цельным)."""
         messages = self._build_request()
-        if self._cfg.stream:
-            self._events.on_stream_start()
-            try:
+        self._events.on_stream_start()
+        try:
+            if self._cfg.stream:
                 return self._provider.stream(
                     messages,
                     tools=specs,
@@ -152,12 +173,12 @@ class Agent:
                     temperature=self._cfg.temperature,
                     on_delta=self._events.on_stream_delta,
                 )
-            finally:
-                self._events.on_stream_end()
+            turn = self._provider.complete(
+                messages, tools=specs, model=self._model, temperature=self._cfg.temperature
+            )
+        finally:
+            self._events.on_stream_end()
 
-        turn = self._provider.complete(
-            messages, tools=specs, model=self._model, temperature=self._cfg.temperature
-        )
         if turn.message.content.strip():
             self._events.on_assistant_text(turn.message.content)
         return turn
@@ -211,12 +232,19 @@ class Agent:
             return self._fail(call, f"внутренняя ошибка при подготовке: {e}")
 
         # 3) Выполнение
+        result: ToolResult | None = None
+        error = ""
+        self._events.on_tool_start(call)
         try:
-            result: ToolResult = tool.run(params, self._ctx)
+            result = tool.run(params, self._ctx)
         except ToolError as e:
-            return self._fail(call, str(e))
+            error = str(e)
         except Exception as e:  # неожиданная ошибка — не роняем агента
-            return self._fail(call, f"внутренняя ошибка выполнения: {e}")
+            error = f"внутренняя ошибка выполнения: {e}"
+        finally:
+            self._events.on_tool_end(call)
+        if result is None:
+            return self._fail(call, error or "инструмент не вернул результат")
 
         self._events.on_tool_result(call, result, previewed=previewed)
         self._conversation.add_function_result(name, result.as_function_content())

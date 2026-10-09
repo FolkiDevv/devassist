@@ -94,7 +94,14 @@ class RecordingEvents(AgentEvents):
         self.confirms.append((call, preview, dangerous))
         return self.confirm_answer
 
+    def on_tool_start(self, call: ToolCallInfo) -> None:
+        self.events.append(("tool_start", call))
+
+    def on_tool_end(self, call: ToolCallInfo) -> None:
+        self.events.append(("tool_end", call))
+
     def on_tool_result(self, call, result, *, previewed):
+        self.events.append(("tool_result", call))
         self.results.append((call, result, previewed))
 
     def on_notice(self, text, *, level="info"):
