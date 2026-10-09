@@ -297,3 +297,27 @@ def test_kill_group_on_windows_kills_tree(monkeypatch):
     process._kill_group(FakeProc())
     assert calls[0] == ["taskkill", "/F", "/T", "/PID", "4242"]
     assert calls[-1] == "kill"
+
+
+@posix_only
+def test_interrupt_while_starting_readers_kills_command(ctx, monkeypatch):
+    from devassist.tools import process
+
+    pidfile = ctx.root / "pid"
+    real_start = process.threading.Thread.start
+
+    def interrupted_start(self):
+        # дать оболочке записать PID, затем «нажать Ctrl+C» до старта читателей
+        for _ in range(100):
+            if pidfile.exists() and pidfile.read_text().strip():
+                break
+            time.sleep(0.05)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(process.threading.Thread, "start", interrupted_start)
+    with pytest.raises(KeyboardInterrupt):
+        process.run_process(
+            f"sleep 30 & echo $! > {pidfile}; wait", cwd=ctx.root, timeout=60, shell=True
+        )
+    monkeypatch.setattr(process.threading.Thread, "start", real_start)
+    _assert_dead(int(pidfile.read_text()))

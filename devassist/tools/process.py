@@ -166,15 +166,17 @@ def run_process(
         **kwargs,
     )
     out, err = _Capture(), _Capture()
-    readers = [
-        threading.Thread(target=_pump, args=(proc.stdout, out), daemon=True),
-        threading.Thread(target=_pump, args=(proc.stderr, err), daemon=True),
-    ]
-    for t in readers:
-        t.start()
-
+    readers: list[threading.Thread] = []
     timed_out = killed_background = False
+    # Защищённый блок начинается сразу после Popen: прерывание в любой момент
+    # (в том числе при запуске читателей) не оставит команду работать.
     try:
+        readers = [
+            threading.Thread(target=_pump, args=(proc.stdout, out), daemon=True),
+            threading.Thread(target=_pump, args=(proc.stderr, err), daemon=True),
+        ]
+        for t in readers:
+            t.start()
         try:
             proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -189,17 +191,18 @@ def run_process(
             _kill_group(proc)
             for t in readers:
                 t.join(timeout=_PIPE_GRACE_SECONDS)
-    except KeyboardInterrupt:
+    except BaseException:  # Ctrl+C или сбой запуска читателей
         _kill_group(proc)
         proc.wait()
         raise
     finally:
-        for stream, reader in zip((proc.stdout, proc.stderr), readers, strict=True):
+        for i, stream in enumerate((proc.stdout, proc.stderr)):
+            reader = readers[i] if i < len(readers) else None
             # Если вывод держит потомок, сбежавший из группы (setsid), поток-читатель
             # всё ещё заблокирован в read(), и close() ждал бы ту же блокировку
             # бесконечно. Такой поток не закрываем: читатель — daemon, канал
             # закроется, когда потомок завершится.
-            if reader.is_alive():
+            if reader is not None and reader.is_alive():
                 continue
             try:
                 stream.close()  # type: ignore[union-attr]
