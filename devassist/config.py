@@ -3,9 +3,12 @@
 Источники настроек (в порядке приоритета):
   1. Явные аргументы командной строки (передаются в Config.load()).
   2. Переменные окружения.
-  3. Файл .env в корне проекта (загружается без внешних зависимостей).
-  4. Значения по умолчанию.
+  3. Файл .env в корне проекта.
+  4. Файл .env в текущей директории (если она не корень проекта).
+  5. Значения по умолчанию.
 
+Файлы .env читаются в отдельный словарь и НЕ попадают в ``os.environ`` — иначе
+секреты унаследовали бы все процессы, которые запускает агент.
 Секреты (ключ GigaChat) НЕ хранятся в коде — только в окружении / .env.
 """
 
@@ -13,42 +16,112 @@ from __future__ import annotations
 
 import os
 import ssl
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
 # URL по умолчанию для каждой схемы авторизации.
 DEFAULT_OAUTH_URL = "https://gigachat.devices.sberbank.ru/api/v1"
 DEFAULT_MTLS_URL = "https://gigachat-ift.sberdevices.delta.sbrf.ru/v1"
+DEFAULT_AUTH_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
+DEFAULT_MODEL = "GigaChat-3-Ultra"
 
 
-def load_dotenv(path: Path) -> None:
+class ConfigError(ValueError):
+    """Некорректное значение настройки (сообщение пригодно для показа пользователю)."""
+
+
+def read_dotenv(path: Path) -> dict[str, str]:
     """Минимальный парсер .env: KEY=VALUE, поддержка # комментариев и кавычек.
 
-    Не перезаписывает уже установленные переменные окружения.
+    Возвращает словарь; глобальное окружение процесса не изменяется.
     """
+    values: dict[str, str] = {}
     if not path.is_file():
-        return
-    for raw in path.read_text(encoding="utf-8").splitlines():
+        return values
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as e:
+        raise ConfigError(f"Не удалось прочитать {path}: {e}") from e
+    for raw in text.splitlines():
         line = raw.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, _, value = line.partition("=")
         key = key.strip()
+        if key.startswith("export "):
+            key = key[len("export ") :].strip()
         value = value.strip().strip('"').strip("'")
-        if key and key not in os.environ:
-            os.environ[key] = value
+        if key:
+            values[key] = value
+    return values
 
 
-def _env_bool(name: str, default: bool = False) -> bool:
-    val = os.environ.get(name)
-    if val is None:
+def load_environment(
+    root: Path,
+    *,
+    environ: Mapping[str, str] | None = None,
+    cwd: Path | None = None,
+) -> dict[str, str]:
+    """Сводное окружение: environ > <root>/.env > <cwd>/.env.
+
+    Порядок детерминирован; одинаковые пути читаются один раз.
+    """
+    environ = os.environ if environ is None else environ
+    cwd = (cwd or Path.cwd()).resolve()
+    root = root.resolve()
+    merged: dict[str, str] = {}
+    # От младшего источника к старшему: каждый следующий перекрывает предыдущий.
+    sources = [cwd / ".env"] if cwd != root else []
+    sources.append(root / ".env")
+    for path in sources:
+        merged.update(read_dotenv(path))
+    merged.update(environ)
+    return merged
+
+
+def _env_bool(env: Mapping[str, str], name: str, default: bool = False) -> bool:
+    val = env.get(name)
+    if val is None or not val.strip():
         return default
     return val.strip().lower() in ("1", "true", "yes", "on")
 
 
-@dataclass
+def _env_int(env: Mapping[str, str], name: str, default: int, *, minimum: int = 1) -> int:
+    raw = env.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw.strip())
+    except ValueError as e:
+        raise ConfigError(f"{name}: ожидается целое число, получено {raw!r}") from e
+    if value < minimum:
+        raise ConfigError(f"{name}: значение должно быть не меньше {minimum}, получено {value}")
+    return value
+
+
+def _env_float(env: Mapping[str, str], name: str, default: float, *, lo: float, hi: float) -> float:
+    raw = env.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = float(raw.strip())
+    except ValueError as e:
+        raise ConfigError(f"{name}: ожидается число, получено {raw!r}") from e
+    if not lo <= value <= hi:
+        raise ConfigError(
+            f"{name}: значение должно быть в диапазоне [{lo}; {hi}], получено {value}"
+        )
+    return value
+
+
+@dataclass(frozen=True)
 class Config:
-    """Сводная конфигурация приложения."""
+    """Сводная конфигурация приложения. Неизменяема после загрузки.
+
+    Состояние, меняющееся во время работы (например, текущая модель после
+    ``/model``), хранится в агенте, а не здесь.
+    """
 
     # --- GigaChat ---
     # Две схемы авторизации (выбирается автоматически по наличию реквизитов):
@@ -60,8 +133,8 @@ class Config:
     cert: str | None = None  # путь к клиентскому сертификату (mTLS, PEM)
     key: str | None = None  # путь к приватному ключу (mTLS)
     scope: str = "GIGACHAT_API_PERS"
-    model: str = "GigaChat-3-Ultra"
-    auth_url: str = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
+    model: str = DEFAULT_MODEL
+    auth_url: str = DEFAULT_AUTH_URL
     base_url: str = DEFAULT_OAUTH_URL
     verify_ssl: bool = False
     timeout: int = 120
@@ -73,6 +146,9 @@ class Config:
     max_tool_failures: int = 4  # стоп при N неудачных вызовах подряд (анти-залипание)
     temperature: float = 0.2
     stream: bool = True  # потоковый (посимвольный) вывод ответа модели
+    # Бюджет контекста (оценка в токенах), в который укладывается история при
+    # отправке модели. Старые сообщения сверх бюджета отбрасываются.
+    context_budget_tokens: int = 60_000
 
     @classmethod
     def load(
@@ -82,19 +158,23 @@ class Config:
         model: str | None = None,
         auto_approve: bool = False,
         stream: bool = True,
+        environ: Mapping[str, str] | None = None,
+        cwd: Path | None = None,
     ) -> Config:
-        root = Path(project_root or Path.cwd()).resolve()
-        # .env ищем в корне проекта, затем в cwd
-        for candidate in {root / ".env", Path.cwd() / ".env"}:
-            load_dotenv(candidate)
+        """Собирает конфигурацию. Некорректные значения → :class:`ConfigError`.
 
-        access_key = os.environ.get("GIGACHAT_ACCESS_KEY") or None
-        cert = os.environ.get("GIGACHAT_CERT") or None
-        key = os.environ.get("GIGACHAT_KEY") or None
+        ``environ``/``cwd`` подменяются в тестах (по умолчанию — os.environ и Path.cwd()).
+        """
+        root = Path(project_root or cwd or Path.cwd()).resolve()
+        env = load_environment(root, environ=environ, cwd=cwd)
+
+        access_key = env.get("GIGACHAT_ACCESS_KEY") or None
+        cert = env.get("GIGACHAT_CERT") or None
+        key = env.get("GIGACHAT_KEY") or None
 
         # Выбор эндпоинта: явный GIGACHAT_URL имеет приоритет; иначе берётся
         # дефолт под выбранную схему — OAuth при наличии ключа, mTLS при cert+key.
-        base_url = os.environ.get("GIGACHAT_URL")
+        base_url = env.get("GIGACHAT_URL")
         if not base_url:
             base_url = DEFAULT_MTLS_URL if (not access_key and cert and key) else DEFAULT_OAUTH_URL
 
@@ -102,19 +182,17 @@ class Config:
             access_key=access_key,
             cert=cert,
             key=key,
-            scope=os.environ.get("GIGACHAT_SCOPE", "GIGACHAT_API_PERS"),
-            model=model or os.environ.get("GIGACHAT_MODEL", "GigaChat-3-Ultra"),
-            auth_url=os.environ.get(
-                "GIGACHAT_AUTH_URL",
-                "https://ngw.devices.sberbank.ru:9443/api/v2/oauth",
-            ),
-            base_url=base_url,
-            verify_ssl=_env_bool("GIGACHAT_VERIFY_SSL", False),
-            timeout=int(os.environ.get("GIGACHAT_TIMEOUT", "120")),
+            scope=env.get("GIGACHAT_SCOPE") or "GIGACHAT_API_PERS",
+            model=model or env.get("GIGACHAT_MODEL") or DEFAULT_MODEL,
+            auth_url=env.get("GIGACHAT_AUTH_URL") or DEFAULT_AUTH_URL,
+            base_url=base_url.rstrip("/"),
+            verify_ssl=_env_bool(env, "GIGACHAT_VERIFY_SSL", False),
+            timeout=_env_int(env, "GIGACHAT_TIMEOUT", 120),
             project_root=root,
             auto_approve=auto_approve,
             stream=stream,
-            temperature=float(os.environ.get("DEVASSIST_TEMPERATURE", "0.2")),
+            temperature=_env_float(env, "DEVASSIST_TEMPERATURE", 0.2, lo=0.0, hi=2.0),
+            context_budget_tokens=_env_int(env, "DEVASSIST_CONTEXT_TOKENS", 60_000, minimum=4_000),
         )
 
     @property

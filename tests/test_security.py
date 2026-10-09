@@ -1,10 +1,9 @@
-"""Тесты песочницы, классификации риска и контекста проекта."""
+"""Тесты песочницы и классификации риска."""
 
 from __future__ import annotations
 
 import pytest
 
-from devassist.context import build_file_tree, build_project_context, read_memory
 from devassist.security import (
     RiskLevel,
     SandboxError,
@@ -32,20 +31,3 @@ def test_classify_shell():
     assert classify_shell_command("sudo apt update") == RiskLevel.DANGEROUS
     assert classify_shell_command("curl http://x") == RiskLevel.DANGEROUS
     assert classify_shell_command("git reset --hard") == RiskLevel.DANGEROUS
-
-
-def test_file_tree_and_memory(tmp_path):
-    (tmp_path / "src").mkdir()
-    (tmp_path / "src" / "main.py").write_text("x")
-    (tmp_path / "node_modules").mkdir()
-    (tmp_path / "node_modules" / "junk.js").write_text("x")
-    (tmp_path / "DEVASSIST.md").write_text("важная заметка")
-
-    tree = build_file_tree(tmp_path)
-    assert "src/" in tree and "main.py" in tree
-    assert "node_modules" not in tree  # игнорируется
-
-    assert read_memory(tmp_path) == "важная заметка"
-    ctx = build_project_context(tmp_path)
-    assert "важная заметка" in ctx
-    assert "Структура проекта" in ctx

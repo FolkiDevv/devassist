@@ -92,12 +92,11 @@ def test_consume_sse_text_stream():
         '"usage":{"total_tokens":5}}',
         "data: [DONE]",
     ]
-    turn, emitted = p._consume_sse(_FakeSSE(lines), deltas.append)
-    assert emitted is True
+    turn = p._consume_sse(_FakeSSE(lines), deltas.append)
     assert deltas == ["При", "вет"]
     assert turn.message.content == "Привет"
     assert turn.finish_reason == "stop"
-    assert turn.usage["total_tokens"] == 5
+    assert turn.usage.total_tokens == 5
     assert not turn.wants_tool
     p.close()
 
@@ -111,8 +110,8 @@ def test_consume_sse_function_call_stream():
         '"functions_state_id":"sid-9"},"index":0,"finish_reason":"function_call"}]}',
         "data: [DONE]",
     ]
-    turn, emitted = p._consume_sse(_FakeSSE(lines), deltas.append)
-    assert emitted is False  # текста не было, только вызов функции
+    turn = p._consume_sse(_FakeSSE(lines), deltas.append)
+    assert deltas == []  # текста не было, только вызов функции
     assert turn.wants_tool
     assert turn.message.function_call.name == "get_weather"
     assert turn.message.function_call.arguments == {"city": "Казань"}

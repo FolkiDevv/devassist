@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
@@ -12,25 +11,9 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from devassist.config import Config  # noqa: E402
+from devassist.config import Config, load_environment  # noqa: E402
+from devassist.project.workspace import Workspace  # noqa: E402
 from devassist.tools.base import ToolContext  # noqa: E402
-
-
-def resolve_access_key() -> str | None:
-    """Ключ GigaChat для live-тестов.
-
-    Берём из окружения; если не задан — из эталонного скрипта test_gigachat.py,
-    чтобы тесты были воспроизводимы одной командой без ручной настройки.
-    """
-    key = os.environ.get("GIGACHAT_ACCESS_KEY")
-    if key:
-        return key
-    try:
-        import test_gigachat  # type: ignore
-
-        return getattr(test_gigachat, "ACCESS_KEY", None) or None
-    except Exception:
-        return None
 
 
 @pytest.fixture
@@ -45,15 +28,19 @@ def config(project: Path) -> Config:
 
 
 @pytest.fixture
-def ctx(config: Config) -> ToolContext:
-    return ToolContext(config=config)
+def ctx(project: Path) -> ToolContext:
+    return ToolContext(workspace=Workspace(project))
 
 
 @pytest.fixture(scope="session")
 def live_config() -> Config:
-    """Конфиг для live-тестов; пропускает тест, если ключ недоступен."""
-    key = resolve_access_key()
-    if not key:
-        pytest.skip("Нет GIGACHAT_ACCESS_KEY — live-тесты пропущены")
-    model = os.environ.get("DEVASSIST_TEST_MODEL", "GigaChat-2-Max")
-    return Config(access_key=key, model=model, project_root=Path.cwd())
+    """Конфиг для live-тестов (окружение + .env репозитория, OAuth или mTLS).
+
+    Пропускает тест, если реквизиты GigaChat не заданы.
+    """
+    env = load_environment(REPO_ROOT)
+    model = env.get("DEVASSIST_TEST_MODEL") or "GigaChat-2-Max"
+    cfg = Config.load(project_root=REPO_ROOT, model=model)
+    if cfg.auth_mode == "none":
+        pytest.skip("Нет реквизитов GigaChat (ключ или cert+key) — live-тесты пропущены")
+    return cfg

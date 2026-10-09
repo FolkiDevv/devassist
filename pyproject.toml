@@ -22,7 +22,8 @@ dependencies = [
     "prompt_toolkit>=3.0",
 ]
 
-[project.optional-dependencies]
+[dependency-groups]
+# Ставится `uv sync` по умолчанию (PEP 735). Только для разработки — в пакет не попадает.
 dev = ["pytest>=7.0", "ruff>=0.5"]
 
 [project.scripts]

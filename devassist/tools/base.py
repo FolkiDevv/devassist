@@ -4,8 +4,12 @@
   * объявляет имя, описание и pydantic-модель параметров (Params);
   * из модели автоматически строится JSON-schema для function calling;
   * объявляет уровень риска (для модели прав);
+  * кратко описывает вызов для UI (``describe``);
   * умеет (опционально) показать превью (например, дифф) перед выполнением;
   * выполняется методом ``run`` и возвращает ``ToolResult``.
+
+Как показывать результат, решает сам инструмент (через :class:`Display`), а не
+агентный цикл — поэтому новый инструмент не требует правок в ядре и UI.
 """
 
 from __future__ import annotations
@@ -13,26 +17,54 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, Literal, TypeVar
 
 from pydantic import BaseModel
 
-from devassist.config import Config
+from devassist.errors import ToolError
 from devassist.llm.types import ToolSpec
+from devassist.project.workspace import Workspace
 from devassist.security import RiskLevel
+
+__all__ = [
+    "Display",
+    "Tool",
+    "ToolContext",
+    "ToolError",
+    "ToolRegistry",
+    "ToolResult",
+    "build_default_registry",
+]
 
 P = TypeVar("P", bound=BaseModel)
 
 
-@dataclass
+@dataclass(frozen=True)
 class ToolContext:
-    """Контекст выполнения, доступный инструменту."""
+    """Контекст выполнения, доступный инструменту.
 
-    config: Config
+    Намеренно не содержит Config: инструментам не нужны (и не должны быть
+    доступны) реквизиты API.
+    """
+
+    workspace: Workspace
 
     @property
     def root(self) -> Path:
-        return self.config.project_root
+        return self.workspace.root
+
+
+@dataclass(frozen=True)
+class Display:
+    """Дополнительный вывод для пользователя (не уходит в модель).
+
+    ``kind="diff"`` — unified diff (подсвечивается как дифф), ``"text"`` — обычный
+    вывод (команды, git). ``title`` — заголовок блока.
+    """
+
+    text: str
+    kind: Literal["diff", "text"] = "text"
+    title: str = ""
 
 
 @dataclass
@@ -42,16 +74,12 @@ class ToolResult:
     content: str  # текст, который вернётся модели
     ok: bool = True
     summary: str = ""  # краткая строка для UI
-    display: str | None = None  # доп. вывод для пользователя (дифф/листинг)
+    display: Display | None = None  # доп. вывод для пользователя (дифф/листинг)
 
     def as_function_content(self) -> str:
         if self.ok:
             return self.content
         return f"ОШИБКА: {self.content}"
-
-
-class ToolError(Exception):
-    """Ожидаемая ошибка инструмента (возвращается модели, не роняет агента)."""
 
 
 def _normalize_property(prop: dict[str, Any]) -> dict[str, Any]:
@@ -108,12 +136,33 @@ class Tool(ABC, Generic[P]):
     def parse(self, arguments: dict[str, Any]) -> BaseModel:
         return self.Params.model_validate(arguments or {})
 
+    def describe(self, params: BaseModel) -> str:
+        """Краткое описание вызова для UI (путь, команда, шаблон...).
+
+        Реализация по умолчанию берёт самое информативное из типичных полей;
+        инструменты с особыми параметрами переопределяют метод.
+        """
+        d = params.model_dump()
+        if "path" in d and d["path"] not in (None, "", "."):
+            return str(d["path"])
+        if "command" in d:
+            return str(d["command"])[:70]
+        if "pattern" in d:
+            return f"/{d['pattern']}/" if "glob" in d else str(d["pattern"])
+        if "path" in d:
+            return str(d["path"])
+        return ""
+
     def risk(self, params: BaseModel, ctx: ToolContext) -> RiskLevel:  # noqa: ARG002
         """Уровень риска по умолчанию. Переопределяется инструментами."""
         return RiskLevel.SAFE
 
-    def preview(self, params: BaseModel, ctx: ToolContext) -> str | None:  # noqa: ARG002
-        """Текст/дифф для показа перед подтверждением. None — нечего показывать."""
+    def preview(self, params: BaseModel, ctx: ToolContext) -> Display | None:  # noqa: ARG002
+        """Что показать перед подтверждением (дифф, команда). None — нечего показывать.
+
+        Вызывается только для операций, требующих подтверждения. Ошибка превью
+        (ToolError) означает, что операция невыполнима: она не будет запущена.
+        """
         return None
 
     @abstractmethod

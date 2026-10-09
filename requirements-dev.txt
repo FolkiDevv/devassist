@@ -1,8 +1,0 @@
-# Зависимости для разработки и тестирования.
-#   pip install -r requirements-dev.txt
-# Включает runtime-зависимости + инструменты разработчика.
-
--r requirements.txt
-
-pytest>=7.0
-ruff>=0.5

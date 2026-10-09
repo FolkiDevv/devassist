@@ -1,6 +1,10 @@
-"""Системный промпт агента."""
+"""Системный промпт агента и его сборка с контекстом проекта."""
 
 from __future__ import annotations
+
+from devassist.project.files import build_file_tree
+from devassist.project.instructions import load_instructions
+from devassist.project.workspace import Workspace
 
 SYSTEM_PROMPT = """\
 Ты — devassist, инженер-ассистент, работающий в терминале на локальной машине \
@@ -37,3 +41,21 @@ SYSTEM_PROMPT = """\
 (function calling). НИКОГДА не пиши вызовы инструментов текстом или в виде блоков \
 ```python read_file(...)``` — такой текст не выполняется и только мешает.
 """
+
+
+def build_project_context(workspace: Workspace) -> str:
+    """Блок контекста проекта: корень, файлы инструкций, дерево файлов."""
+    root = workspace.root
+    parts = [f"Корень проекта: {root}"]
+    for doc in load_instructions(root):
+        note = " (обрезано)" if doc.truncated else ""
+        parts.append(f"\nИнструкции проекта ({doc.name}){note}:\n{doc.content}")
+    tree = build_file_tree(root)
+    if tree:
+        parts.append(f"\nСтруктура проекта:\n{tree}")
+    return "\n".join(parts)
+
+
+def build_system_prompt(workspace: Workspace) -> str:
+    """Полный системный промпт: правила агента + контекст проекта."""
+    return f"{SYSTEM_PROMPT}\n\n=== КОНТЕКСТ ПРОЕКТА ===\n{build_project_context(workspace)}"

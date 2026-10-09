@@ -1,86 +1,250 @@
-"""Офлайн-тесты агентного цикла (без сети): анти-залипание и базовый поток."""
+"""Офлайн-тесты агентного цикла (без сети): поток, подтверждения, анти-залипание."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+from fakes import FakeTool, RecordingEvents, ScriptedProvider, text_turn, tool_turn
+
 from devassist.agent.loop import Agent
-from devassist.agent.session import Session
 from devassist.config import Config
-from devassist.llm.base import LLMProvider
-from devassist.llm.types import AssistantTurn, FunctionCall, Message
-from devassist.ui.console import Console
+from devassist.errors import ToolError
+from devassist.llm.types import Usage
+from devassist.tools.base import Display, ToolRegistry, ToolResult, build_default_registry
 
 
-class ScriptedProvider(LLMProvider):
-    """Провайдер-заглушка: выдаёт заранее заданную последовательность ходов."""
-
-    def __init__(self, turns):
-        self._turns = list(turns)
-        self.calls = 0
-
-    @property
-    def model(self) -> str:
-        return "scripted"
-
-    def complete(self, messages, tools=None, *, temperature=0.2) -> AssistantTurn:
-        self.calls += 1
-        if self._turns:
-            return self._turns.pop(0)
-        return AssistantTurn(message=Message(role="assistant", content="конец"))
-
-    def stream(self, messages, tools=None, *, temperature=0.2, on_delta=None):
-        return self.complete(messages, tools, temperature=temperature)
-
-
-def _agent(provider, tmp_path: Path, **cfg_kw) -> Agent:
+def _agent(provider, tmp_path: Path, *, events=None, registry=None, **cfg_kw) -> Agent:
+    cfg_kw.setdefault("auto_approve", True)
     cfg = Config(access_key="x", project_root=tmp_path, stream=False, **cfg_kw)
-    from devassist.tools.base import build_default_registry
-
-    ui = Console(no_color=True, assume_yes=True)
-    return Agent(provider, build_default_registry(), cfg, ui, session=Session(tmp_path))
-
-
-def _tool_turn(name, args):
-    return AssistantTurn(
-        message=Message(
-            role="assistant",
-            content="",
-            function_call=FunctionCall(name=name, arguments=args),
-        ),
-        finish_reason="function_call",
+    return Agent(
+        provider,
+        registry or build_default_registry(),
+        cfg,
+        events or RecordingEvents(),
     )
+
+
+def _registry_with(tool) -> ToolRegistry:
+    reg = ToolRegistry()
+    reg.register(tool)
+    return reg
 
 
 def test_loop_stops_after_repeated_failures(tmp_path):
     # модель упорно вызывает read_file на несуществующем файле
-    bad = _tool_turn("read_file", {"path": "nope.txt"})
+    bad = tool_turn("read_file", {"path": "nope.txt"})
     provider = ScriptedProvider([bad] * 20)
-    agent = _agent(provider, tmp_path, max_tool_failures=4)
+    events = RecordingEvents()
+    agent = _agent(provider, tmp_path, events=events, max_tool_failures=4)
     final = agent.run_turn("сделай что-нибудь")
     assert "Прервано" in final
-    # должно остановиться примерно на пороге, а не крутить 50 шагов
-    assert provider.calls <= 5
+    # должно остановиться на пороге, а не крутить 50 шагов
+    assert provider.calls == 4
+    assert events.stats[-1].stop_reason == "tool_failures"
+    assert events.notices and events.notices[-1][0] == "error"
 
 
 def test_loop_completes_on_text(tmp_path):
-    provider = ScriptedProvider(
-        [AssistantTurn(message=Message(role="assistant", content="Готово!"))]
-    )
-    agent = _agent(provider, tmp_path)
-    final = agent.run_turn("привет")
-    assert final == "Готово!"
+    provider = ScriptedProvider([text_turn("Готово!")])
+    events = RecordingEvents()
+    agent = _agent(provider, tmp_path, events=events)
+    assert agent.run_turn("привет") == "Готово!"
+    assert ("text", "Готово!") in events.events
 
 
 def test_loop_runs_tool_then_finishes(tmp_path):
     (tmp_path / "f.txt").write_text("hello", encoding="utf-8")
+    provider = ScriptedProvider([tool_turn("read_file", {"path": "f.txt"}), text_turn("прочитал")])
+    agent = _agent(provider, tmp_path)
+    assert agent.run_turn("прочитай f.txt") == "прочитал"
+    assert provider.calls == 2
+
+
+def test_streaming_events_wrap_each_request(tmp_path):
+    provider = ScriptedProvider([text_turn("поток")])
+    events = RecordingEvents()
+    cfg = Config(access_key="x", project_root=tmp_path, stream=True)
+    agent = Agent(provider, build_default_registry(), cfg, events)
+    agent.run_turn("hi")
+    kinds = [k for k, _ in events.events]
+    assert kinds == ["stream_start", "delta", "stream_end"]
+
+
+def test_write_outside_sandbox_does_not_crash_without_auto_approve(tmp_path):
+    # Раньше SandboxError из preview() пробивал run_turn и ронял REPL.
+    root = tmp_path / "proj"
+    root.mkdir()
+    provider = ScriptedProvider(
+        [tool_turn("write_file", {"path": "../escape.txt", "content": "x"}), text_turn("не вышло")]
+    )
+    events = RecordingEvents()
+    agent = _agent(provider, root, events=events, auto_approve=False)
+    assert agent.run_turn("запиши файл") == "не вышло"
+    assert not (tmp_path / "escape.txt").exists()
+    assert events.confirms == []  # невыполнимую операцию не предлагаем подтверждать
+    results = [m for m in agent.conversation.messages if m.role == "function"]
+    assert "за пределы" in results[-1].content
+
+
+@pytest.mark.parametrize("exc", [ToolError("нельзя"), ValueError("сбой превью")])
+def test_preview_failure_never_runs_tool(tmp_path, exc):
+    def boom():
+        raise exc
+
+    tool = FakeTool(preview=boom)
+    provider = ScriptedProvider([tool_turn("fake_write", {}), text_turn("ок")])
+    events = RecordingEvents()
+    agent = _agent(
+        provider, tmp_path, events=events, registry=_registry_with(tool), auto_approve=False
+    )
+    agent.run_turn("x")
+    assert tool.runs == 0
+    assert events.confirms == []
+    assert events.results[-1][1].ok is False
+
+
+def test_rejection_does_not_run_and_tells_model(tmp_path):
+    tool = FakeTool()
+    provider = ScriptedProvider([tool_turn("fake_write", {}), text_turn("ок")])
+    events = RecordingEvents(confirm_answer=False)
+    agent = _agent(
+        provider, tmp_path, events=events, registry=_registry_with(tool), auto_approve=False
+    )
+    agent.run_turn("x")
+    assert tool.runs == 0
+    call, preview, dangerous = events.confirms[0]
+    assert call.name == "fake_write" and preview.kind == "diff" and dangerous is False
+    function_msgs = [m for m in agent.conversation.messages if m.role == "function"]
+    assert "ОТКЛОНИЛ" in function_msgs[-1].content
+
+
+def test_auto_approve_skips_confirmation(tmp_path):
+    tool = FakeTool()
+    provider = ScriptedProvider([tool_turn("fake_write", {}), text_turn("ок")])
+    events = RecordingEvents(confirm_answer=False)
+    agent = _agent(provider, tmp_path, events=events, registry=_registry_with(tool))
+    agent.run_turn("x")
+    assert tool.runs == 1
+    assert events.confirms == []
+
+
+def test_custom_tool_display_reaches_ui(tmp_path):
+    display = Display("+new line", kind="diff", title="x")
+    tool = FakeTool(run=lambda: ToolResult(content="ok", summary="готово", display=display))
+    provider = ScriptedProvider([tool_turn("fake_write", {}), text_turn("ок")])
+    events = RecordingEvents(confirm_answer=True)
+    agent = _agent(
+        provider, tmp_path, events=events, registry=_registry_with(tool), auto_approve=False
+    )
+    agent.run_turn("x")
+    call, result, previewed = events.results[-1]
+    assert result.display == display and previewed is True
+
+
+def test_disallowed_git_subcommand_is_not_confirmed(tmp_path):
+    provider = ScriptedProvider([tool_turn("git", {"subcommand": "push"}), text_turn("ок")])
+    events = RecordingEvents()
+    agent = _agent(provider, tmp_path, events=events, auto_approve=False)
+    agent.run_turn("запушь")
+    assert events.confirms == []
+    assert events.results[-1][1].ok is False
+
+
+def test_turn_stats_split_billed_and_context(tmp_path):
+    (tmp_path / "f.txt").write_text("hello", encoding="utf-8")
     provider = ScriptedProvider(
         [
-            _tool_turn("read_file", {"path": "f.txt"}),
-            AssistantTurn(message=Message(role="assistant", content="прочитал")),
+            tool_turn(
+                "read_file", {"path": "f.txt"}, Usage(prompt_tokens=100, completion_tokens=10)
+            ),
+            text_turn("ок", Usage(prompt_tokens=130, completion_tokens=20)),
         ]
     )
+    events = RecordingEvents()
+    _agent(provider, tmp_path, events=events).run_turn("x")
+    stats = events.stats[-1]
+    assert (stats.steps, stats.tool_calls) == (2, 1)
+    assert stats.billed_tokens == 260
+    assert stats.context_tokens == 150
+
+
+def _assert_well_formed(messages):
+    for i, m in enumerate(messages):
+        if m.role == "function":
+            prev = messages[i - 1]
+            assert prev.role == "assistant" and prev.function_call is not None
+
+
+def test_ctrl_c_during_tool_repairs_history(tmp_path):
+    def interrupted():
+        raise KeyboardInterrupt
+
+    tool = FakeTool(run=interrupted)
+    provider = ScriptedProvider([tool_turn("fake_write", {}), text_turn("снова тут")])
+    agent = _agent(provider, tmp_path, registry=_registry_with(tool))
+    with pytest.raises(KeyboardInterrupt):
+        agent.run_turn("x")
+    assert agent.conversation.pending_call() is None
+    # следующий ход отправляет корректную историю
+    assert agent.run_turn("продолжай") == "снова тут"
+    _assert_well_formed(provider.requests[-1]["messages"])
+
+
+def test_set_model_is_passed_to_provider(tmp_path):
+    provider = ScriptedProvider([text_turn("a"), text_turn("b")])
     agent = _agent(provider, tmp_path)
-    final = agent.run_turn("прочитай f.txt")
-    assert final == "прочитал"
-    assert provider.calls == 2
+    agent.run_turn("1")
+    agent.set_model("GigaChat-2-Max")
+    agent.run_turn("2")
+    assert [r["model"] for r in provider.requests] == [agent._cfg.model, "GigaChat-2-Max"]
+    with pytest.raises(ValueError):
+        agent.set_model("  ")
+
+
+def test_reset_rebuilds_system_prompt(tmp_path):
+    provider = ScriptedProvider([text_turn("a"), text_turn("b")])
+    agent = _agent(provider, tmp_path)
+    agent.run_turn("1")
+    (tmp_path / "new_file.py").write_text("x", encoding="utf-8")
+    agent.reset()
+    assert len(agent.conversation) == 0
+    agent.run_turn("2")
+    system = provider.requests[-1]["messages"][0]
+    assert system.role == "system" and "new_file.py" in system.content
+    assert [m.role for m in provider.requests[-1]["messages"]] == ["system", "user"]
+
+
+def test_constructor_has_no_filesystem_side_effects(tmp_path, monkeypatch):
+    import devassist.agent.loop as loop
+
+    def boom(_ws):
+        raise AssertionError("системный промпт собран в конструкторе")
+
+    monkeypatch.setattr(loop, "build_system_prompt", boom)
+    _agent(ScriptedProvider(), tmp_path)  # не падает
+
+
+def test_long_turn_keeps_current_task_in_context(tmp_path):
+    (tmp_path / "big.txt").write_text("y" * 5000, encoding="utf-8")
+    steps = [tool_turn("read_file", {"path": "big.txt"}) for _ in range(6)] + [text_turn("ок")]
+    provider = ScriptedProvider(steps)
+    agent = _agent(provider, tmp_path, context_budget_tokens=4000)
+    agent.run_turn("ТЕКУЩАЯ ЗАДАЧА")
+    for request in provider.requests:
+        contents = [m.content for m in request["messages"] if m.role == "user"]
+        assert contents == ["ТЕКУЩАЯ ЗАДАЧА"]
+        _assert_well_formed(request["messages"])
+    assert len(provider.requests[-1]["messages"]) < len(agent.conversation) + 1
+
+
+def test_empty_conversation_instance_is_used(tmp_path):
+    from devassist.agent.conversation import Conversation
+
+    conv = Conversation()  # пустой — ложен по __len__
+    cfg = Config(access_key="x", project_root=tmp_path, stream=False)
+    agent = Agent(
+        ScriptedProvider([text_turn("ок")]), build_default_registry(), cfg, conversation=conv
+    )
+    agent.run_turn("x")
+    assert agent.conversation is conv and len(conv) == 2

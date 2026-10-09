@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 
 import pytest
 
@@ -34,6 +35,44 @@ def test_search_glob_filter(ctx):
     s = SearchContentTool()
     out = s.run(s.parse({"pattern": "needle", "glob": "*.py"}), ctx)
     assert "a.py" in out.content and "a.txt" not in out.content
+
+
+def test_search_skips_ignored_binary_large_and_secrets(ctx):
+    _write(ctx, "src/a.py", "needle")
+    _write(ctx, "node_modules/m.js", "needle")
+    _write(ctx, ".env", "needle=secret")
+    _write(ctx, ".env.example", "needle=")
+    (ctx.root / "bin.dat").write_bytes(b"needle\0\1\2")
+    (ctx.root / "big.txt").write_text("needle\n" * 200_000, encoding="utf-8")
+    s = SearchContentTool()
+    out = s.run(s.parse({"pattern": "needle"}), ctx).content
+    files = sorted({line.split(":", 1)[0] for line in out.splitlines()})
+    assert files == [".env.example", "src/a.py"]
+
+
+def test_search_glob_with_path(ctx):
+    _write(ctx, "src/x/a.py", "needle")
+    _write(ctx, "lib/b.py", "needle")
+    s = SearchContentTool()
+    out = s.run(s.parse({"pattern": "needle", "glob": "src/**/*.py"}), ctx).content
+    assert "src/x/a.py" in out and "lib/b.py" not in out
+
+
+def test_search_max_results_is_clamped(ctx):
+    _write(ctx, "a.txt", "hit\n" * 2000)
+    s = SearchContentTool()
+    out = s.run(s.parse({"pattern": "hit", "max_results": 10**6}), ctx).content
+    assert len([ln for ln in out.splitlines() if ln.startswith("a.txt:")]) == 500
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="симлинки")
+def test_search_does_not_follow_symlinks_outside(ctx, tmp_path_factory):
+    outside = tmp_path_factory.mktemp("outside") / "secret.txt"
+    outside.write_text("needle", encoding="utf-8")
+    (ctx.root / "link.txt").symlink_to(outside)
+    s = SearchContentTool()
+    out = s.run(s.parse({"pattern": "needle"}), ctx).content
+    assert "link.txt" not in out
 
 
 def test_search_invalid_regex(ctx):
@@ -108,3 +147,14 @@ def test_git_disallowed_subcommand(git_repo):
     g = GitTool()
     with pytest.raises(ToolError):
         g.run(g.parse({"subcommand": "push"}), git_repo)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="FIFO")
+def test_search_skips_fifo(ctx):
+    import os
+
+    os.mkfifo(ctx.root / "pipe")
+    _write(ctx, "a.txt", "needle")
+    s = SearchContentTool()
+    out = s.run(s.parse({"pattern": "needle"}), ctx).content
+    assert "a.txt" in out

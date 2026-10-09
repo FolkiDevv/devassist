@@ -4,23 +4,27 @@
 обращение к модели → если модель просит инструмент, выполняем его (с
 подтверждением для изменяющих/опасных операций) и возвращаем результат
 обратно в модель → повторяем, пока модель не выдаст финальный текстовый
-ответ либо не исчерпается лимит шагов.
+ответ либо не сработает ограничитель.
+
+Ядро не зависит от UI: всё, что видит пользователь, передаётся через
+:class:`~devassist.agent.events.AgentEvents`.
 """
 
 from __future__ import annotations
 
-from devassist.agent.session import Session
+from pydantic import BaseModel
+
+from devassist.agent.context_window import estimate_tokens, fit_history
+from devassist.agent.conversation import Conversation
+from devassist.agent.events import AgentEvents, ToolCallInfo, TurnStats
+from devassist.agent.guard import LoopGuard
+from devassist.agent.prompts import build_system_prompt
 from devassist.config import Config
 from devassist.llm.base import LLMProvider
-from devassist.llm.types import Message
+from devassist.llm.types import AssistantTurn, Message, ToolSpec
+from devassist.project.workspace import Workspace
 from devassist.security import RiskLevel
-from devassist.tools.base import (
-    ToolContext,
-    ToolError,
-    ToolRegistry,  # type: ignore
-    ToolResult,
-)
-from devassist.ui.console import Console
+from devassist.tools.base import Tool, ToolContext, ToolError, ToolRegistry, ToolResult
 
 
 class Agent:
@@ -29,91 +33,133 @@ class Agent:
         provider: LLMProvider,
         registry: ToolRegistry,
         config: Config,
-        ui: Console,
-        session: Session | None = None,
+        events: AgentEvents | None = None,
+        *,
+        workspace: Workspace | None = None,
+        conversation: Conversation | None = None,
     ):
+        """Конструктор не обращается к файловой системе и сети."""
         self._provider = provider
         self._registry = registry
         self._cfg = config
-        self._ui = ui
-        self._ctx = ToolContext(config=config)
-        self._session = session or Session(config.project_root)
+        # `is None`, а не `or`: пустой Conversation ложен (__len__ == 0).
+        self._events = AgentEvents() if events is None else events
+        self._workspace = Workspace(config.project_root) if workspace is None else workspace
+        self._ctx = ToolContext(workspace=self._workspace)
+        self._conversation = Conversation() if conversation is None else conversation
+        self._model = config.model
+        self._system_prompt: str | None = None  # строится лениво, сбрасывается в reset()
+
+    # ------------------------------------------------------------------ #
+    @property
+    def conversation(self) -> Conversation:
+        return self._conversation
 
     @property
-    def session(self) -> Session:
-        return self._session
+    def workspace(self) -> Workspace:
+        return self._workspace
+
+    @property
+    def model(self) -> str:
+        return self._model
+
+    def set_model(self, name: str) -> None:
+        """Сменить модель (действует со следующего обращения)."""
+        name = name.strip()
+        if not name:
+            raise ValueError("Имя модели не может быть пустым")
+        self._model = name
+
+    def reset(self) -> None:
+        """Начать новый диалог; контекст проекта будет собран заново."""
+        self._conversation = Conversation()
+        self._system_prompt = None
 
     # ------------------------------------------------------------------ #
     def run_turn(self, user_input: str) -> str:
-        """Обрабатывает один запрос пользователя до финального ответа."""
-        self._session.add_user(user_input)
+        """Обрабатывает один запрос пользователя до финального ответа.
+
+        При любом прерывании (Ctrl+C, ошибка LLM) история приводится в
+        согласованное состояние, исключение пробрасывается дальше.
+        """
+        try:
+            return self._run_turn(user_input)
+        except BaseException:
+            self._conversation.repair()
+            raise
+
+    def _run_turn(self, user_input: str) -> str:
+        self._conversation.add_user(user_input)
         specs = self._registry.specs()
+        guard = LoopGuard(max_steps=self._cfg.max_steps, max_failures=self._cfg.max_tool_failures)
+        stats = TurnStats()
         final_text = ""
-        steps = 0
-        tools_used = 0
-        total_tokens = 0
-        consecutive_failures = 0
 
-        for _step in range(self._cfg.max_steps):
-            steps += 1
-            turn = self._next_turn(specs)
-            msg = turn.message
-            self._session.add_assistant(msg)
-            total_tokens += int(turn.usage.get("total_tokens", 0) or 0)
+        while True:
+            stop = guard.before_step()
+            if stop is None:
+                stats.steps = guard.steps
+                turn = self._next_turn(specs)
+                msg = turn.message
+                self._conversation.add_assistant(msg, turn.usage)
+                stats.prompt_tokens += turn.usage.prompt_tokens
+                stats.completion_tokens += turn.usage.completion_tokens
+                stats.context_tokens = turn.usage.prompt_tokens + turn.usage.completion_tokens
 
-            if not turn.wants_tool:
-                final_text = msg.content
+                if not turn.wants_tool:
+                    final_text = msg.content
+                    break
+
+                # --- модель просит инструмент ---
+                assert msg.function_call is not None
+                stats.tool_calls += 1
+                ok = self._execute_tool_call(msg)
+                stop = guard.after_tool(msg.function_call, ok)
+            if stop is not None:
+                final_text = stop.message
+                stats.stop_reason = stop.kind
+                self._events.on_notice(stop.message, level="error")
                 break
 
-            # --- модель просит инструмент ---
-            tools_used += 1
-            ok = self._execute_tool_call(msg)
-            if ok:
-                consecutive_failures = 0
-            else:
-                consecutive_failures += 1
-                if consecutive_failures >= self._cfg.max_tool_failures:
-                    final_text = (
-                        f"Прервано: {consecutive_failures} неудачных вызовов "
-                        "инструментов подряд. Похоже, агент застрял — уточните "
-                        "задачу или попробуйте другую модель."
-                    )
-                    self._ui.error(final_text)
-                    break
-        else:
-            final_text = (
-                "Достигнут лимит шагов агента "
-                f"({self._cfg.max_steps}). Задача может быть не завершена."
-            )
-            self._ui.error(final_text)
-
-        self._ui.turn_stats(steps=steps, tokens=total_tokens, tools=tools_used)
+        self._events.on_turn_end(stats)
         return final_text
 
     # ------------------------------------------------------------------ #
-    def _next_turn(self, specs):
+    def system_prompt(self) -> str:
+        if self._system_prompt is None:
+            self._system_prompt = build_system_prompt(self._workspace)
+        return self._system_prompt
+
+    def _build_request(self) -> list[Message]:
+        """Сообщения для модели: системный промпт + история в пределах бюджета.
+
+        Единственная точка сборки запроса — сюда встраивается сжатие контекста.
+        """
+        system = Message(role="system", content=self.system_prompt())
+        budget = max(self._cfg.context_budget_tokens - estimate_tokens([system]), 1_000)
+        return [system, *fit_history(self._conversation.messages, budget)]
+
+    def _next_turn(self, specs: list[ToolSpec]) -> AssistantTurn:
         """Один проход модели с выводом текста (потоковым или цельным)."""
+        messages = self._build_request()
         if self._cfg.stream:
-            self._ui.begin_stream()
+            self._events.on_stream_start()
             try:
-                turn = self._provider.stream(
-                    self._session.messages(),
+                return self._provider.stream(
+                    messages,
                     tools=specs,
+                    model=self._model,
                     temperature=self._cfg.temperature,
-                    on_delta=self._ui.stream_write,
+                    on_delta=self._events.on_stream_delta,
                 )
             finally:
-                self._ui.end_stream()
-            return turn
+                self._events.on_stream_end()
 
         turn = self._provider.complete(
-            self._session.messages(),
-            tools=specs,
-            temperature=self._cfg.temperature,
+            messages, tools=specs, model=self._model, temperature=self._cfg.temperature
         )
-        # Показываем текст модели (рассуждения/план), если есть.
         if turn.message.content.strip():
-            self._ui.assistant(turn.message.content)
+            self._events.on_assistant_text(turn.message.content)
         return turn
 
     # ------------------------------------------------------------------ #
@@ -121,114 +167,72 @@ class Agent:
         """Выполняет запрошенный моделью инструмент. Возвращает True при успехе."""
         assert msg.function_call is not None
         name = msg.function_call.name
-        raw_args = msg.function_call.arguments
         tool = self._registry.get(name)
 
         if tool is None:
-            self._ui.tool_call(name, "(неизвестный инструмент)")
-            self._session.add_function_result(name, f"ОШИБКА: инструмент '{name}' не существует.")
-            return False
+            return self._fail(
+                ToolCallInfo(name, "(неизвестный инструмент)"),
+                f"инструмент '{name}' не существует.",
+            )
 
         # 1) Валидация параметров
         try:
-            params = tool.parse(raw_args)
+            params = tool.parse(msg.function_call.arguments)
         except Exception as e:  # ошибка схемы — возвращаем модели
-            self._ui.tool_call(name, "(неверные аргументы)")
-            self._session.add_function_result(name, f"ОШИБКА валидации аргументов: {e}")
-            return False
-
-        # 2) Краткая сводка вызова
-        summary = self._call_summary(name, params)
-        self._ui.tool_call(name, summary)
-
-        # 3) Подтверждение для изменяющих/опасных операций
-        risk = tool.risk(params, self._ctx)
-        if risk >= RiskLevel.WRITE and not self._cfg.auto_approve:
-            preview = None
-            try:
-                preview = tool.preview(params, self._ctx)
-            except ToolError:
-                # превью не удалось (например, файл не найден) — пусть run() вернёт ошибку
-                return self._run_and_record(tool, params, name)
-            if preview:
-                if name in ("write_file", "edit_file"):
-                    self._ui.diff(preview, title=getattr(params, "path", "изменения"))
-                else:
-                    self._ui.output_block(preview)
-            dangerous = risk >= RiskLevel.DANGEROUS
-            question = (
-                f"Выполнить опасную операцию '{name}'?" if dangerous else f"Применить '{name}'?"
+            return self._fail(
+                ToolCallInfo(name, "(неверные аргументы)"), f"валидация аргументов: {e}"
             )
-            if not self._ui.confirm(question, dangerous=dangerous):
-                self._ui.tool_result("отклонено пользователем", ok=False)
-                self._session.add_function_result(
-                    name,
-                    "Пользователь ОТКЛОНИЛ выполнение этой операции. "
-                    "Не повторяй её; предложи альтернативу или уточни план.",
-                )
-                return False
 
-        # 4) Выполнение
-        return self._run_and_record(tool, params, name)
+        call = ToolCallInfo(name, self._describe(tool, params))
+        self._events.on_tool_call(call)
 
-    def _run_and_record(self, tool, params, name: str) -> bool:
+        # 2) Подтверждение изменяющих/опасных операций
+        previewed = False
+        try:
+            risk = tool.risk(params, self._ctx)
+            if risk >= RiskLevel.WRITE and not self._cfg.auto_approve:
+                # Превью заодно проверяет выполнимость: если оно падает, операция
+                # не запускается и подтверждение не запрашивается.
+                preview = tool.preview(params, self._ctx)
+                dangerous = risk >= RiskLevel.DANGEROUS
+                if not self._events.confirm(call, preview, dangerous=dangerous):
+                    return self._fail(
+                        call,
+                        "отклонено пользователем",
+                        model_text=(
+                            "Пользователь ОТКЛОНИЛ выполнение этой операции. "
+                            "Не повторяй её; предложи альтернативу или уточни план."
+                        ),
+                    )
+                previewed = preview is not None
+        except ToolError as e:
+            return self._fail(call, str(e))
+        except Exception as e:  # неожиданная ошибка — не роняем агента
+            return self._fail(call, f"внутренняя ошибка при подготовке: {e}")
+
+        # 3) Выполнение
         try:
             result: ToolResult = tool.run(params, self._ctx)
         except ToolError as e:
-            self._ui.tool_result(str(e), ok=False)
-            self._session.add_function_result(name, f"ОШИБКА: {e}")
-            return False
+            return self._fail(call, str(e))
         except Exception as e:  # неожиданная ошибка — не роняем агента
-            self._ui.tool_result(f"внутренняя ошибка: {e}", ok=False)
-            self._session.add_function_result(name, f"ОШИБКА выполнения: {e}")
-            return False
+            return self._fail(call, f"внутренняя ошибка выполнения: {e}")
 
-        # Показ результата пользователю
-        self._ui.tool_result(result.summary or "готово", ok=result.ok)
-        if result.display and name in ("write_file", "edit_file"):
-            # дифф уже показывали в превью при подтверждении; повторно не дублируем,
-            # но в auto_approve режиме покажем здесь
-            if self._cfg.auto_approve:
-                title = getattr(params, "path", None) or "изменения"
-                self._ui.diff(result.display, title=str(title))
-        elif result.display and name in (
-            "run_shell",
-            "git",
-            "search_content",
-            "read_file",
-            "list_dir",
-            "find_files",
-        ):
-            self._ui.output_block(result.display[:2000], title=self._output_title(name, params))
-
-        self._session.add_function_result(name, result.as_function_content())
+        self._events.on_tool_result(call, result, previewed=previewed)
+        self._conversation.add_function_result(name, result.as_function_content())
         return result.ok
 
-    @staticmethod
-    def _output_title(name: str, params) -> str:
-        d = params.model_dump()
-        if name == "run_shell":
-            return f"$ {str(d.get('command', ''))[:60]}"
-        if name == "git":
-            return f"git {d.get('subcommand', '')}"
-        if name == "search_content":
-            return f"поиск: /{d.get('pattern', '')}/"
-        if name in ("read_file", "list_dir"):
-            return str(d.get("path", ""))
-        if name == "find_files":
-            return f"файлы: {d.get('pattern', '')}"
-        return "вывод"
+    def _fail(self, call: ToolCallInfo, error: str, *, model_text: str | None = None) -> bool:
+        """Неудачный вызов: показать пользователю и сообщить модели."""
+        summary = error.splitlines()[0] if error else "ошибка"
+        result = ToolResult(content=error, ok=False, summary=summary)
+        self._events.on_tool_result(call, result, previewed=False)
+        self._conversation.add_function_result(call.name, model_text or f"ОШИБКА: {error}")
+        return False
 
-    # ------------------------------------------------------------------ #
     @staticmethod
-    def _call_summary(name: str, params) -> str:
-        d = params.model_dump()
-        if "path" in d:
-            return str(d["path"])
-        if "command" in d:
-            return str(d["command"])[:70]
-        if "pattern" in d:
-            return f"/{d['pattern']}/"
-        if "subcommand" in d:
-            return f"{d['subcommand']} {' '.join(d.get('args', []))}".strip()
-        return ""
+    def _describe(tool: Tool, params: BaseModel) -> str:
+        try:
+            return tool.describe(params)
+        except Exception:
+            return ""

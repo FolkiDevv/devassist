@@ -3,16 +3,22 @@
 from __future__ import annotations
 
 import difflib
-import fnmatch
 import re
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from pydantic import BaseModel, Field
 
+from devassist.project.files import glob_match, walk_files
 from devassist.security import RiskLevel, resolve_in_root
-from devassist.tools.base import Tool, ToolContext, ToolError, ToolResult
+from devassist.tools.base import Display, Tool, ToolContext, ToolError, ToolResult
 
-MAX_READ_BYTES = 400_000
+# Жёсткий предел размера читаемого файла (дальше — только search_content).
+MAX_READ_BYTES = 20_000_000
+# Сколько отдаётся модели за один вызов: строки, символы на строку, символы всего.
+MAX_READ_LINES = 1000
+MAX_LINE_CHARS = 1000
+MAX_READ_CHARS = 60_000
+_BINARY_PROBE = 8192
 
 
 def _rel(ctx: ToolContext, path: Path) -> str:
@@ -167,7 +173,8 @@ class ReadFileTool(Tool):
     name = "read_file"
     description = (
         "Читает содержимое текстового файла. Можно указать диапазон строк "
-        "(start_line/end_line). Возвращает текст с номерами строк."
+        "(start_line/end_line). Возвращает текст с номерами строк; за один вызов — "
+        f"не более {MAX_READ_LINES} строк, для продолжения укажите start_line."
     )
     Params = ReadFileParams
 
@@ -177,30 +184,53 @@ class ReadFileTool(Tool):
             raise ToolError(f"Файл не найден: {params.path}")
         if p.is_dir():
             raise ToolError(f"Это директория, а не файл: {params.path}")
+        if not p.is_file():  # FIFO/сокет/устройство — чтение может заблокироваться
+            raise ToolError(f"Не обычный файл (FIFO, сокет или устройство): {params.path}")
         if p.stat().st_size > MAX_READ_BYTES:
             raise ToolError(
-                f"Файл слишком большой (>{MAX_READ_BYTES} байт). "
-                "Используйте диапазон строк или search_content."
+                f"Файл слишком большой (>{MAX_READ_BYTES} байт). Используйте search_content."
             )
+        with p.open("rb") as fh:
+            if b"\0" in fh.read(_BINARY_PROBE):
+                raise ToolError(f"Бинарный файл, чтение не поддерживается: {params.path}")
+
+        start = max(params.start_line or 1, 1)
+        end = params.end_line
+        selected: list[tuple[int, str]] = []
+        budget = MAX_READ_CHARS
+        total = 0
+        stopped_at: int | None = None  # первая строка, которая не поместилась
         try:
-            text = p.read_text(encoding="utf-8")
+            with p.open(encoding="utf-8") as fh:
+                for total, raw in enumerate(fh, start=1):
+                    if total < start or (end is not None and total > end):
+                        continue
+                    if stopped_at is not None:
+                        continue  # досчитываем общее число строк
+                    line = raw.rstrip("\r\n")
+                    if len(line) > MAX_LINE_CHARS:
+                        line = line[:MAX_LINE_CHARS] + " …[строка обрезана]"
+                    if len(selected) >= MAX_READ_LINES or len(line) + 1 > budget:
+                        stopped_at = total
+                        continue
+                    selected.append((total, line))
+                    budget -= len(line) + 1
         except UnicodeDecodeError as e:
             raise ToolError(f"Файл не является текстовым (UTF-8): {params.path}") from e
 
-        lines = text.splitlines()
-        start = (params.start_line or 1) - 1
-        end = params.end_line or len(lines)
-        start = max(start, 0)
-        sel = lines[start:end]
-        width = len(str(start + len(sel)))
-        numbered = "\n".join(
-            f"{str(start + i + 1).rjust(width)}\t{line}" for i, line in enumerate(sel)
-        )
-        if not sel:
-            numbered = "(пусто)"
+        if not selected:
+            numbered = "(пусто)" if total == 0 else f"(нет строк в диапазоне; всего строк: {total})"
+        else:
+            width = len(str(selected[-1][0]))
+            numbered = "\n".join(f"{str(n).rjust(width)}\t{line}" for n, line in selected)
+        if stopped_at is not None:
+            numbered += (
+                f"\n… показаны строки {selected[0][0] if selected else start}–"
+                f"{stopped_at - 1} из {total}. Продолжение: start_line={stopped_at}."
+            )
         return ToolResult(
             content=numbered,
-            summary=f"прочитан {_rel(ctx, p)} ({len(sel)} строк)",
+            summary=f"прочитан {_rel(ctx, p)} ({len(selected)} строк)",
         )
 
 
@@ -232,10 +262,11 @@ class WriteFileTool(Tool):
                 return ""
         return ""
 
-    def preview(self, params: WriteFileParams, ctx: ToolContext) -> str | None:
+    def preview(self, params: WriteFileParams, ctx: ToolContext) -> Display | None:
         old = self._old_content(ctx, params)
         content, _ = repair_escaped_content(params.content)
-        return make_diff(old, content, params.path) or "(новый пустой файл)"
+        diff = make_diff(old, content, params.path) or "(новый пустой файл)"
+        return Display(diff, kind="diff", title=params.path)
 
     def run(self, params: WriteFileParams, ctx: ToolContext) -> ToolResult:
         p = resolve_in_root(ctx.root, params.path)
@@ -252,7 +283,7 @@ class WriteFileTool(Tool):
         return ToolResult(
             content=f"Файл {verb}: {params.path} ({n} строк).{note}",
             summary=f"{verb} {_rel(ctx, p)}{note}",
-            display=make_diff(old, content, params.path),
+            display=Display(make_diff(old, content, params.path), kind="diff", title=params.path),
         )
 
 
@@ -339,9 +370,9 @@ class EditFileTool(Tool):
             "Скопируйте фрагмент дословно из содержимого ниже:\n\n" + _numbered_excerpt(old)
         )
 
-    def preview(self, params: EditFileParams, ctx: ToolContext) -> str | None:
+    def preview(self, params: EditFileParams, ctx: ToolContext) -> Display | None:
         _, old, new, _ = self._compute(params, ctx)
-        return make_diff(old, new, params.path)
+        return Display(make_diff(old, new, params.path), kind="diff", title=params.path)
 
     def run(self, params: EditFileParams, ctx: ToolContext) -> ToolResult:
         p, old, new, count = self._compute(params, ctx)
@@ -350,20 +381,23 @@ class EditFileTool(Tool):
         return ToolResult(
             content=f"Отредактирован {params.path}: заменено вхождений — {replaced}.",
             summary=f"изменён {_rel(ctx, p)}",
-            display=make_diff(old, new, params.path),
+            display=Display(make_diff(old, new, params.path), kind="diff", title=params.path),
         )
 
 
 # --------------------------------------------------------------------------- #
 # list_dir
 # --------------------------------------------------------------------------- #
+MAX_LIST_ENTRIES = 500
+
+
 class ListDirParams(BaseModel):
     path: str = Field(default=".", description="Путь к директории (по умолчанию корень)")
 
 
 class ListDirTool(Tool):
     name = "list_dir"
-    description = "Выводит список файлов и поддиректорий в указанной директории."
+    description = "Выводит список файлов и поддиректорий (включая скрытые) в указанной директории."
     Params = ListDirParams
 
     def run(self, params: ListDirParams, ctx: ToolContext) -> ToolResult:
@@ -371,52 +405,57 @@ class ListDirTool(Tool):
         if not p.is_dir():
             raise ToolError(f"Не директория: {params.path}")
         entries = sorted(p.iterdir(), key=lambda e: (e.is_file(), e.name.lower()))
-        lines = []
-        for e in entries:
-            if e.name.startswith(".") and e.name not in (".env.example",):
-                continue
-            lines.append(f"{e.name}/" if e.is_dir() else e.name)
+        lines = [f"{e.name}/" if e.is_dir() else e.name for e in entries[:MAX_LIST_ENTRIES]]
         body = "\n".join(lines) if lines else "(пусто)"
-        return ToolResult(content=body, summary=f"{_rel(ctx, p)}: {len(lines)} элементов")
+        if len(entries) > MAX_LIST_ENTRIES:
+            body += f"\n… показано {MAX_LIST_ENTRIES} из {len(entries)}"
+        return ToolResult(content=body, summary=f"{_rel(ctx, p)}: {len(entries)} элементов")
 
 
 # --------------------------------------------------------------------------- #
 # find_files
 # --------------------------------------------------------------------------- #
+MAX_FIND_RESULTS = 1000
+
+
 class FindFilesParams(BaseModel):
-    pattern: str = Field(description="Glob-шаблон имени, например '*.py' или 'src/**/*.ts'")
+    pattern: str = Field(
+        description="Glob-шаблон: '*.py' — по имени в любом каталоге, 'src/**/*.ts' — путь от корня"
+    )
     max_results: int = Field(default=200, description="Максимум результатов")
 
 
-_IGNORE_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", ".pytest_cache"}
+def _check_pattern(pattern: str) -> None:
+    """Шаблон должен быть относительным и не подниматься выше корня проекта."""
+    if not pattern:
+        raise ToolError("Пустой шаблон.")
+    if PurePosixPath(pattern).is_absolute() or PureWindowsPath(pattern).is_absolute():
+        raise ToolError("Шаблон должен быть относительным путём от корня проекта.")
+    if ".." in re.split(r"[\\/]", pattern):
+        raise ToolError("Шаблон не может содержать '..' — поиск только внутри проекта.")
 
 
 class FindFilesTool(Tool):
     name = "find_files"
     description = (
-        "Ищет файлы по glob-шаблону имени (рекурсивно). "
+        "Ищет файлы по glob-шаблону (рекурсивно, внутри проекта). Шаблон без '/' "
+        "сравнивается с именем файла, с '/' — с путём от корня ('**' — любые каталоги). "
         "Игнорирует служебные директории (.git, node_modules и т.п.)."
     )
     Params = FindFilesParams
 
     def run(self, params: FindFilesParams, ctx: ToolContext) -> ToolResult:
+        pattern = params.pattern.strip()
+        _check_pattern(pattern)
+        limit = min(max(params.max_results, 1), MAX_FIND_RESULTS)
         root = ctx.root
-        results: list[str] = []
-        # Поддержка как 'glob' от корня, так и простого имени-шаблона рекурсивно.
-        pattern = params.pattern
-        candidates = root.rglob("*") if "/" not in pattern else root.glob(pattern)
-        for path in candidates:
-            if not path.is_file():
-                continue
-            if any(part in _IGNORE_DIRS for part in path.parts):
-                continue
-            rel = _rel(ctx, path)
-            if "/" in pattern:
-                results.append(rel)
-            elif fnmatch.fnmatch(path.name, pattern):
-                results.append(rel)
-            if len(results) >= params.max_results:
-                break
-        results.sort()
-        body = "\n".join(results) if results else "(ничего не найдено)"
-        return ToolResult(content=body, summary=f"найдено файлов: {len(results)}")
+        matches = sorted(
+            rel
+            for rel in (path.relative_to(root).as_posix() for path in walk_files(root))
+            if glob_match(rel, pattern)
+        )
+        shown = matches[:limit]
+        body = "\n".join(shown) if shown else "(ничего не найдено)"
+        if len(matches) > limit:
+            body += f"\n… показано {limit} из {len(matches)}; уточните шаблон"
+        return ToolResult(content=body, summary=f"найдено файлов: {len(matches)}")
