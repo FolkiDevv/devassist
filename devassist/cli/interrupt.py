@@ -237,7 +237,8 @@ class EscInterrupt:
 
             if self._saved_mode is None:
                 self._saved_mode = termios.tcgetattr(self._fd)
-            tty.setcbreak(self._fd)
+            # TCSANOW: по умолчанию TCSAFLUSH выбросил бы уже набранные клавиши.
+            tty.setcbreak(self._fd, termios.TCSANOW)
 
     def _restore_mode(self) -> None:
         if os.name == "posix" and self._saved_mode is not None:

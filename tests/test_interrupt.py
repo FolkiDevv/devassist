@@ -133,3 +133,14 @@ def test_text_after_sequences_is_kept(keys, text):
     parser, hits = _parser()
     parser.feed(keys)
     assert hits == [] and parser.take_text() == text
+
+
+@pty_only
+def test_input_typed_before_enter_is_kept(pty_pair):
+    master, slave = pty_pair
+    os.write(master, "уже набрано".encode())  # до перехода в cbreak
+    time.sleep(0.1)
+    esc = EscInterrupt(fd=slave, enabled=True)
+    with esc:
+        time.sleep(0.3)
+    assert esc.take_typeahead() == "уже набрано"
