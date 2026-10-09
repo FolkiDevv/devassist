@@ -151,3 +151,11 @@ def test_is_excluded_matches_walk_decision(tmp_path):
     assert is_excluded(tmp_path, tmp_path.resolve() / "out")
     assert not is_excluded(tmp_path, tmp_path.resolve())
     assert is_excluded(tmp_path, tmp_path.parent)
+
+
+def test_walk_files_accepts_unresolved_base(tmp_path):
+    _make(tmp_path, ".gitignore", "*.gen\n")
+    _make(tmp_path, "pkg/a.py")
+    _make(tmp_path, "pkg/b.gen")
+    base = tmp_path / "pkg" / ".." / "pkg"  # не раскрытый путь внутри корня
+    assert _rels(tmp_path, base) == ["pkg/a.py"]

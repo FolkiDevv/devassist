@@ -41,7 +41,7 @@ def _open_index(ctx: ToolContext) -> Iterator[ProjectIndex]:
 
 
 def _refresh_note(stats: RefreshStats) -> str:
-    return f"; индекс обновлён: {stats.changed} файлов" if stats.changed else ""
+    return f"; индекс обновлён (файлов: {stats.changed})" if stats.changed else ""
 
 
 def _lines(symbol: Symbol) -> str:
@@ -122,7 +122,7 @@ class FileOutlineParams(BaseModel):
 
 
 def _entry_line(entry: FileEntry, shown_path: str) -> str:
-    details = [entry.language or "?", f"{entry.lines} строк"]
+    details = [entry.language or "?", f"строк: {entry.lines}"]
     if entry.symbols:
         details.append(f"определений: {entry.symbols}")
     if entry.status == STATUS_LARGE:

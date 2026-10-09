@@ -108,6 +108,8 @@ def walk_files(root: Path, base: Path | None = None, *, gitignore: bool = True) 
     start = base if base is not None else root
     if not is_within(root, start):
         gitignore = False  # путь вне корня: правилам проекта не к чему относиться
+    elif gitignore:
+        start = start.resolve()  # пути от корня считаются по раскрытому пути
     stacks: dict[str, IgnoreStack] = {}
     if gitignore:
         stacks[_rel_dir(root, start)] = stack_for(root, _rel_dir(root, start))

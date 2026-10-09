@@ -50,7 +50,7 @@ def test_find_symbol_lists_definitions(ctx):
     result = _find(ctx, query="run_turn")
     assert result.ok
     assert result.content == ("app/agent.py:2-3 method Agent.run_turn — def run_turn(self, text):")
-    assert result.summary.startswith("найдено определений: 1; индекс обновлён: 2 файлов")
+    assert result.summary.startswith("найдено определений: 1; индекс обновлён (файлов: 2)")
     # второй вызов: индекс уже актуален
     assert _find(ctx, query="run_turn").summary == "найдено определений: 1"
 
@@ -83,7 +83,7 @@ def test_find_symbol_describe():
 def test_file_outline_of_file(ctx):
     result = _outline(ctx, "app/agent.py")
     assert result.content.splitlines() == [
-        "app/agent.py (python, 7 строк, определений: 3)",
+        "app/agent.py (python, строк: 7, определений: 3)",
         "1-3  class Agent:",
         "  2-3  def run_turn(self, text):",
         "6-7  def helper():",
@@ -95,8 +95,8 @@ def test_file_outline_of_file(ctx):
 def test_file_outline_of_directory(ctx):
     result = _outline(ctx, ".")
     assert result.content.splitlines() == [
-        "app/agent.py (python, 7 строк, определений: 3)",
-        "docs/guide.md (markdown, 2 строк, определений: 2)",
+        "app/agent.py (python, строк: 7, определений: 3)",
+        "docs/guide.md (markdown, строк: 2, определений: 2)",
     ]
     assert result.summary.startswith(".: файлов 2, определений 5")
     assert _outline(ctx, "app").content.startswith("agent.py (python")
@@ -109,7 +109,7 @@ def test_file_outline_groups_large_directories(ctx, monkeypatch):
     assert lines[:3] == [
         "app/ (файлов: 1, определений: 3)",
         "docs/ (файлов: 1, определений: 2)",
-        "top.py (python, 2 строк, определений: 1)",
+        "top.py (python, строк: 2, определений: 1)",
     ]
     assert "всего файлов: 3" in lines[-1]
 
