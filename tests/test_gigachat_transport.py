@@ -211,7 +211,7 @@ def test_measure_prompt_sends_one_token_request():
     p.close()
 
 
-@pytest.mark.parametrize("status", [400, 413, 422, 500, 503])
+@pytest.mark.parametrize("status", [400, 413, 422, 500, 504])
 def test_measure_prompt_oversize_statuses(status):
     def handler(request: httpx.Request) -> httpx.Response:
         if str(request.url) == AUTH_URL:
@@ -326,3 +326,37 @@ def test_measure_prompt_token_errors_are_not_oversize():
         p.measure_prompt("x")
     assert not isinstance(e.value, PromptTooLong)
     p.close()
+
+
+@pytest.mark.parametrize("status", [502, 503])
+def test_measure_prompt_unavailable_gateway_is_not_oversize(status):
+    """Временная недоступность — не «не помещается»: иначе окно занизилось бы навсегда."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == AUTH_URL:
+            return _auth_response()
+        return httpx.Response(status, text="<html>Bad Gateway</html>")
+
+    p = _provider(handler)
+    with pytest.raises(GigaChatError) as e:
+        p.measure_prompt("x" * 10)
+    assert not isinstance(e.value, PromptTooLong) and "временно недоступен" in str(e.value)
+    p.close()
+
+
+def test_error_body_is_clipped():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == AUTH_URL:
+            return _auth_response()
+        return httpx.Response(400, text="<html>" + "x" * 50_000 + "</html>")
+
+    p = _provider(handler)
+    with pytest.raises(GigaChatError) as e:
+        p.complete(_msgs())
+    assert len(str(e.value)) < 700 and str(e.value).endswith("…")
+    p.close()
+
+
+def test_negative_retry_after_does_not_crash():
+    resp = httpx.Response(429, headers={"Retry-After": "-5"})
+    assert GigaChatProvider._retry_after(resp, 1.0) == 0.0

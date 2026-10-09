@@ -38,12 +38,22 @@ class ModelWindows:
     не трогают файловую систему.
     """
 
-    def __init__(self, path: Path | None = None, entries: dict[str, dict[str, Any]] | None = None):
+    def __init__(
+        self,
+        path: Path | None = None,
+        entries: dict[str, dict[str, Any]] | None = None,
+        *,
+        base_url: str = "",
+    ):
         self.path = path
         self._entries: dict[str, dict[str, Any]] = dict(entries or {})
+        # Текущий эндпоинт: замер с другого контура (иное окно у той же модели) не берётся.
+        self.base_url = base_url
 
     @classmethod
-    def load(cls, path: Path | None = None) -> tuple[ModelWindows, str | None]:
+    def load(
+        cls, path: Path | None = None, *, base_url: str = ""
+    ) -> tuple[ModelWindows, str | None]:
         """Читает файл (по умолчанию :func:`default_path`).
 
         Нет файла — пустое хранилище; битый файл — пустое хранилище и текст
@@ -53,16 +63,23 @@ class ModelWindows:
         try:
             entries = _read(path)
         except FileNotFoundError:
-            return cls(path), None
+            return cls(path, base_url=base_url), None
         except (OSError, ValueError) as e:
             warning = f"не удалось прочитать {path}: {e} — окна моделей замеряются заново"
-            return cls(path), warning
-        return cls(path, entries), None
+            return cls(path, base_url=base_url), warning
+        return cls(path, entries, base_url=base_url), None
 
     def get(self, model: str) -> int | None:
-        """Замеренное окно модели (токены) или None."""
+        """Замеренное окно модели (токены) или None.
+
+        Замер другого эндпоинта (поле ``base_url``) не используется: внутренний и
+        внешний контуры могут разворачивать модель с разными окнами.
+        """
         entry = self._entries.get(model)
         if not isinstance(entry, dict):
+            return None
+        measured_at = entry.get("base_url")
+        if self.base_url and measured_at and measured_at != self.base_url:
             return None
         value = entry.get("context_window")
         return value if isinstance(value, int) and value > 0 else None

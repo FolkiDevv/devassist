@@ -221,7 +221,7 @@ def main(argv: list[str] | None = None) -> int:
             ui.info("Доступные модели:\n" + "\n".join(f"  • {m}" for m in models))
             return EXIT_OK
 
-        windows, warning = ModelWindows.load()
+        windows, warning = ModelWindows.load(base_url=config.base_url)
         if warning:
             ui.warn(warning)
         if args.test_context:

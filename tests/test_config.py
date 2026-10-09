@@ -120,3 +120,75 @@ def test_yes_all_implies_auto_approve(tmp_path):
     assert cfg.auto_approve and cfg.yes_all
     cfg = Config.load(project_root=tmp_path, auto_approve=True, environ={}, cwd=tmp_path)
     assert cfg.auto_approve and not cfg.yes_all
+
+
+def test_ca_bundle_enables_verification(tmp_path):
+    import ssl
+
+    import certifi
+
+    env = {"GIGACHAT_ACCESS_KEY": "k", "GIGACHAT_CA_BUNDLE": certifi.where()}
+    cfg = Config.load(project_root=tmp_path, environ=env, cwd=tmp_path)
+    assert cfg.verify_ssl and cfg.ca_bundle == certifi.where()
+    context = cfg.build_ssl_verify()
+    assert isinstance(context, ssl.SSLContext) and context.verify_mode == ssl.CERT_REQUIRED
+    # явный GIGACHAT_VERIFY_SSL=0 важнее
+    cfg = Config.load(
+        project_root=tmp_path, environ={**env, "GIGACHAT_VERIFY_SSL": "0"}, cwd=tmp_path
+    )
+    assert cfg.build_ssl_verify() is False
+    with pytest.raises(ConfigError, match="GIGACHAT_CA_BUNDLE"):
+        Config.load(
+            project_root=tmp_path,
+            environ={"GIGACHAT_CA_BUNDLE": str(tmp_path / "нет.pem")},
+            cwd=tmp_path,
+        )
+
+
+def _self_signed(tmp_path):
+    import shutil
+    import subprocess
+
+    if shutil.which("openssl") is None:
+        pytest.skip("нет openssl")
+    cert, key = tmp_path / "c.pem", tmp_path / "k.pem"
+    subprocess.run(
+        [
+            "openssl",
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-days",
+            "1",
+            "-subj",
+            "/CN=test",
+            "-keyout",
+            str(key),
+            "-out",
+            str(cert),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return cert, key
+
+
+def test_mtls_verification_loads_trust_anchors(tmp_path):
+    """Голый SSLContext без корневых сертификатов не проверил бы ни один сервер."""
+    import ssl
+
+    cert, key = _self_signed(tmp_path)
+    base = {"GIGACHAT_CERT": str(cert), "GIGACHAT_KEY": str(key)}
+    cfg = Config.load(
+        project_root=tmp_path, environ={**base, "GIGACHAT_VERIFY_SSL": "1"}, cwd=tmp_path
+    )
+    context = cfg.build_ssl_verify()
+    assert context.verify_mode == ssl.CERT_REQUIRED
+    assert context.cert_store_stats()["x509_ca"] > 0 or context.get_ca_certs() != []
+    cfg = Config.load(
+        project_root=tmp_path, environ={**base, "GIGACHAT_CA_BUNDLE": str(cert)}, cwd=tmp_path
+    )
+    context = cfg.build_ssl_verify()
+    assert context.verify_mode == ssl.CERT_REQUIRED and len(context.get_ca_certs()) == 1

@@ -553,6 +553,19 @@ def test_repl_does_not_index_outside_git_repo(cli_env, capsys):
     assert "индекс проекта: 1 файл, 1 определение" in _out(capsys)
 
 
+def test_repl_warns_when_tls_verification_is_off(tmp_path, capsys):
+    from dataclasses import replace
+
+    from devassist.cli.repl import TLS_OFF_WARNING
+
+    agent, ui, ctx, _ = _measure_env(tmp_path, auto_approve=True)
+    run_repl(agent, ui, ctx.commands, read_input=_reader("/exit"), index_on_start=False)
+    assert " ".join(TLS_OFF_WARNING.split()[:4]) in _out(capsys)
+    agent._cfg = replace(agent.config, verify_ssl=True)
+    run_repl(agent, ui, ctx.commands, read_input=_reader("/exit"), index_on_start=False)
+    assert "TLS" not in _out(capsys)
+
+
 def test_repl_without_index_on_start(cli_env):
     agent, ui, commands, _, _ = cli_env
     run_repl(agent, ui, commands, read_input=_reader("/exit"), index_on_start=False)

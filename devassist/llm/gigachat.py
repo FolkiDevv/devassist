@@ -54,6 +54,19 @@ _RETRY_STATUS = {429, 500, 502, 503, 504}
 # Замер окна: 4xx с этими статусами — не про размер запроса (авторизация, нет
 # модели, лимит частоты); остальные 4xx и 5xx считаются «запрос не помещается».
 _NOT_SIZE_STATUS = {401, 403, 404, 429}
+# …кроме временной недоступности шлюза: счесть её отказом по размеру — занизить
+# окно, и заниженное значение сохранилось бы в ~/.devassist/models.json.
+_UNAVAILABLE_STATUS = {502, 503}
+# Сколько тела ответа показывать в сообщении об ошибке (HTML-страница прокси и т.п.).
+_ERROR_BODY_CHARS = 500
+
+
+def _body(resp: httpx.Response) -> str:
+    """Тело ответа для сообщения об ошибке — не длиннее :data:`_ERROR_BODY_CHARS`."""
+    text = resp.text.strip()
+    return text if len(text) <= _ERROR_BODY_CHARS else text[:_ERROR_BODY_CHARS] + "…"
+
+
 _PROBE_ATTEMPTS = 2
 # Обрыв или таймаут уже отправляемого запроса — для огромного запроса это тоже
 # «не помещается»; ошибки установки соединения к размеру отношения не имеют.
@@ -145,7 +158,7 @@ class GigaChatProvider(LLMProvider):
             data = resp.json()
         except ValueError as e:
             raise GigaChatError(
-                f"GigaChat вернул не-JSON ответ ({resp.status_code}): {resp.text[:500]}"
+                f"GigaChat вернул не-JSON ответ ({resp.status_code}): {_body(resp)}"
             ) from e
         if not isinstance(data, dict):
             raise GigaChatError(f"Неожиданный формат ответа GigaChat: {str(data)[:500]}")
@@ -157,7 +170,7 @@ class GigaChatProvider(LLMProvider):
         ra = resp.headers.get("Retry-After")
         if ra:
             try:
-                return min(float(ra), 30.0)
+                return max(min(float(ra), 30.0), 0.0)  # отрицательное — ValueError в sleep
             except ValueError:
                 pass
         return default
@@ -187,7 +200,7 @@ class GigaChatProvider(LLMProvider):
             resp.raise_for_status()
         except httpx.HTTPStatusError as e:
             raise GigaChatError(
-                f"Не удалось получить токен GigaChat ({resp.status_code}): {resp.text}"
+                f"Не удалось получить токен GigaChat ({resp.status_code}): {_body(resp)}"
             ) from e
 
         data = self._json(resp)
@@ -218,15 +231,19 @@ class GigaChatProvider(LLMProvider):
     # ------------------------------------------------------------------ #
     @staticmethod
     def _as_json_content(content: str) -> str:
-        """GigaChat требует, чтобы content сообщения role=function был валидным
-        JSON-строкой. Если результат инструмента — произвольный текст, заворачиваем
-        его в JSON-объект {"result": ...}."""
+        """GigaChat требует, чтобы content сообщения role=function был JSON-объектом.
+
+        Объект передаётся как есть, всё остальное — текст, но и голые JSON-значения
+        (``42``, ``true``, ``[]`` — например, листинг из одного файла ``1``) —
+        заворачивается в ``{"result": ...}``: отвергнутое API сообщение осталось бы
+        в истории и ломало бы каждый следующий запрос этого чата."""
         text = content or ""
         try:
-            json.loads(text)
-            return text  # уже валидный JSON
-        except (json.JSONDecodeError, ValueError):
-            return json.dumps({"result": text}, ensure_ascii=False)
+            if isinstance(json.loads(text), dict):
+                return text
+        except ValueError:
+            pass
+        return json.dumps({"result": text}, ensure_ascii=False)
 
     @classmethod
     def _message_to_payload(cls, msg: Message) -> dict[str, Any]:
@@ -324,7 +341,7 @@ class GigaChatProvider(LLMProvider):
         try:
             resp.raise_for_status()
         except httpx.HTTPStatusError as e:
-            raise GigaChatError(f"GigaChat вернул {resp.status_code}: {resp.text}") from e
+            raise GigaChatError(f"GigaChat вернул {resp.status_code}: {_body(resp)}") from e
 
         return self._parse_response(self._json(resp))
 
@@ -371,10 +388,12 @@ class GigaChatProvider(LLMProvider):
         }
         resp = self._post_chat(payload, self._send_probe)
         status = resp.status_code
+        if status in _UNAVAILABLE_STATUS:
+            raise GigaChatError(f"GigaChat временно недоступен ({status}): {_body(resp)}")
         if status >= 500 or (status >= 400 and status not in _NOT_SIZE_STATUS):
             raise PromptTooLong(status, resp.text)
         if status >= 400:
-            raise GigaChatError(f"GigaChat вернул {status}: {resp.text}")
+            raise GigaChatError(f"GigaChat вернул {status}: {_body(resp)}")
         usage = Usage.from_raw(self._json(resp).get("usage"))
         if usage.prompt_tokens <= 0:
             raise GigaChatError("GigaChat не вернул usage.prompt_tokens — замер невозможен")
@@ -435,7 +454,7 @@ class GigaChatProvider(LLMProvider):
                         continue
                     if resp.status_code >= 400:
                         resp.read()
-                        raise GigaChatError(f"GigaChat вернул {resp.status_code}: {resp.text}")
+                        raise GigaChatError(f"GigaChat вернул {resp.status_code}: {_body(resp)}")
                     return self._consume_sse(resp, emit)
             except _RETRYABLE_EXC as e:
                 last_exc = e
@@ -510,7 +529,7 @@ class GigaChatProvider(LLMProvider):
         )
         if resp.status_code >= 400:
             raise GigaChatError(
-                f"Не удалось получить список моделей ({resp.status_code}): {resp.text}"
+                f"Не удалось получить список моделей ({resp.status_code}): {_body(resp)}"
             )
         models = self._json(resp).get("data") or []
         return [

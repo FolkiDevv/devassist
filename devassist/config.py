@@ -165,6 +165,9 @@ class Config:
     auth_url: str = DEFAULT_AUTH_URL
     base_url: str = DEFAULT_OAUTH_URL
     verify_ssl: bool = False
+    # Корневой сертификат для проверки сервера (Минцифры для API Сбера); задан —
+    # проверка TLS включена по умолчанию.
+    ca_bundle: str | None = None
     timeout: int = 120
 
     # --- Агент / окружение ---
@@ -225,6 +228,9 @@ class Config:
         base_url = env.get("GIGACHAT_URL")
         if not base_url:
             base_url = DEFAULT_MTLS_URL if (not access_key and cert and key) else DEFAULT_OAUTH_URL
+        ca_bundle = env.get("GIGACHAT_CA_BUNDLE") or None
+        if ca_bundle and not Path(ca_bundle).expanduser().is_file():
+            raise ConfigError(f"GIGACHAT_CA_BUNDLE: файл не найден: {ca_bundle}")
 
         return cls(
             access_key=access_key,
@@ -234,7 +240,8 @@ class Config:
             model=model or env.get("GIGACHAT_MODEL") or DEFAULT_MODEL,
             auth_url=env.get("GIGACHAT_AUTH_URL") or DEFAULT_AUTH_URL,
             base_url=base_url.rstrip("/"),
-            verify_ssl=_env_bool(env, "GIGACHAT_VERIFY_SSL", False),
+            verify_ssl=_env_bool(env, "GIGACHAT_VERIFY_SSL", ca_bundle is not None),
+            ca_bundle=str(Path(ca_bundle).expanduser()) if ca_bundle else None,
             timeout=_env_int(env, "GIGACHAT_TIMEOUT", 120),
             project_root=root,
             auto_approve=auto_approve or yes_all,
@@ -269,10 +276,12 @@ class Config:
         """Значение для httpx ``verify=``.
 
         Для mTLS строит SSL-контекст с клиентским сертификатом (cert+key); файлы
-        проверяются на существование и загружаемость. Для OAuth возвращает флаг
-        проверки TLS-сертификата сервера (verify_ssl).
+        проверяются на существование и загружаемость. Для OAuth — флаг проверки
+        TLS-сертификата сервера (verify_ssl) или контекст с ``ca_bundle``.
         """
         if self.auth_mode != "mtls":
+            if self.verify_ssl and self.ca_bundle:
+                return ssl.create_default_context(cafile=self.ca_bundle)
             return self.verify_ssl
 
         cert_path = Path(self.cert)  # type: ignore[arg-type]
@@ -287,6 +296,12 @@ class Config:
             # Внутренний контур: самоподписанный серверный сертификат.
             context.check_hostname = False
             context.verify_mode = ssl.CERT_NONE
+        elif self.ca_bundle:
+            context.load_verify_locations(cafile=self.ca_bundle)
+        else:
+            # Голый SSLContext не знает ни одного корневого сертификата: без этого
+            # проверка сервера с GIGACHAT_VERIFY_SSL=1 не проходила бы никогда.
+            context.load_default_certs()
         try:
             context.load_cert_chain(certfile=str(cert_path), keyfile=str(key_path))
         except ssl.SSLError as e:

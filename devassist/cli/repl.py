@@ -29,6 +29,11 @@ from devassist.llm.base import LLMError
 from devassist.ui.console import Console
 from devassist.ui.format import mode_badge
 
+TLS_OFF_WARNING = (
+    "проверка TLS-сертификата GigaChat выключена — ключ можно перехватить подменой "
+    "сервера; задайте GIGACHAT_CA_BUNDLE (корневой сертификат Минцифры)"
+)
+
 
 def status_of(agent: Agent) -> StatusInfo:
     """Данные для статус-строки (вычисляются при каждой отрисовке приглашения)."""
@@ -116,6 +121,9 @@ def run_repl(
         auto_approve=agent.config.auto_approve,
         mode=agent.mode,
     )
+    cfg = agent.config
+    if cfg.auth_mode == "oauth" and not cfg.verify_ssl:
+        ui.warn(TLS_OFF_WARNING)
     if resumed is not None:
         ui.chat_resumed(resumed, agent.conversation.messages)
     # Ввод не принимается, пока строится индекс (Esc/Ctrl+C — отменить построение).
