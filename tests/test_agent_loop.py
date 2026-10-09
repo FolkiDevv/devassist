@@ -11,7 +11,10 @@ from devassist.agent.loop import Agent
 from devassist.config import Config
 from devassist.errors import ToolError
 from devassist.llm.types import Usage
+from devassist.permissions import PermissionMode, ToolKind
 from devassist.tools.base import Display, ToolRegistry, ToolResult, build_default_registry
+from devassist.tools.plan import APPROVE_EDITS
+from devassist.tools.questions import Answer
 
 
 def _agent(provider, tmp_path: Path, *, events=None, registry=None, **cfg_kw) -> Agent:
@@ -513,3 +516,134 @@ def test_request_budget_includes_tool_schemas(tmp_path):
     with_specs = agent._build_request(heavy)
     assert len(with_specs) < len(without) < len(conv) + 1
     assert with_specs[-1].content.startswith("ответ 19")
+
+
+# ----------------------------- режимы разрешений ----------------------------- #
+def _system_prompts(provider) -> list[str]:
+    return [request["messages"][0].content for request in provider.requests]
+
+
+def test_plan_mode_blocks_edits_without_asking(tmp_path):
+    tool = FakeTool(kind=ToolKind.EDIT)
+    provider = ScriptedProvider([tool_turn("fake_write", {}), text_turn("ок")])
+    events = RecordingEvents(confirm_answer=True)
+    agent = _agent(
+        provider,
+        tmp_path,
+        events=events,
+        registry=_registry_with(tool),
+        auto_approve=False,
+        mode=PermissionMode.PLAN,
+    )
+    agent.run_turn("поправь")
+    assert tool.runs == 0 and events.confirms == []
+    assert events.results[-1][1].summary == "заблокировано: режим планирования"
+    assert "режим планирования" in _function_results(agent)[-1]
+    assert "exit_plan_mode" in _function_results(agent)[-1]
+
+
+def test_plan_mode_blocks_even_with_auto_approve(tmp_path):
+    tool = FakeTool(kind=ToolKind.EDIT)
+    provider = ScriptedProvider([tool_turn("fake_write", {}), text_turn("ок")])
+    agent = _agent(provider, tmp_path, registry=_registry_with(tool), mode=PermissionMode.PLAN)
+    agent.run_turn("поправь")
+    assert tool.runs == 0
+
+
+def test_plan_mode_asks_for_commands(tmp_path):
+    tool = FakeTool(kind=ToolKind.COMMAND)
+    provider = ScriptedProvider([tool_turn("fake_write", {}), text_turn("ок")])
+    events = RecordingEvents(confirm_answer=True)
+    agent = _agent(
+        provider,
+        tmp_path,
+        events=events,
+        registry=_registry_with(tool),
+        auto_approve=False,
+        mode=PermissionMode.PLAN,
+    )
+    agent.run_turn("запусти тесты")
+    assert tool.runs == 1 and len(events.confirms) == 1
+
+
+def test_plan_mode_stops_model_that_keeps_editing(tmp_path):
+    edits = [tool_turn("write_file", {"path": f"f{i}.txt", "content": "x"}) for i in range(10)]
+    provider = ScriptedProvider(edits)
+    events = RecordingEvents()
+    agent = _agent(provider, tmp_path, events=events, mode=PermissionMode.PLAN)
+    agent.run_turn("сделай")
+    assert events.stats[-1].stop_reason == "tool_failures"
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_accept_edits_applies_edits_without_asking(tmp_path):
+    tool = FakeTool(kind=ToolKind.EDIT)
+    provider = ScriptedProvider([tool_turn("fake_write", {}), text_turn("ок")])
+    events = RecordingEvents(confirm_answer=False)
+    agent = _agent(
+        provider,
+        tmp_path,
+        events=events,
+        registry=_registry_with(tool),
+        auto_approve=False,
+        mode=PermissionMode.ACCEPT_EDITS,
+    )
+    agent.run_turn("поправь")
+    assert tool.runs == 1 and events.confirms == []
+
+
+@pytest.mark.parametrize("kind", [ToolKind.COMMAND, ToolKind.OTHER])
+def test_accept_edits_still_asks_for_the_rest(tmp_path, kind):
+    tool = FakeTool(kind=kind)
+    provider = ScriptedProvider([tool_turn("fake_write", {}), text_turn("ок")])
+    events = RecordingEvents(confirm_answer=False)
+    agent = _agent(
+        provider,
+        tmp_path,
+        events=events,
+        registry=_registry_with(tool),
+        auto_approve=False,
+        mode=PermissionMode.ACCEPT_EDITS,
+    )
+    agent.run_turn("x")
+    assert tool.runs == 0 and len(events.confirms) == 1
+
+
+def test_plan_rules_are_sent_only_in_plan_mode(tmp_path):
+    provider = ScriptedProvider([text_turn("план"), text_turn("готово")])
+    agent = _agent(provider, tmp_path, mode=PermissionMode.PLAN)
+    agent.run_turn("спланируй")
+    agent.set_mode(PermissionMode.MANUAL)
+    agent.run_turn("делай")
+    planning, manual = _system_prompts(provider)
+    assert "РЕЖИМ ПЛАНИРОВАНИЯ" in planning
+    assert "РЕЖИМ ПЛАНИРОВАНИЯ" not in manual
+
+
+def test_mode_survives_reset_and_cycles(tmp_path):
+    agent = _agent(ScriptedProvider(), tmp_path)
+    assert agent.mode is PermissionMode.MANUAL
+    assert agent.cycle_mode() is PermissionMode.ACCEPT_EDITS
+    agent.reset()
+    assert agent.mode is PermissionMode.ACCEPT_EDITS
+    assert [agent.cycle_mode(), agent.cycle_mode()] == [PermissionMode.PLAN, PermissionMode.MANUAL]
+
+
+def test_approved_plan_switches_mode_within_the_turn(tmp_path):
+    provider = ScriptedProvider(
+        [
+            tool_turn("exit_plan_mode", {"plan": "# План\n1. создать a.txt"}),
+            tool_turn("write_file", {"path": "a.txt", "content": "x"}),
+            text_turn("готово"),
+        ]
+    )
+    events = RecordingEvents(confirm_answer=False, answers=[Answer((APPROVE_EDITS,))])
+    agent = _agent(provider, tmp_path, events=events, auto_approve=False, mode=PermissionMode.PLAN)
+    assert agent.run_turn("спланируй и сделай") == "готово"
+    assert agent.mode is PermissionMode.ACCEPT_EDITS
+    assert (tmp_path / "a.txt").read_text(encoding="utf-8") == "x"
+    assert events.confirms == []  # правка после одобрения — уже без вопроса
+    (question,) = events.questions[0]
+    assert question.body == "# План\n1. создать a.txt"
+    # правила плана — только до одобрения
+    assert ["РЕЖИМ ПЛАНИРОВАНИЯ" in p for p in _system_prompts(provider)] == [True, False, False]

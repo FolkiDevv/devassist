@@ -8,7 +8,8 @@
 * многострочный ввод: ``\\`` в конце строки + Enter или Alt+Enter — новая строка;
   Esc Esc — очистить ввод (черновик сохраняется в истории);
   вставка многострочного текста не отправляет его;
-* статус-строка: модель, заполнение контекста, потраченные токены, режим ``-y``.
+* Shift+Tab — сменить режим разрешений (ручной → авто-правки → план);
+* статус-строка: модель, режим, заполнение контекста, потраченные токены, ``-y``.
 
 Если stdin/stdout не терминал (pipe, CI) или prompt_toolkit не смог запуститься,
 используется обычный ``input()``.
@@ -27,14 +28,15 @@ from prompt_toolkit.application import get_app
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.completion import CompleteEvent, Completer, Completion
 from prompt_toolkit.document import Document
-from prompt_toolkit.filters import Condition
+from prompt_toolkit.filters import Condition, has_completions
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings, KeyPressEvent
 from prompt_toolkit.output import ColorDepth
 from prompt_toolkit.styles import Style
 
+from devassist.permissions import PermissionMode
 from devassist.project.workspace import Workspace
-from devassist.ui.format import format_tokens
+from devassist.ui.format import format_tokens, mode_badge
 from devassist.ui.theme import PROMPT_STYLES
 
 if TYPE_CHECKING:  # commands импортирует KEY_HELP отсюда
@@ -56,6 +58,7 @@ KEY_HELP: tuple[tuple[str, str], ...] = (
     ("\\ + Enter, Alt+Enter", "новая строка (вставка многострочного текста не отправляет)"),
     ("Tab, ↑ ↓", "автодополнение команд, история ввода"),
     ("→", "принять подсказку из истории"),
+    ("Shift+Tab", "сменить режим: ручной → авто-правки → план (и во время ответа)"),
     ("Esc", "во время ответа — прервать ход"),
     ("Esc Esc", "очистить ввод (черновик остаётся в истории, ↑ вернёт его)"),
     ("Ctrl+C", "сбросить ввод; во время ответа — прервать ход"),
@@ -76,12 +79,18 @@ class StatusInfo:
     context_budget: int = 0
     billed_tokens: int = 0
     auto_approve: bool = False
+    mode: PermissionMode = PermissionMode.MANUAL
 
 
 def toolbar_fragments(status: StatusInfo) -> list[tuple[str, str]]:
     """Статус-строка в формате prompt_toolkit: список пар (стиль, текст)."""
     sep = ("", "  ·  ")
     parts: list[tuple[str, str]] = [("class:toolbar.model", f" {status.model}")]
+    parts += [
+        sep,
+        (f"class:toolbar.mode.{status.mode.value}", mode_badge(status.mode)),
+        ("", " (Shift+Tab)"),
+    ]
     if status.context_budget > 0:
         percent = round(100 * status.context_tokens / status.context_budget)
         if percent >= _CONTEXT_DANGER:
@@ -164,8 +173,15 @@ class LazyFileHistory(FileHistory):
 
 
 # --------------------------------- клавиши --------------------------------- #
-def _key_bindings() -> KeyBindings:
+def _key_bindings(on_cycle_mode: Callable[[], object] | None = None) -> KeyBindings:
     kb = KeyBindings()
+
+    if on_cycle_mode is not None:
+        # При открытом меню дополнения Shift+Tab остаётся штатным «назад по меню».
+        @kb.add("s-tab", filter=~has_completions)
+        def _cycle_mode(event: KeyPressEvent) -> None:
+            on_cycle_mode()
+            event.app.invalidate()  # статус-строка с новым режимом — сразу
 
     @kb.add("escape", "escape")
     def _clear(event: KeyPressEvent) -> None:
@@ -204,9 +220,13 @@ def create_prompt_session(
     status: Callable[[], StatusInfo],
     no_color: bool = False,
     arg_choices: Mapping[str, ArgChoices] = {},
+    on_cycle_mode: Callable[[], object] | None = None,
     **kwargs: Any,
 ) -> PromptSession[str]:
-    """Сессия ввода. ``kwargs`` (``input``/``output``) подменяются в тестах."""
+    """Сессия ввода. ``kwargs`` (``input``/``output``) подменяются в тестах.
+
+    ``on_cycle_mode`` — что сделать по Shift+Tab (сменить режим агента).
+    """
 
     @Condition
     def _typing_command() -> bool:
@@ -219,7 +239,7 @@ def create_prompt_session(
         completer=SlashCommandCompleter(commands, arg_choices),
         complete_while_typing=_typing_command,
         reserve_space_for_menu=min(8, len(list(commands)) + 1),
-        key_bindings=_key_bindings(),
+        key_bindings=_key_bindings(on_cycle_mode),
         bottom_toolbar=lambda: toolbar_fragments(status()),
         prompt_continuation=_continuation,
         placeholder=[("class:placeholder", PLACEHOLDER)],
@@ -242,6 +262,7 @@ def make_input_reader(
     status: Callable[[], StatusInfo],
     no_color: bool = False,
     arg_choices: Mapping[str, ArgChoices] = {},
+    on_cycle_mode: Callable[[], object] | None = None,
 ) -> InputReader:
     """Функция чтения строки: prompt_toolkit в терминале, иначе ``input()``."""
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
@@ -253,6 +274,7 @@ def make_input_reader(
             status=status,
             no_color=no_color,
             arg_choices=arg_choices,
+            on_cycle_mode=on_cycle_mode,
         )
     except Exception:  # терминал не поддерживается (например, mintty без консоли)
         return _read_plain

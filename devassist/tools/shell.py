@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+from devassist.permissions import ToolKind
 from devassist.security import RiskLevel, classify_shell_command
 from devassist.tools.base import Display, Tool, ToolContext, ToolResult
 from devassist.tools.process import run_process, truncate_middle
@@ -27,6 +28,7 @@ class RunShellTool(Tool):
         "Сетевые команды (curl/wget) запрещены политикой безопасности."
     )
     Params = RunShellParams
+    kind = ToolKind.COMMAND
 
     def risk(self, params: RunShellParams, ctx: ToolContext) -> RiskLevel:
         return classify_shell_command(params.command)

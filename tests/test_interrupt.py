@@ -144,3 +144,44 @@ def test_input_typed_before_enter_is_kept(pty_pair):
     with esc:
         time.sleep(0.3)
     assert esc.take_typeahead() == "уже набрано"
+
+
+# --------------------------- Shift+Tab во время хода --------------------------- #
+def _backtab_parser(pending: bool = False):
+    escapes: list[int] = []
+    backtabs: list[int] = []
+    parser = KeyParser(lambda: escapes.append(1), lambda: pending, lambda: backtabs.append(1))
+    return parser, escapes, backtabs
+
+
+def test_shift_tab_cycles_mode():
+    parser, escapes, backtabs = _backtab_parser()
+    parser.feed(b"ab\x1b[Zcd\x1b[Z")
+    assert backtabs == [1, 1] and escapes == []
+    assert parser.take_text() == "abcd"
+
+
+@pytest.mark.parametrize("keys", [b"\x1b[1;2Z", b"\x1b[A", b"\x1bZ", b"\x1bOZ", b"Z"])
+def test_other_keys_are_not_shift_tab(keys):
+    parser, _, backtabs = _backtab_parser()
+    parser.feed(keys)
+    assert backtabs == []
+
+
+def test_shift_tab_split_across_reads():
+    parser, escapes, backtabs = _backtab_parser(pending=True)
+    parser.feed(b"\x1b")
+    parser.feed(b"[")
+    parser.feed(b"Z")
+    assert backtabs == [1] and escapes == []
+
+
+@pty_only
+def test_shift_tab_reaches_callback_without_interrupting(pty_pair):
+    master, slave = pty_pair
+    hits: list[int] = []
+    esc = EscInterrupt(fd=slave, enabled=True, on_backtab=lambda: hits.append(1))
+    with esc:
+        os.write(master, b"\x1b[Z")
+        time.sleep(0.3)
+    assert hits == [1] and esc.take_typeahead() == ""

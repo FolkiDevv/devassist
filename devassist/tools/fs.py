@@ -8,6 +8,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from pydantic import BaseModel, Field
 
+from devassist.permissions import ToolKind
 from devassist.project.files import glob_match, walk_files
 from devassist.project.workspace import DATA_DIR_NAME
 from devassist.security import RiskLevel, resolve_in_root
@@ -267,6 +268,7 @@ class WriteFileTool(Tool):
         "содержимым. Создаёт родительские директории при необходимости."
     )
     Params = WriteFileParams
+    kind = ToolKind.EDIT
 
     def risk(self, params: WriteFileParams, ctx: ToolContext) -> RiskLevel:
         return RiskLevel.WRITE
@@ -327,6 +329,7 @@ class EditFileTool(Tool):
         "но фрагмент лучше копировать дословно из содержимого файла."
     )
     Params = EditFileParams
+    kind = ToolKind.EDIT
 
     def risk(self, params: EditFileParams, ctx: ToolContext) -> RiskLevel:
         return RiskLevel.WRITE

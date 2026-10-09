@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from datetime import datetime
 
+from devassist.permissions import PermissionMode
+from devassist.ui.theme import MODE_ICONS
+
 SKIPPED_MARK = "…"
 
 
@@ -15,6 +18,12 @@ def plural(n: int, one: str, few: str, many: str) -> str:
     if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
         return few
     return many
+
+
+def mode_badge(mode: PermissionMode) -> str:
+    """Режим разрешений для статус-строки и индикатора: значок + название."""
+    icon = MODE_ICONS.get(mode.value, "")
+    return f"{icon} {mode.label}" if icon else mode.label
 
 
 def format_tokens(n: int) -> str:

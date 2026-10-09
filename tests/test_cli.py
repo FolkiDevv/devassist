@@ -16,6 +16,7 @@ from devassist.cli.commands import (
 )
 from devassist.cli.repl import run_repl
 from devassist.config import Config
+from devassist.permissions import PermissionMode
 from devassist.project.workspace import Workspace
 from devassist.tools.base import build_default_registry
 from devassist.ui.console import Console
@@ -141,6 +142,7 @@ def oneshot(tmp_path, monkeypatch):
         "DEVASSIST_TEMPERATURE",
         "DEVASSIST_CONTEXT_TOKENS",
         "DEVASSIST_SAVE_CHATS",
+        "DEVASSIST_MODE",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -708,3 +710,78 @@ def test_continue_restores_model_unless_overridden(tmp_path, oneshot):
     assert provider.requests[-1]["model"] == "M-cli"
     (chat,) = _store(tmp_path).recent()
     assert chat.model == "M-cli"
+
+
+# ----------------------------- режимы разрешений ----------------------------- #
+def test_mode_command(cli_env, capsys):
+    agent, _, commands, ctx, _ = cli_env
+    assert commands.dispatch("/mode", ctx) is True
+    out = _out(capsys)
+    assert "режим: ручной" in out and "plan — план" in out and "Shift+Tab" in out
+    commands.dispatch("/mode plan", ctx)
+    assert agent.mode is PermissionMode.PLAN
+    assert "режим: план" in _out(capsys)
+    commands.dispatch("/mode EDITS", ctx)
+    assert agent.mode is PermissionMode.ACCEPT_EDITS
+    commands.dispatch("/mode auto", ctx)
+    assert agent.mode is PermissionMode.ACCEPT_EDITS
+    assert "неизвестный режим" in _out(capsys)
+
+
+def test_repl_shows_mode_and_wires_shift_tab(cli_env, capsys):
+    import contextlib
+
+    from devassist.cli.repl import status_of
+
+    agent, ui, commands, _, _ = cli_env
+
+    class FakeEsc:
+        enabled = True
+        on_backtab = None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return None
+
+        def paused(self):
+            return contextlib.nullcontext()
+
+        def take_typeahead(self):
+            return ""
+
+    esc = FakeEsc()
+    assert run_repl(agent, ui, commands, read_input=_reader("/exit"), interrupt=esc) == 0
+    out = _out(capsys)
+    assert "режим" in out and "ручной" in out and "Shift+Tab" in out  # баннер
+    # Shift+Tab во время хода — смена режима агента и подсказка в индикаторе
+    esc.on_backtab()
+    assert agent.mode is PermissionMode.ACCEPT_EDITS
+    assert status_of(agent).mode is PermissionMode.ACCEPT_EDITS
+    assert "авто-правки (Shift+Tab)" in ui._turn_hint()
+
+
+def test_oneshot_mode_flag_and_env(tmp_path, oneshot, monkeypatch):
+    provider = ScriptedProvider([text_turn("план"), text_turn("план")])
+    oneshot(provider)
+    assert _main(tmp_path, "--mode", "plan", "-p", "x", "--no-save") == 0
+    monkeypatch.setenv("DEVASSIST_MODE", "plan")
+    assert _main(tmp_path, "-p", "x", "--no-save") == 0
+    assert all("РЕЖИМ ПЛАНИРОВАНИЯ" in r["messages"][0].content for r in provider.requests)
+    with pytest.raises(SystemExit):
+        _main(tmp_path, "--mode", "auto", "-p", "x")
+
+
+def test_oneshot_plan_without_approver_ends_with_plan(tmp_path, oneshot, capsys):
+    provider = ScriptedProvider(
+        [
+            tool_turn("exit_plan_mode", {"plan": "1. поправить a.py"}),
+            text_turn("План: 1. поправить a.py"),
+        ]
+    )
+    oneshot(provider)
+    assert _main(tmp_path, "--mode", "plan", "-p", "спланируй", "--no-save") == 0
+    function_msgs = [m for m in provider.requests[-1]["messages"] if m.role == "function"]
+    assert "Одобрить план некому" in function_msgs[-1].content
+    assert "План: 1. поправить a.py" in capsys.readouterr().out
