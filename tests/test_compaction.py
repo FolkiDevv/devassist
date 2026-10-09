@@ -163,6 +163,29 @@ def test_summarize_clips_long_summary():
     assert len(text) < 1_100 and text.endswith("(краткое содержание обрезано)")
 
 
+def test_summarize_tells_model_the_size_limit():
+    provider = ScriptedProvider(summaries=[text_turn("итог")])
+    summarize(
+        provider, _messages(1), model="M", temperature=0.2, input_budget=20_000, max_chars=1_400
+    )
+    user = provider.summary_requests[0]["messages"][1].content
+    assert "не больше 1400 символов (~200 слов)" in user
+
+
+def test_summarize_clips_by_line_keeping_current_state():
+    reply = "Текущее состояние: правлю loop.py, дальше — тесты.\n" + "\n".join(
+        f"- сделано {i}: подробности подробности" for i in range(100)
+    )
+    provider = ScriptedProvider(summaries=[text_turn(reply)])
+    text = summarize(
+        provider, _messages(1), model="M", temperature=0.2, input_budget=20_000, max_chars=500
+    )
+    body, mark = text.rsplit("\n", 1)
+    assert text.startswith("Текущее состояние: правлю loop.py, дальше — тесты.")
+    assert len(body) <= 500 and mark == "…(краткое содержание обрезано)"
+    assert body.split("\n")[-1].endswith("подробности")  # строка не оборвана на полуслове
+
+
 @pytest.mark.parametrize(
     "reply",
     [
