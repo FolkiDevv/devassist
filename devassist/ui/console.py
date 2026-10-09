@@ -531,7 +531,10 @@ class Console(AgentEvents):
                 if not raw:
                     continue
                 numbers = raw.replace(",", " ").split()
-                if not all(n.isdigit() and 1 <= int(n) <= custom for n in numbers):
+                if not numbers:
+                    continue  # одни запятые — спросить заново
+                # isdecimal, а не isdigit: «²» — цифра, но int() её не разберёт
+                if not all(n.isdecimal() and 1 <= int(n) <= custom for n in numbers):
                     return Answer(custom=raw)  # не номера — это свой ответ
                 picked = sorted({int(n) for n in numbers})
                 if len(picked) > 1 and not question.multi_select:

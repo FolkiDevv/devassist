@@ -234,6 +234,8 @@ def _asking_console(monkeypatch, *replies):
         (["MongoDB"], [Answer(custom="MongoDB")]),
         (["3", "Redis"], [Answer(custom="Redis")]),
         (["1 2", "1"], [Answer(("PostgreSQL",))]),  # один вариант — повтор вопроса
+        ([" , ", "2"], [Answer(("SQLite",))]),  # одни запятые — повтор
+        (["²"], [Answer(custom="²")]),  # не номер — свой ответ, без падения
     ],
 )
 def test_plain_questions(monkeypatch, replies, expected):
