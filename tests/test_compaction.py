@@ -214,3 +214,24 @@ def test_summarize_request_fits_budget_with_huge_instructions_and_old_summary():
     )
     for request in provider.summary_requests:
         assert estimate_tokens(request["messages"]) <= 4_000
+
+
+def test_summarize_keeps_latest_request_when_old_chunks_dropped():
+    # Длинный последний ход: запрос, затем много больших результатов — запрос
+    # оказывается старше трёх последних кусков, но на вход суммаризатора попадает.
+    messages = _messages(2, 4_000)
+    messages.append(Message(role="user", content="ТЕКУЩАЯ ЗАДАЧА: перенеси API на async"))
+    messages += [
+        Message(role="function", name="read_file", content=f"файл {i:02} " + "x" * 4_000)
+        for i in range(12)  # ~2 результата на кусок (обрезаются до 2000 символов)
+    ]
+    provider = ScriptedProvider(summaries=[text_turn(f"сводка {i}") for i in range(5)])
+    summarize(provider, messages, model="M", temperature=0.2, input_budget=2_500, max_chars=600)
+    assert len(provider.summary_requests) == MAX_INPUT_CHUNKS
+    first = provider.summary_requests[0]["messages"][1].content
+    assert "ТЕКУЩАЯ ЗАДАЧА" in first and "опущена" in first
+    assert "запрос 0" not in first and "файл 05" not in first and "файл 06" in first
+    last = provider.summary_requests[-1]["messages"][1].content
+    assert "файл 11" in last  # свежая переписка — на месте
+    for request in provider.summary_requests:
+        assert estimate_tokens(request["messages"]) <= 2_500

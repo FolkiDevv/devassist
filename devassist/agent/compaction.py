@@ -143,6 +143,31 @@ def chunk_entries(entries: Sequence[str], budget_tokens: int) -> list[list[str]]
     return chunks
 
 
+def _recent_chunks(messages: Sequence[Message], budget_tokens: int) -> list[list[str]]:
+    """Последние :data:`MAX_INPUT_CHUNKS` кусков переписки для суммаризатора.
+
+    Последний запрос пользователя (текущая задача) попадает на вход всегда, даже
+    если его кусок старше последних: окно истории его тоже никогда не отбрасывало.
+    """
+    entries = render_transcript(messages)
+    chunks = chunk_entries(entries, budget_tokens)
+    kept = chunks[-MAX_INPUT_CHUNKS:]
+    last_user = max((i for i, m in enumerate(messages) if m.role == "user"), default=None)
+    if len(chunks) <= MAX_INPUT_CHUNKS or last_user is None:
+        return kept
+    first_kept = len(entries) - sum(len(c) for c in kept)
+    if last_user >= first_kept:
+        return kept
+    # Запрос — в отброшенном куске: он идёт первым, переписка после него — следом,
+    # в пределах тех же кусков.
+    budget_tokens = max(budget_tokens, MIN_CHUNK_TOKENS)
+    task = clip_middle(entries[last_user], budget_tokens * CHARS_PER_TOKEN // 2)
+    after = entries[last_user + 1 :]
+    kept = chunk_entries(after, budget_tokens - estimate_text_tokens(task))[-MAX_INPUT_CHUNKS:]
+    kept[0] = [task, *kept[0]]
+    return kept
+
+
 def _request_text(previous: str | None, chunk: str, instructions: str, omitted: bool) -> str:
     parts = []
     if previous:
@@ -195,9 +220,8 @@ def summarize(
         + estimate_text_tokens(instructions)
         + REQUEST_OVERHEAD_TOKENS
     )
-    chunks = chunk_entries(render_transcript(messages), input_budget - reserve)
-    omitted = len(chunks) > MAX_INPUT_CHUNKS
-    chunks = chunks[-MAX_INPUT_CHUNKS:]
+    chunks = _recent_chunks(messages, input_budget - reserve)
+    omitted = sum(len(c) for c in chunks) < len(messages)
 
     summary = previous
     for i, chunk in enumerate(chunks):
