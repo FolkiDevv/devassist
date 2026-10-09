@@ -2,26 +2,45 @@
 
 Обёртка над rich, изолирующая остальной код от деталей вывода. Задаёт единый
 визуальный язык: брендовые цвета, панели, рендеринг вызовов инструментов,
-потоковый вывод ответа модели, диффы и подтверждения.
+потоковый вывод ответа модели с живым Markdown, индикаторы ожидания, диффы и
+подтверждения.
+
+Временная область внизу экрана (``rich.live.Live``) — одна на всю консоль: в ней
+крутится индикатор ожидания модели или работы инструмента и рисуется ещё растущий
+хвост ответа. Перед запуском новой области предыдущая всегда останавливается,
+перед вопросом пользователю — тоже. Анимацию двигает собственный поток под общей
+с печатью блокировкой: встроенное авто-обновление rich перерисовывает область
+параллельно с печатью над ней, и при гонке стирает уже напечатанные строки.
+
+В не-терминале (pipe, файл, «глупый» терминал) живой области нет: ответ модели
+печатается как есть, по мере поступления — так его удобно перенаправлять в файл.
 """
 
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+import threading
+import time
+from collections.abc import Callable, Sequence
 from typing import IO
 
-from rich.box import HEAVY, ROUNDED
+from rich.box import ROUNDED
 from rich.console import Console as RichConsole
-from rich.console import Group
-from rich.markdown import Markdown
+from rich.console import ConsoleOptions, Group, RenderResult
+from rich.live import Live
 from rich.panel import Panel
+from rich.segment import Segment, SegmentLines
+from rich.spinner import Spinner
 from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
+from rich.theme import Theme
 
 from devassist.agent.events import AgentEvents, NoticeLevel, ToolCallInfo, TurnStats
 from devassist.tools.base import Display, ToolResult
+from devassist.ui.format import SKIPPED_MARK, clip_lines, format_tokens, plural
+from devassist.ui.markdown import Markdown
+from devassist.ui.markdown_stream import MarkdownStream
 from devassist.ui.theme import (
     ACCENT,
     BRAND,
@@ -31,9 +50,9 @@ from devassist.ui.theme import (
     ICON_FAIL,
     ICON_OK,
     ICON_TOOL,
+    MARKDOWN_STYLES,
     MUTED,
     OK,
-    SPINNER,
     WARN,
 )
 
@@ -41,7 +60,8 @@ from devassist.ui.theme import (
 # вывода команд: ESC-последовательности могут перекрасить/стереть экран,
 # подменить заголовок окна и т.п. Оставляем только \n и \t.
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
-_OUTPUT_PREVIEW_CHARS = 2000
+_SKIPPED_RE = re.compile(rf"^{SKIPPED_MARK} пропущено .*$", re.MULTILINE)
+_REFRESH_PER_SECOND = 12
 
 
 def sanitize(text: str) -> str:
@@ -49,14 +69,115 @@ def sanitize(text: str) -> str:
     return _CONTROL_RE.sub("", text.replace("\r\n", "\n"))
 
 
-class Console(AgentEvents):
-    """Терминальный интерфейс на rich; реализует события агента."""
+class _LiveView:
+    """Содержимое временной области: хвост ответа (если есть) + строка индикатора.
 
-    def __init__(self, *, no_color: bool = False, file: IO[str] | None = None):
-        self._c = RichConsole(no_color=no_color, highlight=False, emoji=False, file=file)
-        self._ansi = self._c.is_terminal and not no_color
-        self._streaming = False
-        self._got_token = False
+    Вызывается из потока обновления ``Live``. Сама обрезает себя по высоте экрана:
+    то, что ушло за верх экрана, временная область уже не сможет стереть.
+    """
+
+    def __init__(self, label: str, tail: Callable[[], list[list[Segment]]] | None = None):
+        self._label = label
+        self._tail = tail
+        self._started = time.monotonic()
+        self._spinner = Spinner("dots", style=BRAND)
+
+    def __rich_console__(self, console: RichConsole, options: ConsoleOptions) -> RenderResult:
+        elapsed = int(time.monotonic() - self._started)
+        self._spinner.update(
+            text=Text.assemble(
+                (f" {self._label}… ", MUTED),
+                (f"{elapsed} с", MUTED),
+                ("  ·  Ctrl+C — прервать", MUTED),
+            )
+        )
+        lines = self._tail() if self._tail else []
+        if lines:
+            room = max(console.size.height - 3, 1)  # индикатор + отступ + запас
+            yield SegmentLines(lines[-room:], new_lines=True)
+            yield Text("")
+        yield self._spinner
+
+
+class _LiveArea:
+    """Временная область + поток анимации; печать над ней — только через :meth:`print`."""
+
+    def __init__(self, console: RichConsole, view: _LiveView, *, animate: bool):
+        self._live = Live(
+            view,
+            console=console,
+            auto_refresh=False,
+            transient=True,
+            redirect_stdout=False,
+            redirect_stderr=False,
+            vertical_overflow="crop",
+        )
+        self._lock = threading.RLock()
+        self._stopped = threading.Event()
+        self._thread = threading.Thread(target=self._animate, daemon=True) if animate else None
+
+    @property
+    def active(self) -> bool:
+        return not self._stopped.is_set()
+
+    def start(self) -> None:
+        self._live.start(refresh=True)
+        if self._thread is not None:
+            self._thread.start()
+
+    def _animate(self) -> None:
+        while not self._stopped.wait(1 / _REFRESH_PER_SECOND):
+            with self._lock:
+                if not self._stopped.is_set():
+                    self._live.refresh()
+
+    def print(self, renderable) -> None:
+        with self._lock:
+            self._live.console.print(renderable)
+
+    def stop(self) -> None:
+        self._stopped.set()
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=1)
+        with self._lock:
+            self._live.stop()
+
+
+class Console(AgentEvents):
+    """Терминальный интерфейс на rich; реализует события агента.
+
+    ``force_terminal``/``width``/``auto_refresh`` нужны тестам: живую область
+    можно проверить без настоящего терминала и без фонового потока обновления.
+    """
+
+    def __init__(
+        self,
+        *,
+        no_color: bool = False,
+        file: IO[str] | None = None,
+        force_terminal: bool | None = None,
+        width: int | None = None,
+        auto_refresh: bool = True,
+    ):
+        self._c = RichConsole(
+            no_color=no_color,
+            highlight=False,
+            emoji=False,
+            file=file,
+            force_terminal=force_terminal,
+            width=width,
+            theme=Theme(MARKDOWN_STYLES),
+        )
+        self._no_color = no_color
+        self._live_ok = self._c.is_terminal and not self._c.is_dumb_terminal
+        self._auto_refresh = auto_refresh
+        self._live: _LiveArea | None = None
+        self._md: MarkdownStream | None = None  # потоковый ответ (живой режим)
+        self._raw_started = False  # потоковый ответ (не-терминал): метка уже напечатана
+
+    @property
+    def no_color(self) -> bool:
+        return self._no_color
 
     # ----------------------------- базовое ----------------------------- #
     def print(self, *args, **kwargs) -> None:
@@ -83,6 +204,27 @@ class Console(AgentEvents):
     def success(self, text: str) -> None:
         self._c.print(Text(f"{ICON_OK} {text}", style=f"bold {OK}"))
 
+    # ------------------------- временная область ------------------------ #
+    def _start_live(self, view: _LiveView) -> None:
+        self.stop_live()
+        if not self._live_ok:
+            return
+        area = _LiveArea(self._c, view, animate=self._auto_refresh)
+        area.start()
+        self._live = area
+
+    def _print_above_live(self, renderable) -> None:
+        if self._live is not None:
+            self._live.print(renderable)
+        else:
+            self._c.print(renderable)
+
+    def stop_live(self) -> None:
+        """Убирает временную область (идемпотентно). Безопасно вызывать всегда."""
+        live, self._live = self._live, None
+        if live is not None:
+            live.stop()
+
     # ------------------------------ баннер ------------------------------ #
     def banner(
         self,
@@ -91,12 +233,13 @@ class Console(AgentEvents):
         model: str,
         root: str,
         hints: Sequence[tuple[str, str]] = (),
+        auto_approve: bool = False,
     ) -> None:
         """Приветственная панель; ``hints`` — пары (команда, краткое описание)."""
         logo = Text()
         logo.append(f"{ICON_BRAND} ", style=f"bold {BRAND}")
         logo.append("dev", style=f"bold {BRAND}")
-        logo.append("assist", style="bold white")
+        logo.append("assist", style="bold")
         logo.append(f"  v{version}", style=MUTED)
 
         subtitle = Text("AI-ассистент разработчика · работает на GigaChat", style=MUTED)
@@ -105,18 +248,10 @@ class Console(AgentEvents):
         meta.add_column(style=MUTED, justify="right")
         meta.add_column()
         meta.add_row("модель", Text(model, style=f"bold {ACCENT}"))
-        meta.add_row("проект", Text(root, style="white"))
+        meta.add_row("проект", Text(root))
 
         body = Group(logo, subtitle, Text(""), meta)
-        self._c.print(
-            Panel(
-                body,
-                box=ROUNDED,
-                border_style=BRAND,
-                padding=(1, 2),
-                expand=False,
-            )
-        )
+        self._c.print(Panel(body, box=ROUNDED, border_style=BRAND, padding=(1, 2), expand=False))
         hint = Text("  ", style=MUTED)
         for i, (cmd, desc) in enumerate(hints):
             if i:
@@ -124,7 +259,24 @@ class Console(AgentEvents):
             hint.append(cmd, style=ACCENT)
             hint.append(f" {desc}", style=MUTED)
         self._c.print(hint)
+        if auto_approve:
+            self.warn("авто-подтверждение включено (-y): изменения применяются без вопросов")
         self._c.print()
+
+    def help(
+        self, commands: Sequence[tuple[str, str]], keys: Sequence[tuple[str, str]] = ()
+    ) -> None:
+        """Справка: таблица команд и клавиш."""
+        table = Table.grid(padding=(0, 2))
+        table.add_column(style=ACCENT, no_wrap=True)
+        table.add_column(style=MUTED)
+        for name, desc in commands:
+            table.add_row(name, desc)
+        if keys:
+            table.add_row("", "")
+            for key, desc in keys:
+                table.add_row(Text(key, style="bold"), desc)
+        self._c.print(table)
 
     # --------------------------- сообщения LLM -------------------------- #
     def on_assistant_text(self, text: str) -> None:
@@ -135,51 +287,63 @@ class Console(AgentEvents):
         self._c.print(Markdown(sanitize(text)))
 
     def _assistant_label(self) -> None:
-        self._c.print(Text(f"{ICON_BRAND} devassist", style=f"bold {BRAND}"))
+        self._print_above_live(Text(f"{ICON_BRAND} devassist", style=f"bold {BRAND}"))
 
     # ----------------------- потоковый вывод LLM ------------------------ #
     def on_stream_start(self) -> None:
-        """Начинает потоковый вывод: индикатор ожидания первого токена."""
-        self._streaming = True
-        self._got_token = False
-        if self._ansi:
-            self._c.file.write(f"\x1b[38;2;124;124;138m{SPINNER} думаю…\x1b[0m")
-            self._c.file.flush()
+        """Запрос отправлен: индикатор ожидания до первого токена."""
+        self._md = None
+        self._raw_started = False
+        self._start_live(_LiveView("думаю"))
 
     def on_stream_delta(self, text: str) -> None:
-        """Печатает очередной кусок текста модели по мере поступления."""
+        """Очередной кусок текста модели."""
         text = sanitize(text)
         if not text:
             return
-        if self._streaming and not self._got_token:
-            self._got_token = True
-            if self._ansi:
-                self._c.file.write("\r\x1b[K")  # стереть индикатор
-            self._assistant_label()
-        self._c.file.write(text)
-        self._c.file.flush()
+        if not self._live_ok:
+            if not self._raw_started:
+                self._raw_started = True
+                self._assistant_label()
+            self._c.file.write(text)
+            self._c.file.flush()
+            return
+        if self._md is None:
+            self._md = MarkdownStream(self._c)
+            self._assistant_label()  # при активной области печатается над ней
+            self._start_live(_LiveView("печатает", tail=self._md.tail_lines))
+        lines = self._md.feed(text)
+        if lines:
+            self._print_above_live(SegmentLines(lines, new_lines=True))
 
     def on_stream_end(self) -> None:
-        """Завершает потоковый вывод (перевод строки/очистка индикатора)."""
-        if not self._streaming:
-            return
-        if self._got_token:
+        """Ответ закончен (или прерван): убрать индикатор, дорисовать хвост."""
+        md, self._md = self._md, None
+        self.stop_live()
+        if md is not None:
+            lines = md.finish()
+            if lines:
+                self._c.print(SegmentLines(lines, new_lines=True))
+        if self._raw_started:
+            self._raw_started = False
             self._c.file.write("\n")
-        elif self._ansi:
-            self._c.file.write("\r\x1b[K")  # ничего не пришло — убрать индикатор
-        self._c.file.flush()
-        self._streaming = False
-        self._got_token = False
+            self._c.file.flush()
 
     # --------------------------- инструменты ---------------------------- #
     def on_tool_call(self, call: ToolCallInfo) -> None:
         line = Text()
         line.append(f"{ICON_TOOL} ", style=f"bold {OK}")
-        line.append(call.name, style="bold white")
+        line.append(call.name, style="bold")
         if call.summary:
             line.append("  ", style=MUTED)
             line.append(sanitize(call.summary), style=ACCENT)
         self._c.print(line)
+
+    def on_tool_start(self, call: ToolCallInfo) -> None:
+        self._start_live(_LiveView("выполняется"))
+
+    def on_tool_end(self, call: ToolCallInfo) -> None:
+        self.stop_live()
 
     def on_tool_result(self, call: ToolCallInfo, result: ToolResult, *, previewed: bool) -> None:
         self.tool_result(result.summary or ("готово" if result.ok else "ошибка"), ok=result.ok)
@@ -191,7 +355,7 @@ class Console(AgentEvents):
             if not previewed:
                 self.diff(shown.text, title=shown.title or None)
         else:
-            self.output_block(shown.text[:_OUTPUT_PREVIEW_CHARS], title=shown.title or "вывод")
+            self.output_block(clip_lines(shown.text), title=shown.title or "вывод")
 
     def tool_result(self, summary: str, ok: bool = True) -> None:
         summary = sanitize(summary)
@@ -229,9 +393,11 @@ class Console(AgentEvents):
     def output_block(self, text: str, *, title: str = "вывод") -> None:
         if not text.strip():
             return
+        body = Text(sanitize(text).rstrip())
+        body.highlight_regex(_SKIPPED_RE, f"italic {MUTED}")
         self._c.print(
             Panel(
-                Text(sanitize(text).rstrip(), style="white"),
+                body,
                 title=Text(title, style=MUTED),
                 title_align="left",
                 box=ROUNDED,
@@ -247,18 +413,16 @@ class Console(AgentEvents):
 
     def on_turn_end(self, stats: TurnStats) -> None:
         steps = stats.steps
-        plural = (
-            "шаг"
-            if steps % 10 == 1 and steps % 100 != 11
-            else ("шага" if 2 <= steps % 10 <= 4 and not 12 <= steps % 100 <= 14 else "шагов")
-        )
-        parts = [f"{steps} {plural}"]
+        parts = [f"{steps} {plural(steps, 'шаг', 'шага', 'шагов')}"]
         if stats.tool_calls:
-            parts.append(f"инструментов: {stats.tool_calls}")
+            n = stats.tool_calls
+            parts.append(f"{n} {plural(n, 'инструмент', 'инструмента', 'инструментов')}")
+        if stats.duration_s:
+            parts.append(f"{stats.duration_s:.1f} с")
         if stats.context_tokens:
-            parts.append(f"контекст ~{stats.context_tokens} ток.")
+            parts.append(f"контекст ~{format_tokens(stats.context_tokens)}")
         if stats.billed_tokens:
-            parts.append(f"потрачено {stats.billed_tokens} ток.")
+            parts.append(f"потрачено {format_tokens(stats.billed_tokens)} ток.")
         self._c.print(Text("  " + "  ·  ".join(parts), style=MUTED))
 
     # -------------------------- подтверждения --------------------------- #
@@ -268,30 +432,20 @@ class Console(AgentEvents):
                 self.diff(preview.text, title=preview.title or None)
             else:
                 self.output_block(preview.text, title=preview.title or "превью")
-        question = (
-            f"Выполнить опасную операцию '{call.name}'?"
-            if dangerous
-            else f"Применить '{call.name}'?"
-        )
-        return self.ask(question, dangerous=dangerous)
+        action = "Выполнить" if dangerous else "Применить"
+        target = f" ({sanitize(call.summary)})" if call.summary else ""
+        return self.ask(f"{action} {call.name}{target}?", dangerous=dangerous)
 
     def ask(self, question: str, *, dangerous: bool = False) -> bool:
         """Вопрос да/нет. Ctrl+C/Ctrl+D — «нет»."""
+        self.stop_live()
         color = DANGER if dangerous else WARN
-        title = "⚠ ОПАСНАЯ ОПЕРАЦИЯ" if dangerous else "Подтверждение"
-        self._c.print(
-            Panel(
-                Text(question, style="white"),
-                title=Text(title, style=f"bold {color}"),
-                title_align="left",
-                box=HEAVY if dangerous else ROUNDED,
-                border_style=color,
-                padding=(0, 1),
-                expand=False,
-            )
-        )
+        prompt = Text("  ")
+        prompt.append("⚠ ОПАСНО: " if dangerous else "? ", style=f"bold {color}")
+        prompt.append(question, style="bold")
+        prompt.append(" [y/N] ", style=MUTED)
         try:
-            answer = self._c.input(Text("  выполнить? [y/N] ", style=f"bold {color}"))
+            answer = self._c.input(prompt)
         except (EOFError, KeyboardInterrupt):
             self._c.print()
             return False
