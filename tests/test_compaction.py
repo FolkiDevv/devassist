@@ -198,3 +198,19 @@ def test_summarize_reports_paid_usage_before_failure():
             on_usage=usages.append,
         )
     assert usages == [Usage(prompt_tokens=700, completion_tokens=30)]
+
+
+def test_summarize_request_fits_budget_with_huge_instructions_and_old_summary():
+    provider = ScriptedProvider(summaries=[text_turn("сводка")])
+    summarize(
+        provider,
+        _messages(3, 4_000),
+        model="M",
+        temperature=0.2,
+        input_budget=4_000,
+        max_chars=1_000,
+        previous="с" * 12_000,  # резюме от модели с большим окном
+        instructions="п" * 50_000,  # вставили огромный текст в /compact
+    )
+    for request in provider.summary_requests:
+        assert estimate_tokens(request["messages"]) <= 4_000

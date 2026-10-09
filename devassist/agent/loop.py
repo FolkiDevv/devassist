@@ -146,12 +146,21 @@ class Agent:
     def context_tokens(self) -> int:
         """Размер контекста по последнему обращению к модели (0 — диалог пуст).
 
-        Сразу после сжатия — оценка: настоящий размер станет известен со следующим запросом.
+        После сжатия (и при продолжении сжатого чата) — оценка: настоящий размер
+        станет известен со следующим запросом. Считается один раз — свойство
+        читается при каждой перерисовке статус-строки.
         """
         usage = self._conversation.last_usage
         if usage is not None:
             return usage.prompt_tokens + usage.completion_tokens
-        return self._compacted_tokens if self._conversation.summary is not None else 0
+        if self._conversation.summary is None:
+            return 0
+        if not self._compacted_tokens:
+            specs = self._registry.specs()
+            self._compacted_tokens = self._overhead_tokens(specs) + self._history_tokens(
+                self._conversation
+            )
+        return self._compacted_tokens
 
     @property
     def provider(self) -> LLMProvider:

@@ -836,3 +836,17 @@ def test_subdirectory_instructions_join_system_message(tmp_path):
     agent.reset()  # новый диалог — инструкции подключатся заново при обращении
     agent.run_turn("ещё")
     assert NESTED_HEADER not in provider.requests[-1]["messages"][0].content
+
+
+def test_resumed_compacted_chat_reports_estimated_context(tmp_path):
+    from devassist.agent.conversation import Conversation, Summary
+
+    saved = Conversation()
+    saved.add_user("вопрос " + "x" * 3_000)
+    saved.add_assistant(text_turn("ответ").message, Usage(prompt_tokens=9_000))
+    saved.set_summary(Summary("СВОДКА", 2))  # чат сохранён после /compact
+    agent = _agent(ScriptedProvider(), tmp_path)
+    agent.reset(saved)
+    estimate = agent.context_tokens
+    assert 0 < estimate < 9_000
+    assert agent.context_tokens == estimate  # посчитано один раз

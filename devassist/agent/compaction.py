@@ -36,6 +36,7 @@ ARGS_CLIP = 300
 MAX_INPUT_CHUNKS = 3
 MIN_CHUNK_TOKENS = 500
 REQUEST_OVERHEAD_TOKENS = 200  # обвязка запроса суммаризации
+MAX_INSTRUCTIONS_CHARS = 2_000  # пожелания пользователя (/compact …)
 
 
 class CompactionError(LLMError):
@@ -181,7 +182,13 @@ def summarize(
     ``input_budget`` — бюджет одного запроса (оценка в токенах); ``max_chars`` —
     предел длины резюме. ``on_usage`` получает расход каждого обращения — и при
     сбое на следующем куске (оплаченное не теряется). Ошибки — :class:`LLMError`.
+
+    Пожелания и прежнее резюме обрезаются, чтобы запрос с ними и куском переписки
+    укладывался в ``input_budget``.
     """
+    instructions = clip_middle(instructions.strip(), MAX_INSTRUCTIONS_CHARS)
+    if previous is not None:
+        previous = _clip_summary(previous, max_chars)  # могло остаться от модели с большим окном
     reserve = (
         estimate_text_tokens(COMPACT_PROMPT)
         + max_chars // CHARS_PER_TOKEN  # прежнее резюме
