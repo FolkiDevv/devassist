@@ -215,6 +215,27 @@ def test_reset_rebuilds_system_prompt(tmp_path):
     assert [m.role for m in provider.requests[-1]["messages"]] == ["system", "user"]
 
 
+def test_reset_with_saved_conversation_continues_it(tmp_path):
+    from devassist.agent.conversation import Conversation
+
+    saved = Conversation()
+    saved.add_user("старый запрос")
+    saved.add_assistant(
+        text_turn("старый ответ").message, Usage(prompt_tokens=50, completion_tokens=5)
+    )
+    provider = ScriptedProvider([text_turn("новый ответ")])
+    agent = _agent(provider, tmp_path)
+    agent.reset(saved)
+    assert agent.conversation is saved and agent.context_tokens == 55
+    agent.run_turn("дальше")
+    roles = [(m.role, m.content) for m in provider.requests[-1]["messages"][1:]]
+    assert roles == [
+        ("user", "старый запрос"),
+        ("assistant", "старый ответ"),
+        ("user", "дальше"),
+    ]
+
+
 def test_constructor_has_no_filesystem_side_effects(tmp_path, monkeypatch):
     import devassist.agent.loop as loop
 

@@ -88,9 +88,12 @@ class Agent:
             raise ValueError("Имя модели не может быть пустым")
         self._model = name
 
-    def reset(self) -> None:
-        """Начать новый диалог; контекст проекта будет собран заново."""
-        self._conversation = Conversation()
+    def reset(self, conversation: Conversation | None = None) -> None:
+        """Начать новый диалог или продолжить сохранённый (``conversation``).
+
+        Контекст проекта будет собран заново; потраченные токены сессии не сбрасываются.
+        """
+        self._conversation = Conversation() if conversation is None else conversation
         self._system_prompt = None
 
     # ------------------------------------------------------------------ #
