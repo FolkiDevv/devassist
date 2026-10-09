@@ -63,9 +63,11 @@ def run_oneshot(agent: Agent, ui: Console, prompt: str) -> int:
     try:
         agent.run_turn(prompt)
     except LLMError as e:
+        ui.stop_live()
         ui.error(str(e))
         return EXIT_LLM_ERROR
     except KeyboardInterrupt:
+        ui.stop_live()
         ui.system("\n(прервано)")
         return EXIT_INTERRUPTED
     return EXIT_OK

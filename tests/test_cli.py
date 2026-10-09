@@ -178,3 +178,14 @@ def test_version_flag(capsys):
         app.main(["--version"])
     assert exc.value.code == 0
     assert "devassist" in capsys.readouterr().out
+
+
+def test_repl_status_and_auto_approve_banner(cli_env, capsys):
+    from devassist.cli.repl import status_of
+
+    agent, ui, commands, _, _ = cli_env  # cli_env собран с auto_approve=True
+    status = status_of(agent)
+    assert status.model == agent.model and status.auto_approve is True
+    assert status.context_budget == agent.config.context_budget_tokens
+    assert run_repl(agent, ui, commands, read_input=_reader("/exit")) == 0
+    assert "авто-подтверждение" in _out(capsys)
