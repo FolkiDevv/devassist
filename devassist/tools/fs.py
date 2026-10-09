@@ -9,6 +9,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from pydantic import BaseModel, Field
 
 from devassist.project.files import glob_match, walk_files
+from devassist.project.workspace import DATA_DIR_NAME
 from devassist.security import RiskLevel, resolve_in_root
 from devassist.tools.base import Display, Tool, ToolContext, ToolError, ToolResult
 
@@ -26,6 +27,22 @@ def _rel(ctx: ToolContext, path: Path) -> str:
         return str(path.relative_to(ctx.root))
     except ValueError:
         return str(path)
+
+
+def _writable_path(ctx: ToolContext, path: str) -> Path:
+    """Путь для записи: внутри корня и не в служебной папке ``.devassist/``.
+
+    Там лежат индекс, история ввода и чаты агента — модель не должна их править.
+    Проверка срабатывает и в превью, то есть до вопроса о подтверждении.
+    """
+    p = resolve_in_root(ctx.root, path)
+    data_dir = ctx.workspace.data_dir
+    if p == data_dir or data_dir in p.parents:
+        raise ToolError(
+            f"Служебная папка {DATA_DIR_NAME}/ (индекс, история, чаты агента) "
+            f"недоступна для записи: {path}"
+        )
+    return p
 
 
 def make_diff(old: str, new: str, path: str) -> str:
@@ -254,7 +271,7 @@ class WriteFileTool(Tool):
         return RiskLevel.WRITE
 
     def _old_content(self, ctx: ToolContext, params: WriteFileParams) -> str:
-        p = resolve_in_root(ctx.root, params.path)
+        p = _writable_path(ctx, params.path)
         if p.is_file():
             try:
                 return p.read_text(encoding="utf-8")
@@ -269,7 +286,7 @@ class WriteFileTool(Tool):
         return Display(diff, kind="diff", title=params.path)
 
     def run(self, params: WriteFileParams, ctx: ToolContext) -> ToolResult:
-        p = resolve_in_root(ctx.root, params.path)
+        p = _writable_path(ctx, params.path)
         if p.is_dir():
             raise ToolError(f"Это директория: {params.path}")
         existed = p.is_file()
@@ -314,7 +331,7 @@ class EditFileTool(Tool):
         return RiskLevel.WRITE
 
     def _compute(self, params: EditFileParams, ctx: ToolContext):
-        p = resolve_in_root(ctx.root, params.path)
+        p = _writable_path(ctx, params.path)
         if not p.is_file():
             raise ToolError(f"Файл не найден: {params.path}")
         try:

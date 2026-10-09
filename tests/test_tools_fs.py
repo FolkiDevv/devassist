@@ -285,3 +285,24 @@ def test_list_dir_shows_hidden(ctx):
     lister = ListDirTool()
     out = lister.run(lister.parse({}), ctx).content
     assert ".github/" in out and ".gitignore" in out
+
+
+@pytest.mark.parametrize("path", [".devassist/index/index.sqlite3", ".devassist", "./.devassist/x"])
+def test_data_dir_is_not_writable(ctx, path):
+    """Индекс, история и чаты агента — не для правки моделью (отказ ещё в превью)."""
+    (ctx.root / ".devassist" / "index").mkdir(parents=True)
+    (ctx.root / ".devassist" / "x").write_text("old", encoding="utf-8")
+    w, e = WriteFileTool(), EditFileTool()
+    write = w.parse({"path": path, "content": "new"})
+    edit = e.parse({"path": path, "old_string": "old", "new_string": "new"})
+    for tool, params in ((w, write), (e, edit)):
+        with pytest.raises(ToolError, match="Служебная папка"):
+            tool.preview(params, ctx)
+        with pytest.raises(ToolError, match="Служебная папка"):
+            tool.run(params, ctx)
+    assert (ctx.root / ".devassist" / "x").read_text(encoding="utf-8") == "old"
+
+
+def test_similar_names_outside_data_dir_are_writable(ctx):
+    w = WriteFileTool()
+    assert w.run(w.parse({"path": ".devassist.md", "content": "ok"}), ctx).ok
