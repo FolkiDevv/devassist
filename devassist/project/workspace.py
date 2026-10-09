@@ -39,6 +39,17 @@ class Workspace:
         """Каталог индекса проекта."""
         return self.data_dir / "index"
 
+    def is_data_path(self, path: Path) -> bool:
+        """Лежит ли (уже разрешённый) путь внутри ``.devassist/``.
+
+        Сравнение без учёта регистра: на macOS/Windows ``.DEVASSIST`` — та же папка.
+        """
+        try:
+            parts = Path(path).relative_to(self.root).parts
+        except ValueError:
+            return False
+        return bool(parts) and parts[0].casefold() == DATA_DIR_NAME.casefold()
+
     def ensure_data_dir(self) -> Path:
         """Создаёт ``.devassist/`` с ``.gitignore`` (идемпотентно) и возвращает путь.
 

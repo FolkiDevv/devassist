@@ -250,6 +250,49 @@ def test_sandbox_escape_blocked(ctx):
         r.run(r.parse({"path": "/etc/passwd"}), ctx)
 
 
+@pytest.mark.parametrize(
+    "path", [".devassist/chats/x.json", ".devassist", "./.devassist/history", ".DEVASSIST/a"]
+)
+def test_data_dir_is_not_writable(ctx, path):
+    chats = ctx.root / ".devassist" / "chats"
+    chats.mkdir(parents=True)
+    (chats / "x.json").write_text("{}", encoding="utf-8")
+    w, e = WriteFileTool(), EditFileTool()
+    with pytest.raises(SandboxError, match="служебную папку"):
+        w.preview(w.parse({"path": path, "content": "x"}), ctx)
+    with pytest.raises(SandboxError, match="служебную папку"):
+        w.run(w.parse({"path": path, "content": "x"}), ctx)
+    with pytest.raises(SandboxError, match="служебную папку"):
+        e.run(e.parse({"path": path, "old_string": "{}", "new_string": "[]"}), ctx)
+    assert (chats / "x.json").read_text(encoding="utf-8") == "{}"
+    # чтение по-прежнему разрешено, а похожие имена — обычные файлы
+    r = ReadFileTool()
+    assert r.run(r.parse({"path": ".devassist/chats/x.json"}), ctx).ok
+    assert w.run(w.parse({"path": ".devassist-notes.md", "content": "x"}), ctx).ok
+    assert w.run(w.parse({"path": "docs/.devassist/a.md", "content": "x"}), ctx).ok
+
+
+def test_data_dir_write_rejected_before_confirmation(tmp_path):
+    from fakes import RecordingEvents, ScriptedProvider, text_turn, tool_turn
+
+    from devassist.agent.loop import Agent
+    from devassist.config import Config
+    from devassist.tools.base import build_default_registry
+
+    provider = ScriptedProvider(
+        [
+            tool_turn("write_file", {"path": ".devassist/chats/a.json", "content": "{}"}),
+            text_turn("ок"),
+        ]
+    )
+    events = RecordingEvents()
+    cfg = Config(access_key="x", project_root=tmp_path, stream=False)
+    Agent(provider, build_default_registry(), cfg, events).run_turn("испорти чат")
+    assert events.confirms == []
+    assert not (tmp_path / ".devassist").exists()
+    assert "служебную папку" in provider.requests[-1]["messages"][-1].content
+
+
 def test_find_files_rejects_escape_patterns(ctx):
     f = FindFilesTool()
     for pattern in ("../*.toml", "src/../../x", "/etc/*"):
