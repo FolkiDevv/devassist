@@ -608,24 +608,32 @@ class Console(AgentEvents):
             style=MUTED,
         )
         self._c.print(line)
-        request = next(
-            (m.content for m in reversed(messages) if m.role == "user" and m.content.strip()),
-            "",
-        )
-        answer = next(
+        last = next(
             (
-                m.content
-                for m in reversed(messages)
-                if m.role == "assistant" and m.function_call is None and m.content.strip()
+                k
+                for k in range(len(messages) - 1, -1, -1)
+                if messages[k].role == "user" and messages[k].content.strip()
             ),
-            "",
+            None,
         )
-        if request:
-            shown = clip_lines(request, head=3, tail=2, max_chars=600)
+        if last is not None:
+            shown = clip_lines(messages[last].content, head=3, tail=2, max_chars=600)
             self._c.print(Text("› ", style=f"bold {USER}").append(sanitize(shown), style=USER))
-        if answer:
-            self._assistant_label()
-            self._c.print(Markdown(sanitize(answer)))
+            # Ответ ищется только после этого запроса: у прерванного хода его нет, и
+            # ответ на предыдущий запрос здесь выглядел бы ответом на этот.
+            answer = next(
+                (
+                    m.content
+                    for m in reversed(messages[last + 1 :])
+                    if m.role == "assistant" and m.function_call is None and m.content.strip()
+                ),
+                "",
+            )
+            if answer:
+                self._assistant_label()
+                self._c.print(Markdown(sanitize(answer)))
+            else:
+                self._c.print(Text("  (ответа нет — ход не был завершён)", style=MUTED))
         self._c.print()
 
 

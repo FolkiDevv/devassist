@@ -179,3 +179,18 @@ def test_chat_resumed_shows_last_exchange(monkeypatch):
     assert "\x1b" not in out and "› почини [31mтесты" in out  # sanitize убрал ESC
     assert "Готово: тесты проходят" in out
     assert "первый ответ" not in out
+
+
+def test_chat_resumed_after_interrupted_turn_shows_no_stale_answer(monkeypatch):
+    ui, buf = _console(monkeypatch)
+    messages = [
+        Message(role="user", content="первый вопрос"),
+        Message(role="assistant", content="ответ на первый"),
+        Message(role="user", content="второй вопрос"),
+        Message(role="assistant", function_call=FunctionCall(name="run_shell")),
+        Message(role="function", name="run_shell", content="прервано"),
+    ]
+    ui.chat_resumed(_chat(1, "первый вопрос"), messages)
+    out = buf.getvalue()
+    assert "› второй вопрос" in out
+    assert "ответ на первый" not in out and "ответа нет" in out

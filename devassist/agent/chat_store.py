@@ -156,7 +156,10 @@ class ChatStore:
             raise ChatStoreError(f"не удалось прочитать чат {chat_id}: {e}") from None
         try:
             info = self._info(data, chat_id)
-            conversation = Conversation.from_dict(data["conversation"])
+            raw = data["conversation"]
+            if not isinstance(raw, dict):
+                raise ValueError("поле conversation — не объект")
+            conversation = Conversation.from_dict(raw)
         except (KeyError, TypeError, ValueError) as e:
             raise ChatStoreError(f"файл чата {chat_id} повреждён: {e}") from None
         conversation.repair()  # на случай файла, записанного посреди вызова инструмента
@@ -204,10 +207,10 @@ class ChatStore:
         return result
 
     def latest(self) -> SavedChat | None:
-        """Последний чат, который удаётся прочитать."""
-        for info in self.recent(limit=5):
+        """Последний чат, который удаётся прочитать (битые файлы пропускаются)."""
+        for path in self._files():
             try:
-                return self.load(info.id)
+                return self.load(path.stem)
             except ChatStoreError:
                 continue
         return None

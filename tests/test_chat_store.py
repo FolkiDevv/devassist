@@ -76,6 +76,19 @@ def test_load_errors(store):
         store.load("bad")
 
 
+@pytest.mark.parametrize("conversation", [[], "x", None, {"version": 1, "messages": 5}])
+def test_load_rejects_malformed_conversation(store, conversation):
+    store.save("odd", _conv())
+    path = store.directory / "odd.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["conversation"] = conversation
+    path.write_text(json.dumps(data), encoding="utf-8")
+    with pytest.raises(ChatStoreError, match="повреждён"):
+        store.load("odd")
+    assert [c.id for c in store.recent()] == ["odd"]  # метаданные целы — чат в списке
+    assert store.latest() is None
+
+
 def test_recent_order_and_skips_broken(store):
     for chat_id in ["c-old", "c-new", "c-mid"]:
         store.save(chat_id, _conv(f"запрос {chat_id}"))
@@ -103,6 +116,20 @@ def test_latest(store):
     _touch(store, "a2", 2_000)
     latest = store.latest()
     assert latest is not None and latest.info.title == "второй"
+
+
+def test_latest_skips_any_number_of_broken_chats(store):
+    store.save("good", _conv("целый"))
+    _touch(store, "good", 1_000)
+    for i in range(7):  # метаданные целы, диалог испорчен
+        store.save(f"bad{i}", _conv())
+        path = store.directory / f"bad{i}.json"
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["conversation"] = []
+        path.write_text(json.dumps(data), encoding="utf-8")
+        _touch(store, f"bad{i}", 2_000 + i)
+    latest = store.latest()
+    assert latest is not None and latest.info.title == "целый"
 
 
 def test_find_by_id_and_prefix(store):
