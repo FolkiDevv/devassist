@@ -39,7 +39,13 @@ from rich.text import Text
 from rich.theme import Theme
 
 from devassist.agent.chat_store import ChatInfo
-from devassist.agent.events import AgentEvents, NoticeLevel, ToolCallInfo, TurnStats
+from devassist.agent.events import (
+    AgentEvents,
+    CompactResult,
+    NoticeLevel,
+    ToolCallInfo,
+    TurnStats,
+)
 from devassist.llm.types import Message
 from devassist.permissions import PermissionMode
 from devassist.tools.ask_user import format_answer
@@ -487,6 +493,24 @@ class Console(AgentEvents):
         )
 
     # ---------------------------- статистика ---------------------------- #
+    def on_compact_start(self, *, auto: bool) -> None:
+        title = "контекст почти заполнен — сжимаю историю" if auto else "сжимаю историю"
+        if not self._live_ok:
+            self.system(f"{title}…")
+            return
+        self._start_live(_LiveView(title, hint=self._turn_hint))
+
+    def on_compact_end(self, result: CompactResult | None) -> None:
+        self.stop_live()
+        if result is None:
+            return
+        n = result.messages
+        self.system(
+            f"✂ контекст сжат: ~{format_tokens(result.before_tokens)} → "
+            f"~{format_tokens(result.after_tokens)} ток. · в краткое содержание свёрнуто "
+            f"{n} {plural(n, 'сообщение', 'сообщения', 'сообщений')}"
+        )
+
     def on_notice(self, text: str, *, level: NoticeLevel = "info") -> None:
         {"info": self.info, "warn": self.warn, "error": self.error}[level](text)
 

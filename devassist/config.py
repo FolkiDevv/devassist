@@ -89,7 +89,14 @@ def _env_bool(env: Mapping[str, str], name: str, default: bool = False) -> bool:
     return val.strip().lower() in ("1", "true", "yes", "on")
 
 
-def _env_int(env: Mapping[str, str], name: str, default: int, *, minimum: int = 1) -> int:
+def _env_int(
+    env: Mapping[str, str],
+    name: str,
+    default: int,
+    *,
+    minimum: int = 1,
+    maximum: int | None = None,
+) -> int:
     raw = env.get(name)
     if raw is None or not raw.strip():
         return default
@@ -99,6 +106,8 @@ def _env_int(env: Mapping[str, str], name: str, default: int, *, minimum: int = 
         raise ConfigError(f"{name}: ожидается целое число, получено {raw!r}") from e
     if value < minimum:
         raise ConfigError(f"{name}: значение должно быть не меньше {minimum}, получено {value}")
+    if maximum is not None and value > maximum:
+        raise ConfigError(f"{name}: значение должно быть не больше {maximum}, получено {value}")
     return value
 
 
@@ -175,6 +184,10 @@ class Config:
     # отправке модели; старые сообщения сверх бюджета отбрасываются. None — от
     # замеренного окна модели (~/.devassist/models.json), число — явное переопределение.
     context_budget_tokens: int | None = None
+    # Сжимать историю в краткое содержание, когда она занимает compact_threshold
+    # бюджета истории (бюджет за вычетом системного промпта и схем инструментов).
+    auto_compact: bool = True
+    compact_threshold: float = 0.8
     # Сохранять чаты в .devassist/chats/ (продолжение — /resume, --continue).
     save_chats: bool = True
 
@@ -224,6 +237,11 @@ class Config:
             stream=stream,
             temperature=_env_float(env, "DEVASSIST_TEMPERATURE", 0.2, lo=0.0, hi=2.0),
             context_budget_tokens=_env_optional_int(env, "DEVASSIST_CONTEXT_TOKENS", minimum=4_000),
+            auto_compact=_env_bool(env, "DEVASSIST_AUTO_COMPACT", True),
+            compact_threshold=_env_int(
+                env, "DEVASSIST_COMPACT_THRESHOLD", 80, minimum=10, maximum=95
+            )
+            / 100,
             save_chats=save_chats and _env_bool(env, "DEVASSIST_SAVE_CHATS", True),
         )
 

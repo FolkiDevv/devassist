@@ -18,12 +18,23 @@ class ScriptedProvider(LLMProvider):
     """Провайдер-заглушка: выдаёт заранее заданную последовательность ходов.
 
     Элемент сценария — AssistantTurn либо исключение (будет брошено). Каждый
-    запрос записывается в ``requests`` (сообщения + параметры вызова).
+    запрос агента записывается в ``requests`` (сообщения + параметры вызова).
+
+    Запросы без инструментов (``tools=None``) — суммаризация при сжатии контекста:
+    у них своя очередь ``summaries`` (по умолчанию ответ «сводка») и журнал
+    ``summary_requests``, чтобы сжатие не съедало ходы сценария.
     """
 
-    def __init__(self, turns: Iterable[AssistantTurn | BaseException] = ()):
+    def __init__(
+        self,
+        turns: Iterable[AssistantTurn | BaseException] = (),
+        *,
+        summaries: Iterable[AssistantTurn | BaseException] = (),
+    ):
         self._turns = list(turns)
+        self.summaries = list(summaries)
         self.requests: list[dict[str, Any]] = []
+        self.summary_requests: list[dict[str, Any]] = []
 
     @property
     def calls(self) -> int:
@@ -34,19 +45,26 @@ class ScriptedProvider(LLMProvider):
         return "scripted"
 
     def complete(self, messages, tools=None, **kwargs) -> AssistantTurn:
+        if tools is None:
+            self.summary_requests.append({"messages": list(messages), **kwargs})
+            return _next(self.summaries, "сводка")
         self.requests.append({"messages": list(messages), "tools": tools, **kwargs})
-        if self._turns:
-            item = self._turns.pop(0)
-            if isinstance(item, BaseException):
-                raise item
-            return item
-        return text_turn("конец")
+        return _next(self._turns, "конец")
 
     def stream(self, messages, tools=None, *, on_delta=None, **kwargs) -> AssistantTurn:
         turn = self.complete(messages, tools, **kwargs)
         if on_delta and turn.message.content:
             on_delta(turn.message.content)
         return turn
+
+
+def _next(queue: list, default: str) -> AssistantTurn:
+    if not queue:
+        return text_turn(default)
+    item = queue.pop(0)
+    if isinstance(item, BaseException):
+        raise item
+    return item
 
 
 class WindowProvider(ScriptedProvider):
@@ -122,6 +140,7 @@ class RecordingEvents(AgentEvents):
         self.results: list[tuple[ToolCallInfo, ToolResult, bool]] = []
         self.stats: list[TurnStats] = []
         self.notices: list[tuple[str, str]] = []
+        self.compactions: list = []  # CompactResult | None по каждому сжатию
 
     def on_stream_start(self) -> None:
         self.events.append(("stream_start", None))
@@ -158,6 +177,13 @@ class RecordingEvents(AgentEvents):
 
     def on_notice(self, text, *, level="info"):
         self.notices.append((level, text))
+
+    def on_compact_start(self, *, auto):
+        self.events.append(("compact_start", auto))
+
+    def on_compact_end(self, result):
+        self.events.append(("compact_end", result))
+        self.compactions.append(result)
 
     def on_turn_end(self, stats: TurnStats) -> None:
         self.stats.append(stats)

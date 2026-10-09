@@ -143,6 +143,8 @@ def oneshot(tmp_path, monkeypatch):
         "DEVASSIST_CONTEXT_TOKENS",
         "DEVASSIST_SAVE_CHATS",
         "DEVASSIST_MODE",
+        "DEVASSIST_AUTO_COMPACT",
+        "DEVASSIST_COMPACT_THRESHOLD",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -420,6 +422,44 @@ def test_clear_starts_new_chat_and_resume_returns(repl_env, capsys):
     assert "продолжаем чат «старый вопрос»" in out and "старый ответ" in out
     agent.run_turn("ещё")
     assert _history(provider)[0] == ("user", "старый вопрос")
+
+
+def test_compact_command_summarizes_and_saves(repl_env, capsys):
+    agent, _, commands, ctx, provider = repl_env
+    commands.dispatch("/compact", ctx)
+    assert "сжимать нечего" in _out(capsys)
+
+    provider._turns = [text_turn("старый ответ " + "y" * 400), text_turn("новый ответ")]
+    provider.summaries = [text_turn("СВОДКА")]
+    agent.run_turn("старый вопрос " + "x" * 400)
+    assert commands.dispatch("/compact только суть", ctx) is True
+    out = _out(capsys)
+    assert "контекст сжат" in out and "свёрнуто 2 сообщения" in out
+    assert "только суть" in provider.summary_requests[0]["messages"][1].content
+
+    # Чат сохранён вместе с кратким содержанием: продолжение видит сводку, не историю.
+    saved = ctx.chats.store.load(ctx.chats.chat_id)
+    assert saved.conversation.summary is not None and saved.info.title.startswith("старый вопрос")
+    commands.dispatch("/clear", ctx)
+    commands.dispatch(f"/resume {saved.info.id}", ctx)
+    assert "старый вопрос" in _out(capsys)  # показ последнего обмена — из полного журнала
+    agent.run_turn("дальше")
+    assert _history(provider) == [("user", "дальше")]
+    assert "СВОДКА" in provider.requests[-1]["messages"][0].content
+
+
+def test_compact_command_errors_keep_history(repl_env, capsys):
+    from devassist.llm.base import LLMError
+
+    agent, _, commands, ctx, provider = repl_env
+    provider._turns = [text_turn("ответ")]
+    agent.run_turn("вопрос")
+    provider.summaries = [LLMError("сеть упала"), KeyboardInterrupt()]
+    commands.dispatch("/compact", ctx)
+    assert "не удалось сжать контекст: сеть упала" in _out(capsys)
+    commands.dispatch("/compact", ctx)
+    assert "сжатие прервано" in _out(capsys)
+    assert agent.conversation.summary is None
 
 
 def test_resume_picker_and_errors(repl_env, capsys, monkeypatch):

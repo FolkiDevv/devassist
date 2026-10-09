@@ -334,7 +334,8 @@ def test_long_turn_keeps_current_task_in_context(tmp_path):
     (tmp_path / "big.txt").write_text("y" * 5000, encoding="utf-8")
     steps = [tool_turn("read_file", {"path": "big.txt"}) for _ in range(6)] + [text_turn("ок")]
     provider = ScriptedProvider(steps)
-    agent = _agent(provider, tmp_path, context_budget_tokens=4000)
+    # Страховка окна истории — без сжатия контекста.
+    agent = _agent(provider, tmp_path, context_budget_tokens=4000, auto_compact=False)
     agent.run_turn("ТЕКУЩАЯ ЗАДАЧА")
     for request in provider.requests:
         contents = [m.content for m in request["messages"] if m.role == "user"]
@@ -647,3 +648,157 @@ def test_approved_plan_switches_mode_within_the_turn(tmp_path):
     assert question.body == "# План\n1. создать a.txt"
     # правила плана — только до одобрения
     assert ["РЕЖИМ ПЛАНИРОВАНИЯ" in p for p in _system_prompts(provider)] == [True, False, False]
+
+
+# ------------------------------ сжатие контекста ------------------------------ #
+def _big_tool() -> FakeTool:
+    return FakeTool(run=lambda: ToolResult(content="z" * 3000, summary="ok"))  # ~1000 токенов
+
+
+def test_auto_compaction_summarizes_old_steps_and_keeps_task(tmp_path):
+    from devassist.agent.prompts import COMPACT_PROMPT, SUMMARY_HEADER
+
+    steps = [tool_turn("fake_write", {"path": str(i)}) for i in range(4)] + [text_turn("готово")]
+    provider = ScriptedProvider(
+        steps, summaries=[text_turn("СВОДКА", Usage(prompt_tokens=500, completion_tokens=50))]
+    )
+    events = RecordingEvents()
+    agent = _agent(
+        provider,
+        tmp_path,
+        events=events,
+        registry=_registry_with(_big_tool()),
+        context_budget_tokens=4_000,
+    )
+    assert agent.run_turn("ЗАДАЧА") == "готово"
+
+    (summary_request,) = provider.summary_requests
+    system, user = summary_request["messages"]
+    assert system.content == COMPACT_PROMPT and "ЗАДАЧА" in user.content
+    (result,) = events.compactions
+    assert result.auto and result.after_tokens < result.before_tokens
+    assert ("compact_start", True) in events.events
+
+    # После сжатия: резюме — в системном сообщении, задача — дословно, история короче.
+    for request in provider.requests:
+        users = [m.content for m in request["messages"] if m.role == "user"]
+        assert users == ["ЗАДАЧА"]
+        _assert_well_formed(request["messages"])
+    last = provider.requests[-1]["messages"]
+    assert SUMMARY_HEADER in last[0].content and "СВОДКА" in last[0].content
+    assert len(last) < len(agent.conversation) + 1
+    assert len(agent.conversation) == 10  # журнал не переписывается
+    assert events.stats[-1].billed_tokens == 550  # суммаризация оплачена в этом ходе
+    assert agent.billed_tokens == 550
+
+
+def test_auto_compaction_failure_warns_and_turn_continues(tmp_path):
+    from devassist.llm.base import LLMError
+
+    steps = [tool_turn("fake_write", {"path": str(i)}) for i in range(5)] + [text_turn("готово")]
+    provider = ScriptedProvider(steps, summaries=[LLMError("сеть упала")])
+    events = RecordingEvents()
+    agent = _agent(
+        provider,
+        tmp_path,
+        events=events,
+        registry=_registry_with(_big_tool()),
+        context_budget_tokens=4_000,
+    )
+    assert agent.run_turn("ЗАДАЧА") == "готово"
+    assert len(provider.summary_requests) == 1  # до конца хода не повторяет
+    assert events.compactions == [None]
+    assert any(level == "warn" and "сеть упала" in text for level, text in events.notices)
+    assert agent.conversation.summary is None
+
+
+def test_auto_compaction_can_be_disabled(tmp_path):
+    steps = [tool_turn("fake_write", {"path": str(i)}) for i in range(4)] + [text_turn("готово")]
+    provider = ScriptedProvider(steps)
+    agent = _agent(
+        provider,
+        tmp_path,
+        registry=_registry_with(_big_tool()),
+        context_budget_tokens=4_000,
+        auto_compact=False,
+    )
+    agent.run_turn("ЗАДАЧА")
+    assert provider.summary_requests == [] and agent.conversation.summary is None
+
+
+def test_threshold_ignores_system_prompt_and_tool_schemas(tmp_path):
+    from devassist.agent.conversation import Conversation
+    from devassist.llm.types import Message
+
+    # Бюджет 4000 почти целиком занят системным промптом и схемами: доля считается
+    # от остатка под историю, а не от всего бюджета — иначе сжатие на каждом шаге.
+    conv = Conversation()
+    for i in range(10):
+        conv.add_user(f"вопрос {i}")
+        conv.add_assistant(Message(role="assistant", content=f"ответ {i} " + "y" * 100))
+    provider = ScriptedProvider([text_turn("ок")])
+    agent = _agent(provider, tmp_path, context_budget_tokens=4_000)
+    agent.reset(conv)
+    agent.run_turn("ещё")
+    assert provider.summary_requests == []
+
+
+def test_interrupted_compaction_leaves_conversation_intact(tmp_path):
+    steps = [tool_turn("fake_write", {"path": str(i)}) for i in range(4)]
+    provider = ScriptedProvider(steps, summaries=[KeyboardInterrupt()])
+    events = RecordingEvents()
+    agent = _agent(
+        provider,
+        tmp_path,
+        events=events,
+        registry=_registry_with(_big_tool()),
+        context_budget_tokens=4_000,
+    )
+    with pytest.raises(KeyboardInterrupt):
+        agent.run_turn("ЗАДАЧА")
+    assert agent.conversation.summary is None and agent.conversation.pending_call() is None
+    assert events.compactions == [None]
+
+
+def test_manual_compact_folds_whole_dialog(tmp_path):
+    from devassist.agent.prompts import SUMMARY_HEADER
+
+    provider = ScriptedProvider(
+        [
+            text_turn("ответ 1", Usage(prompt_tokens=9_000, completion_tokens=10)),
+            text_turn("ответ 2", Usage(prompt_tokens=9_500, completion_tokens=10)),
+            text_turn("ответ 3"),
+        ],
+        summaries=[text_turn("СВОДКА", Usage(prompt_tokens=300, completion_tokens=20))],
+    )
+    events = RecordingEvents()
+    agent = _agent(provider, tmp_path, events=events)
+    assert agent.compact() is None  # пустой диалог — сжимать нечего
+    agent.run_turn("вопрос 1 " + "x" * 600)
+    agent.run_turn("вопрос 2 " + "x" * 600)
+    billed = agent.billed_tokens
+
+    result = agent.compact("сохрани имена файлов")
+    assert result is not None and not result.auto and result.messages == 4
+    assert "сохрани имена файлов" in provider.summary_requests[0]["messages"][1].content
+    assert agent.conversation.summary.upto == 4 and agent.conversation.context_messages() == []
+    # Оценка вместо устаревшего размера контекста (9 510) до следующего запроса.
+    assert agent.context_tokens == result.after_tokens < result.before_tokens < 9_510
+    assert agent.billed_tokens == billed + 320
+    assert agent.compact() is None  # нового с прошлого сжатия нет
+
+    agent.run_turn("дальше")
+    sent = provider.requests[-1]["messages"]
+    assert [(m.role, m.content) for m in sent[1:]] == [("user", "дальше")]
+    assert SUMMARY_HEADER in sent[0].content and "СВОДКА" in sent[0].content
+
+
+def test_compaction_that_does_not_shrink_is_rejected(tmp_path):
+    from devassist.agent.compaction import CompactionError
+
+    provider = ScriptedProvider([text_turn("да")], summaries=[text_turn("многословно " * 500)])
+    agent = _agent(provider, tmp_path)
+    agent.run_turn("да?")
+    with pytest.raises(CompactionError):
+        agent.compact()
+    assert agent.conversation.summary is None

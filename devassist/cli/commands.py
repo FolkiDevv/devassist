@@ -2,11 +2,12 @@
 
 Команды регистрируются в :class:`CommandRegistry`; из него же строятся справка,
 подсказки в баннере и автодополнение ввода (:mod:`devassist.cli.prompt`). Новая команда
-(``/compact``) — это один :class:`SlashCommand`.
+— это один :class:`SlashCommand`.
 """
 
 from __future__ import annotations
 
+import contextlib
 import re
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager
@@ -17,6 +18,7 @@ from devassist.agent.loop import Agent
 from devassist.cli.indexing import describe_index, run_indexing
 from devassist.cli.models import ModelCatalog, describe_model, ensure_context_window
 from devassist.cli.prompt import KEY_HELP
+from devassist.llm.base import LLMError
 from devassist.permissions import MODE_CYCLE, PermissionMode, parse_mode
 from devassist.project.index import ProjectIndex
 from devassist.ui.console import Console
@@ -157,6 +159,28 @@ def _clear(ctx: CommandContext, _arg: str) -> bool:
     return True
 
 
+def _compact(ctx: CommandContext, arg: str) -> bool:
+    agent = ctx.agent
+    guard = ctx.interrupt if ctx.interrupt is not None else contextlib.nullcontext()
+    try:
+        with guard:
+            result = agent.compact(arg)
+    except KeyboardInterrupt:
+        ctx.ui.warn("сжатие прервано — история не изменилась")
+        return True
+    except LLMError as e:
+        ctx.ui.error(f"не удалось сжать контекст: {e}")
+        return True
+    if result is None:
+        ctx.ui.info("сжимать нечего: история пуста или уже сжата")
+        return True
+    if ctx.chats is not None:  # краткое содержание — часть чата: сохраняем сразу
+        warning = ctx.chats.save(agent.conversation, model=agent.model)
+        if warning:
+            ctx.ui.warn(warning)
+    return True
+
+
 RESUME_LIMIT = 100  # сколько последних чатов показывает селектор
 
 
@@ -228,6 +252,14 @@ def default_commands() -> CommandRegistry:
         )
     )
     registry.register(SlashCommand("/clear", "новый чат", _clear))
+    registry.register(
+        SlashCommand(
+            "/compact",
+            "сжать историю в краткое содержание",
+            _compact,
+            usage="/compact [пожелания]",
+        )
+    )
     registry.register(
         SlashCommand(
             "/resume",
