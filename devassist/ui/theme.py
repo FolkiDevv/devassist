@@ -23,6 +23,8 @@ ICON_FAIL = "✘"
 ICON_BRAND = "✦"
 ICON_ARROW = "↳"
 SPINNER = "✦"
+# Значки режимов разрешений (ключ — PermissionMode.value); ручной — без значка.
+MODE_ICONS: dict[str, str] = {"edits": "⏵⏵", "plan": "⏸"}
 
 # Стили Markdown-ответа модели (имена стилей rich: markdown.*).
 MARKDOWN_STYLES: dict[str, str] = {
@@ -53,6 +55,9 @@ PROMPT_STYLES: dict[str, str] = {
     "toolbar.ok": OK,
     "toolbar.warn": WARN,
     "toolbar.danger": f"bold {DANGER}",
+    "toolbar.mode.manual": MUTED,
+    "toolbar.mode.edits": f"bold {WARN}",
+    "toolbar.mode.plan": f"bold {BRAND}",
     # меню вопросов агента (ask_user)
     "question.counter": f"bold {BRAND}",
     "question.header": f"bold {ACCENT}",

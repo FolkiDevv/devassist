@@ -1,6 +1,7 @@
 """Интерактивный режим (REPL). Строка ввода — :mod:`devassist.cli.prompt`.
 
 Семантика клавиш:
+  * Shift+Tab — сменить режим разрешений (и на приглашении, и во время хода);
   * Ctrl+C на приглашении — сбросить ввод (не выход);
   * Ctrl+C или Esc во время ответа — прервать текущий ход агента;
   * Esc Esc на приглашении — очистить ввод;
@@ -14,13 +15,19 @@ from __future__ import annotations
 from devassist import __version__
 from devassist.agent.chat_store import ChatInfo, ChatRecorder
 from devassist.agent.loop import Agent
-from devassist.cli.commands import CommandContext, CommandRegistry, is_repl_command
+from devassist.cli.commands import (
+    CommandContext,
+    CommandRegistry,
+    is_repl_command,
+    mode_choices,
+)
 from devassist.cli.indexing import ensure_index
 from devassist.cli.interrupt import EscInterrupt
 from devassist.cli.models import ModelCatalog, ensure_context_window
-from devassist.cli.prompt import InputReader, StatusInfo, make_input_reader
+from devassist.cli.prompt import ArgChoices, InputReader, StatusInfo, make_input_reader
 from devassist.llm.base import LLMError
 from devassist.ui.console import Console
+from devassist.ui.format import mode_badge
 
 
 def status_of(agent: Agent) -> StatusInfo:
@@ -31,6 +38,7 @@ def status_of(agent: Agent) -> StatusInfo:
         context_budget=agent.context_budget,
         billed_tokens=agent.billed_tokens,
         auto_approve=agent.config.auto_approve,
+        mode=agent.mode,
     )
 
 
@@ -43,11 +51,20 @@ def autosave(chats: ChatRecorder | None, agent: Agent, ui: Console) -> None:
         ui.warn(warning)
 
 
-def esc_interrupt_for(ui: Console, interrupt: EscInterrupt | None = None) -> EscInterrupt:
-    """Прерывание ходов клавишей Esc (если stdin — терминал) + подсказка в индикаторе."""
+def esc_interrupt_for(
+    ui: Console, interrupt: EscInterrupt | None = None, agent: Agent | None = None
+) -> EscInterrupt:
+    """Прерывание ходов клавишей Esc (если stdin — терминал) + подсказка в индикаторе.
+
+    С ``agent`` Shift+Tab во время хода переключает его режим, а индикатор хода
+    показывает текущий режим.
+    """
     interrupt = EscInterrupt() if interrupt is None else interrupt
     if interrupt.enabled:
         ui.set_interrupt_keys("Esc — прервать", interrupt.paused)
+        if agent is not None:
+            interrupt.on_backtab = agent.cycle_mode
+            ui.set_mode_hint(lambda: f"{mode_badge(agent.mode)} (Shift+Tab)")
     return interrupt
 
 
@@ -76,21 +93,20 @@ def run_repl(
     до первого ввода (:func:`~devassist.cli.models.ensure_context_window`)."""
     if interrupt is None:
         interrupt = EscInterrupt(enabled=None if read_input is None else False)
-    esc = esc_interrupt_for(ui, interrupt)
+    esc = esc_interrupt_for(ui, interrupt, agent)
     if models is None and read_input is None:
         models = ModelCatalog(agent.provider)
     catalog = models
-    arg_choices = (
-        {"/model": lambda: catalog.choices(agent.windows, agent.model)}
-        if catalog is not None
-        else {}
-    )
+    arg_choices: dict[str, ArgChoices] = {"/mode": lambda: mode_choices(agent.mode)}
+    if catalog is not None:
+        arg_choices["/model"] = lambda: catalog.choices(agent.windows, agent.model)
     read = read_input or make_input_reader(
         commands=commands,
         workspace=agent.workspace,
         status=lambda: status_of(agent),
         no_color=ui.no_color,
         arg_choices=arg_choices,
+        on_cycle_mode=agent.cycle_mode,
     )
     ui.banner(
         version=__version__,
@@ -98,6 +114,7 @@ def run_repl(
         root=str(agent.workspace.root),
         hints=[(cmd.name, cmd.summary) for cmd in commands],
         auto_approve=agent.config.auto_approve,
+        mode=agent.mode,
     )
     if resumed is not None:
         ui.chat_resumed(resumed, agent.conversation.messages)

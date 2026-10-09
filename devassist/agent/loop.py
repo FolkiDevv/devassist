@@ -26,11 +26,12 @@ from devassist.agent.context_window import (
 from devassist.agent.conversation import Conversation
 from devassist.agent.events import AgentEvents, ToolCallInfo, TurnStats
 from devassist.agent.guard import CallCheck, LoopGuard, ToolOutcome
-from devassist.agent.prompts import build_system_prompt
+from devassist.agent.prompts import build_system_prompt, mode_prompt
 from devassist.config import Config
 from devassist.llm.base import LLMProvider
 from devassist.llm.model_windows import ModelWindows
 from devassist.llm.types import AssistantTurn, Message, ToolSpec
+from devassist.permissions import Decision, PermissionMode, decide, next_mode
 from devassist.project.workspace import Workspace
 from devassist.security import RiskLevel
 from devassist.tools.base import Tool, ToolContext, ToolError, ToolRegistry, ToolResult
@@ -45,6 +46,11 @@ REJECTED_AGAIN_NOTE = (
 )
 LOOP_STOP_NOTE = (
     "Не выполнено: повтор того же вызова без изменений. Ход остановлен из-за зацикливания."
+)
+PLAN_BLOCKED_NOTE = (
+    "Не выполнено: включён режим планирования, изменения запрещены. Не пытайся "
+    "вносить их: опиши нужные изменения в плане и передай его пользователю "
+    "инструментом exit_plan_mode."
 )
 
 
@@ -75,9 +81,18 @@ class Agent:
         # `is None`, а не `or`: пустой Conversation ложен (__len__ == 0).
         self._events = AgentEvents() if events is None else events
         self._workspace = Workspace(config.project_root) if workspace is None else workspace
-        self._ctx = ToolContext(workspace=self._workspace, ask_user=self._events.ask_user)
+        self._ctx = ToolContext(
+            workspace=self._workspace,
+            ask_user=self._events.ask_user,
+            get_mode=lambda: self._mode,
+            set_mode=self.set_mode,
+        )
         self._conversation = Conversation() if conversation is None else conversation
         self._model = config.model
+        # Режим разрешений — состояние сессии, как модель: reset() его не меняет.
+        # Может смениться посреди хода (Shift+Tab из потока клавиш) — читается при
+        # каждом вызове инструмента и каждом обращении к модели.
+        self._mode = config.mode
         self._windows = ModelWindows() if windows is None else windows
         self._system_prompt: str | None = None  # строится лениво, сбрасывается в reset()
         self._billed_tokens = 0  # потрачено за сессию (reset() не сбрасывает)
@@ -98,6 +113,10 @@ class Agent:
     @property
     def config(self) -> Config:
         return self._cfg
+
+    @property
+    def mode(self) -> PermissionMode:
+        return self._mode
 
     @property
     def context_tokens(self) -> int:
@@ -136,6 +155,15 @@ class Agent:
         if not name:
             raise ValueError("Имя модели не может быть пустым")
         self._model = name
+
+    def set_mode(self, mode: PermissionMode) -> None:
+        """Сменить режим разрешений (действует со следующего вызова инструмента)."""
+        self._mode = PermissionMode(mode)
+
+    def cycle_mode(self) -> PermissionMode:
+        """Следующий режим по кругу (Shift+Tab); возвращает новый режим."""
+        self._mode = next_mode(self._mode)
+        return self._mode
 
     def reset(self, conversation: Conversation | None = None) -> None:
         """Начать новый диалог или продолжить сохранённый (``conversation``).
@@ -225,7 +253,11 @@ class Agent:
 
         Единственная точка сборки запроса — сюда встраивается сжатие контекста.
         """
-        system = Message(role="system", content=self.system_prompt())
+        system_text = self.system_prompt()
+        note = mode_prompt(self._mode)
+        if note:
+            system_text = f"{system_text}\n\n{note}"
+        system = Message(role="system", content=system_text)
         # Схемы инструментов уходят в каждом запросе и занимают то же окно.
         used = estimate_tokens([system]) + estimate_specs_tokens(specs)
         budget = max(self.context_budget - used, 1_000)
@@ -286,12 +318,20 @@ class Agent:
         call = ToolCallInfo(name, self._describe(tool, params))
         self._events.on_tool_call(call)
 
-        # 2) Подтверждение изменяющих/опасных операций
+        # 2) Разрешение по режиму: выполнить, спросить или заблокировать
         previewed = False
         risk = RiskLevel.SAFE
         try:
             risk = tool.risk(params, self._ctx)
-            if risk >= RiskLevel.WRITE and not self._cfg.auto_approve:
+            decision = decide(self._mode, risk, tool.kind, auto_approve=self._cfg.auto_approve)
+            if decision is Decision.BLOCK:
+                return self._fail(
+                    call,
+                    "заблокировано: режим планирования",
+                    model_text=PLAN_BLOCKED_NOTE,
+                    note=note,
+                )
+            if decision is Decision.ASK:
                 if check.rejected_before:
                     # Тот же вызов уже отклонён в этом ходе — не переспрашиваем.
                     self._fail(

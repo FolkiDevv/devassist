@@ -20,6 +20,8 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from devassist.permissions import PermissionMode, parse_mode
+
 # URL по умолчанию для каждой схемы авторизации.
 DEFAULT_OAUTH_URL = "https://gigachat.devices.sberbank.ru/api/v1"
 DEFAULT_MTLS_URL = "https://gigachat-ift.sberdevices.delta.sbrf.ru/v1"
@@ -107,6 +109,16 @@ def _env_optional_int(env: Mapping[str, str], name: str, *, minimum: int = 1) ->
     return _env_int(env, name, 0, minimum=minimum)
 
 
+def _env_mode(env: Mapping[str, str], name: str) -> PermissionMode:
+    raw = env.get(name)
+    if raw is None or not raw.strip():
+        return PermissionMode.MANUAL
+    try:
+        return parse_mode(raw)
+    except ValueError as e:
+        raise ConfigError(f"{name}: {e}") from e
+
+
 def _env_float(env: Mapping[str, str], name: str, default: float, *, lo: float, hi: float) -> float:
     raw = env.get(name)
     if raw is None or not raw.strip():
@@ -149,6 +161,9 @@ class Config:
     # --- Агент / окружение ---
     project_root: Path = field(default_factory=Path.cwd)
     auto_approve: bool = False  # пропускать подтверждения (опасно)
+    # Начальный режим разрешений (ручной / авто-правки / план); в работе режим
+    # меняется в агенте (Shift+Tab, /mode).
+    mode: PermissionMode = PermissionMode.MANUAL
     max_steps: int = 50  # предохранитель агентного цикла
     max_tool_failures: int = 4  # стоп при N неудачных вызовах подряд (анти-залипание)
     # Одинаковый вызов без изменений между повторами: на N-м — предупреждение
@@ -170,6 +185,7 @@ class Config:
         project_root: Path | None = None,
         model: str | None = None,
         auto_approve: bool = False,
+        mode: PermissionMode | None = None,
         stream: bool = True,
         save_chats: bool = True,
         environ: Mapping[str, str] | None = None,
@@ -204,6 +220,7 @@ class Config:
             timeout=_env_int(env, "GIGACHAT_TIMEOUT", 120),
             project_root=root,
             auto_approve=auto_approve,
+            mode=mode or _env_mode(env, "DEVASSIST_MODE"),
             stream=stream,
             temperature=_env_float(env, "DEVASSIST_TEMPERATURE", 0.2, lo=0.0, hi=2.0),
             context_budget_tokens=_env_optional_int(env, "DEVASSIST_CONTEXT_TOKENS", minimum=4_000),

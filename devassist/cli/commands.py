@@ -17,6 +17,7 @@ from devassist.agent.loop import Agent
 from devassist.cli.indexing import describe_index, run_indexing
 from devassist.cli.models import ModelCatalog, describe_model, ensure_context_window
 from devassist.cli.prompt import KEY_HELP
+from devassist.permissions import MODE_CYCLE, PermissionMode, parse_mode
 from devassist.project.index import ProjectIndex
 from devassist.ui.console import Console
 
@@ -122,6 +123,32 @@ def _model(ctx: CommandContext, arg: str) -> bool:
     return True
 
 
+def mode_choices(current: PermissionMode) -> list[tuple[str, str]]:
+    """Варианты аргумента ``/mode`` для автодополнения: (имя, пояснение)."""
+    return [
+        (mode.value, f"{mode.label}{' · текущий' if mode is current else ''} — {mode.description}")
+        for mode in MODE_CYCLE
+    ]
+
+
+def _mode(ctx: CommandContext, arg: str) -> bool:
+    agent = ctx.agent
+    if not arg:
+        lines = [f"режим: {agent.mode.label} — {agent.mode.description}"]
+        lines.append("режимы (Shift+Tab — следующий по кругу):")
+        lines += [f"  • {m.value} — {m.label}: {m.description}" for m in MODE_CYCLE]
+        ctx.ui.info("\n".join(lines))
+        return True
+    try:
+        mode = parse_mode(arg)
+    except ValueError as e:
+        ctx.ui.error(f"{e} (использование: /mode [manual|edits|plan])")
+        return True
+    agent.set_mode(mode)
+    ctx.ui.info(f"режим: {mode.label} — {mode.description}")
+    return True
+
+
 def _clear(ctx: CommandContext, _arg: str) -> bool:
     ctx.agent.reset()
     if ctx.chats is not None:
@@ -195,6 +222,11 @@ def default_commands() -> CommandRegistry:
     registry = CommandRegistry()
     registry.register(SlashCommand("/help", "справка", _help))
     registry.register(SlashCommand("/model", "сменить модель", _model, usage="/model [имя]"))
+    registry.register(
+        SlashCommand(
+            "/mode", "режим: ручной, авто-правки, план", _mode, usage="/mode [manual|edits|plan]"
+        )
+    )
     registry.register(SlashCommand("/clear", "новый чат", _clear))
     registry.register(
         SlashCommand(

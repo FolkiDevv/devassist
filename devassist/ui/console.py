@@ -41,11 +41,19 @@ from rich.theme import Theme
 from devassist.agent.chat_store import ChatInfo
 from devassist.agent.events import AgentEvents, NoticeLevel, ToolCallInfo, TurnStats
 from devassist.llm.types import Message
+from devassist.permissions import PermissionMode
 from devassist.tools.ask_user import format_answer
 from devassist.tools.base import Display, ToolResult
 from devassist.tools.questions import Answer, Question, QuestionsUnavailable
 from devassist.ui import banner as banner_art
-from devassist.ui.format import SKIPPED_MARK, clip_lines, format_tokens, format_when, plural
+from devassist.ui.format import (
+    SKIPPED_MARK,
+    clip_lines,
+    format_tokens,
+    format_when,
+    mode_badge,
+    plural,
+)
 from devassist.ui.markdown import Markdown
 from devassist.ui.markdown_stream import MarkdownStream
 from devassist.ui.spinner import INTERVAL as SPINNER_INTERVAL
@@ -72,6 +80,11 @@ from devassist.ui.theme import (
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 _SKIPPED_RE = re.compile(rf"^{SKIPPED_MARK} пропущено .*$", re.MULTILINE)
 _REFRESH_PER_SECOND = 2 / SPINNER_INTERVAL  # два обновления на кадр — ровный шаг ракеты
+_MODE_COLORS = {
+    PermissionMode.MANUAL: MUTED,
+    PermissionMode.ACCEPT_EDITS: WARN,
+    PermissionMode.PLAN: BRAND,
+}
 
 
 def sanitize(text: str) -> str:
@@ -91,7 +104,7 @@ class _LiveView:
         label: str | Callable[[], str],
         tail: Callable[[], list[list[Segment]]] | None = None,
         *,
-        hint: str = "Ctrl+C — прервать",
+        hint: str | Callable[[], str] = "Ctrl+C — прервать",
     ):
         self._label = label
         self._tail = tail
@@ -104,7 +117,7 @@ class _LiveView:
             rocket_frame(elapsed),
             (f"  {self._label() if callable(self._label) else self._label}… ", MUTED),
             (f"{int(elapsed)} с", MUTED),
-            (f"  ·  {self._hint}", MUTED),
+            (f"  ·  {self._hint() if callable(self._hint) else self._hint}", MUTED),
         )
         lines = self._tail() if self._tail else []
         if lines:
@@ -190,6 +203,7 @@ class Console(AgentEvents):
         self._md: MarkdownStream | None = None  # потоковый ответ (живой режим)
         self._raw_started = False  # потоковый ответ (не-терминал): метка уже напечатана
         self._interrupt_hint = "Ctrl+C — прервать"
+        self._mode_hint: Callable[[], str] | None = None
         self._input_guard: Callable[[], AbstractContextManager[None]] = contextlib.nullcontext
 
     def set_interrupt_keys(
@@ -202,6 +216,16 @@ class Console(AgentEvents):
         """
         self._interrupt_hint = hint
         self._input_guard = input_guard
+
+    def set_mode_hint(self, hint: Callable[[], str] | None) -> None:
+        """Режим разрешений в индикаторе хода; перечитывается при каждой отрисовке,
+        поэтому смена режима во время хода (Shift+Tab) видна сразу."""
+        self._mode_hint = hint
+
+    def _turn_hint(self) -> str:
+        if self._mode_hint is None:
+            return self._interrupt_hint
+        return f"{self._interrupt_hint}  ·  {self._mode_hint()}"
 
     @property
     def no_color(self) -> bool:
@@ -283,15 +307,25 @@ class Console(AgentEvents):
         root: str,
         hints: Sequence[tuple[str, str]] = (),
         auto_approve: bool = False,
+        mode: PermissionMode | None = None,
     ) -> None:
         """Приветственная панель; ``hints`` — пары (команда, краткое описание)."""
-        info = Group(
+        rows = [
             banner_art.title(),
             Text(f"v{version}", style=MUTED),
             Text(""),
             Text.assemble(("модель ", MUTED), (model, f"bold {ACCENT}")),
             Text.assemble(("проект ", MUTED), root),
-        )
+        ]
+        if mode is not None:
+            rows.append(
+                Text.assemble(
+                    ("режим  ", MUTED),
+                    (mode_badge(mode), f"bold {_MODE_COLORS[mode]}"),
+                    ("  Shift+Tab — сменить", MUTED),
+                )
+            )
+        info = Group(*rows)
         body = Table.grid(padding=(0, 3))
         body.add_column(vertical="middle", no_wrap=True)
         body.add_column(vertical="middle")
@@ -339,7 +373,7 @@ class Console(AgentEvents):
         """Запрос отправлен: индикатор ожидания до первого токена."""
         self._md = None
         self._raw_started = False
-        self._start_live(_LiveView("думаю", hint=self._interrupt_hint))
+        self._start_live(_LiveView("думаю", hint=self._turn_hint))
 
     def on_stream_delta(self, text: str) -> None:
         """Очередной кусок текста модели."""
@@ -356,9 +390,7 @@ class Console(AgentEvents):
         if self._md is None:
             self._md = MarkdownStream(self._c)
             self._assistant_label()  # при активной области печатается над ней
-            self._start_live(
-                _LiveView("печатает", tail=self._md.tail_lines, hint=self._interrupt_hint)
-            )
+            self._start_live(_LiveView("печатает", tail=self._md.tail_lines, hint=self._turn_hint))
         lines = self._md.feed(text)
         if lines:
             self._print_above_live(SegmentLines(lines, new_lines=True))
@@ -387,7 +419,7 @@ class Console(AgentEvents):
         self._c.print(line)
 
     def on_tool_start(self, call: ToolCallInfo) -> None:
-        self._start_live(_LiveView("выполняется", hint=self._interrupt_hint))
+        self._start_live(_LiveView("выполняется", hint=self._turn_hint))
 
     def on_tool_end(self, call: ToolCallInfo) -> None:
         self.stop_live()
@@ -508,6 +540,8 @@ class Console(AgentEvents):
         answers: list[Answer] = []
         with self._input_guard():
             for i, question in enumerate(questions, 1):
+                if question.body.strip():
+                    self._question_body(question)
                 answer = self._ask_one(question, i, len(questions))
                 if answer is None:
                     self._c.print(Text("  ? пользователь отказался отвечать", style=MUTED))
@@ -519,6 +553,19 @@ class Console(AgentEvents):
                 self._c.print(line)
                 answers.append(answer)
         return answers
+
+    def _question_body(self, question: Question) -> None:
+        """Подробности к вопросу (например, план на одобрение) — Markdown в рамке."""
+        self._c.print(
+            Panel(
+                Markdown(sanitize(question.body)),
+                title=Text(question.header or "подробности", style=f"bold {BRAND}"),
+                title_align="left",
+                box=ROUNDED,
+                border_style=BRAND,
+                padding=(0, 1),
+            )
+        )
 
     def _ask_one(self, question: Question, index: int, total: int) -> Answer | None:
         if self._live_ok:

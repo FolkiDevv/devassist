@@ -9,7 +9,8 @@
   поэтому прерываются и ожидание сети, и запущенная команда (её группа процессов
   убивается тем же путём, что и при Ctrl+C);
 * ESC-последовательности (стрелки, Alt+клавиша) отличаются от одиночного Esc по
-  тому, что за ESC сразу приходят ещё байты, и игнорируются;
+  тому, что за ESC сразу приходят ещё байты, и игнорируются — кроме Shift+Tab
+  (``ESC [ Z``): он переключает режим разрешений (:attr:`EscInterrupt.on_backtab`);
 * остальной набранный текст копится и подставляется в следующую строку ввода —
   набирать следующий запрос можно, пока агент работает.
 
@@ -42,11 +43,19 @@ class KeyParser:
 
     ``more_pending`` сообщает, пришли ли следующие байты сразу после ESC в конце
     пачки (то есть это начало последовательности, а не нажатый Esc).
+    ``on_backtab`` — Shift+Tab (``ESC [ Z``).
     """
 
-    def __init__(self, on_escape: Callable[[], None], more_pending: Callable[[], bool]):
+    def __init__(
+        self,
+        on_escape: Callable[[], None],
+        more_pending: Callable[[], bool],
+        on_backtab: Callable[[], None] | None = None,
+    ):
         self._on_escape = on_escape
         self._more_pending = more_pending
+        self._on_backtab = on_backtab
+        self._csi_params = False  # в текущей CSI-последовательности были параметры
         self._decoder = codecs.getincrementaldecoder("utf-8")(errors="ignore")
         self._text: list[str] = []
         # Разбор ESC-последовательности: "" — обычный текст; "esc" — после ESC;
@@ -89,6 +98,7 @@ class KeyParser:
         if state == "esc":
             if byte == 0x5B:  # [
                 self._state = "csi"
+                self._csi_params = False
             elif byte == 0x4F:  # O
                 self._state = "ss3"
             else:  # Alt+символ: сам символ отбрасываем целиком
@@ -97,6 +107,10 @@ class KeyParser:
         if state == "csi":
             if 0x40 <= byte <= 0x7E:  # финальный байт; параметры — 0x20–0x3F
                 self._state = ""
+                if byte == 0x5A and not self._csi_params and self._on_backtab is not None:
+                    self._on_backtab()  # ESC [ Z — Shift+Tab
+            else:
+                self._csi_params = True
             return True
         if state == "ss3":
             self._state = ""
@@ -135,6 +149,7 @@ class EscInterrupt:
         fd: int | None = None,
         enabled: bool | None = None,
         interrupt: Callable[[], None] = _interrupt_main,
+        on_backtab: Callable[[], object] | None = None,
     ):
         if fd is None:
             try:
@@ -146,6 +161,8 @@ class EscInterrupt:
             enabled = fd >= 0 and os.isatty(fd) and _supported()
         self.enabled = enabled
         self._interrupt = interrupt
+        # Shift+Tab во время хода (вызывается из фонового потока чтения клавиш).
+        self.on_backtab = on_backtab
         self._lock = threading.Lock()
         self._armed = False  # можно ли ещё прервать текущий ход
         self._stop = threading.Event()
@@ -153,7 +170,7 @@ class EscInterrupt:
         self._idle = threading.Event()  # поток не читает терминал
         self._thread: threading.Thread | None = None
         self._saved_mode: Any = None
-        self._parser = KeyParser(self._on_escape, self._more_pending)
+        self._parser = KeyParser(self._on_escape, self._more_pending, self._on_backtab)
 
     # ------------------------------------------------------------------ #
     def __enter__(self) -> EscInterrupt:
@@ -209,6 +226,10 @@ class EscInterrupt:
                 return
             self._armed = False
             self._interrupt()
+
+    def _on_backtab(self) -> None:
+        if self.on_backtab is not None:
+            self.on_backtab()
 
     def _more_pending(self) -> bool:
         return self._readable(_SEQUENCE_GAP_SECONDS)
@@ -270,7 +291,8 @@ class EscInterrupt:
         while msvcrt.kbhit():
             ch = msvcrt.getwch()
             if ch in ("\x00", "\xe0"):  # стрелки и F-клавиши: префикс + код
-                msvcrt.getwch()
+                if msvcrt.getwch() == "\x0f":  # Shift+Tab — как в POSIX-терминале
+                    chars.append("\x1b[Z")
                 continue
             chars.append(ch)
         return "".join(chars).encode("utf-8")

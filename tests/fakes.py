@@ -10,6 +10,7 @@ from pydantic import BaseModel
 from devassist.agent.events import AgentEvents, ToolCallInfo, TurnStats
 from devassist.llm.base import LLMProvider, PromptTooLong
 from devassist.llm.types import AssistantTurn, FunctionCall, Message, Usage
+from devassist.permissions import ToolKind
 from devassist.tools.base import Display, Tool, ToolContext, ToolResult
 
 
@@ -167,7 +168,8 @@ class FakeParams(BaseModel):
 
 
 class FakeTool(Tool):
-    """Настраиваемый WRITE-инструмент для тестов агентного цикла."""
+    """Настраиваемый WRITE-инструмент для тестов агентного цикла (``kind`` — вид для
+    режимов разрешений)."""
 
     name = "fake_write"
     description = "тестовый инструмент"
@@ -178,7 +180,9 @@ class FakeTool(Tool):
         *,
         preview: Callable[[], Display | None] | None = None,
         run: Callable[[], ToolResult] | None = None,
+        kind: ToolKind = ToolKind.OTHER,
     ):
+        self.kind = kind
         self._preview = preview or (lambda: Display("+x", kind="diff", title="x"))
         self._run = run or (lambda: ToolResult(content="ok", summary="ok"))
         self.runs = 0

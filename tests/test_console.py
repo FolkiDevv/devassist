@@ -314,3 +314,38 @@ def test_banner_shows_rocket_title_and_meta():
     assert "▟█▙" in out and "╺┳┓" in out  # ракета и крупное название
     assert "v9.9.9" in out and "GigaChat-Max" in out and "/work/proj" in out
     assert "/help справка" in out
+
+
+def test_banner_shows_mode():
+    from devassist.permissions import PermissionMode
+
+    ui, buf = _console()
+    ui.banner(version="1", model="m", root="/r", mode=PermissionMode.PLAN)
+    assert "режим  ⏸ план  Shift+Tab — сменить" in _plain(buf)
+
+
+def test_question_body_is_shown_before_options(monkeypatch):
+    from dataclasses import replace
+
+    ui, buf = _asking_console(monkeypatch, "1")
+    question = replace(_DB, header="План", body="## Шаги\n1. **Поправить** `a.py`")
+    assert ui.ask_user([question]) == [Answer(("PostgreSQL",))]
+    out = buf.getvalue()
+    assert "План" in out and "Шаги" in out and "Поправить" in out and "**" not in out
+    assert out.index("Поправить") < out.index("Вопрос 1 из 1")
+
+
+def test_turn_indicator_shows_current_mode():
+    import contextlib
+
+    from devassist.permissions import PermissionMode
+
+    ui, buf = _live_console(width=120)
+    mode = [PermissionMode.MANUAL]
+    ui.set_interrupt_keys("Esc — прервать", contextlib.nullcontext)
+    ui.set_mode_hint(lambda: f"{mode[0].label} (Shift+Tab)")
+    ui.on_stream_start()
+    mode[0] = PermissionMode.PLAN  # Shift+Tab во время хода
+    ui._live._live.refresh()
+    ui.stop_live()
+    assert "Esc — прервать  ·  план (Shift+Tab)" in _plain(buf)

@@ -25,6 +25,7 @@ class Question:
     options: tuple[QuestionOption, ...]
     header: str = ""  # короткая метка темы («База данных»)
     multi_select: bool = False
+    body: str = ""  # Markdown над вариантами ответа (например, план на одобрение)
 
 
 @dataclass(frozen=True)

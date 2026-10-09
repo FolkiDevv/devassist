@@ -53,6 +53,7 @@ def test_load_does_not_touch_os_environ(tmp_path, monkeypatch):
         {"GIGACHAT_TIMEOUT": "0"},
         {"DEVASSIST_TEMPERATURE": "warm"},
         {"DEVASSIST_TEMPERATURE": "5"},
+        {"DEVASSIST_MODE": "yolo"},
     ],
 )
 def test_bad_values_raise_config_error(tmp_path, env):
@@ -83,3 +84,19 @@ def test_save_chats_flag_and_env(tmp_path):
     assert load({}) is True
     assert load({"DEVASSIST_SAVE_CHATS": "0"}) is False
     assert load({"DEVASSIST_SAVE_CHATS": "1"}, save_chats=False) is False  # --no-save сильнее
+
+
+def test_mode_flag_and_env(tmp_path):
+    from devassist.permissions import PermissionMode
+
+    def load(env, **kw):
+        return Config.load(project_root=tmp_path, environ=env, cwd=tmp_path, **kw).mode
+
+    assert load({}) is PermissionMode.MANUAL
+    assert load({"DEVASSIST_MODE": " Plan "}) is PermissionMode.PLAN
+    # --mode сильнее окружения
+    assert load({"DEVASSIST_MODE": "plan"}, mode=PermissionMode.ACCEPT_EDITS) is (
+        PermissionMode.ACCEPT_EDITS
+    )
+    with pytest.raises(ConfigError, match="DEVASSIST_MODE"):
+        load({"DEVASSIST_MODE": "auto"})

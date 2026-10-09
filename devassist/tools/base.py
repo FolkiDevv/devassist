@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Generic, Literal, TypeVar
@@ -23,6 +24,7 @@ from pydantic import BaseModel
 
 from devassist.errors import ToolError
 from devassist.llm.types import ToolSpec
+from devassist.permissions import PermissionMode, ToolKind
 from devassist.project.workspace import Workspace
 from devassist.security import RiskLevel
 from devassist.tools.questions import AskUser
@@ -46,11 +48,14 @@ class ToolContext:
 
     Намеренно не содержит Config: инструментам не нужны (и не должны быть
     доступны) реквизиты API. ``ask_user`` — способ задать вопрос пользователю
-    (None — спросить некого).
+    (None — спросить некого). ``get_mode``/``set_mode`` — текущий режим разрешений
+    агента (None — агента нет, например в тестах инструмента).
     """
 
     workspace: Workspace
     ask_user: AskUser | None = None
+    get_mode: Callable[[], PermissionMode] | None = None
+    set_mode: Callable[[PermissionMode], None] | None = None
 
     @property
     def root(self) -> Path:
@@ -136,6 +141,10 @@ class Tool(ABC, Generic[P]):
     name: str = ""
     description: str = ""
     Params: type[BaseModel] = BaseModel
+    # Вид инструмента для режимов разрешений (permissions.decide): правки файлов
+    # (EDIT) применяются без вопроса в режиме авто-правок, команды (COMMAND)
+    # разрешены в режиме плана; остальное изменяющее в плане заблокировано.
+    kind: ToolKind = ToolKind.OTHER
 
     # ------------------------------------------------------------------ #
     def spec(self) -> ToolSpec:
@@ -218,6 +227,7 @@ def build_default_registry() -> ToolRegistry:
     )
     from devassist.tools.git import GitTool
     from devassist.tools.index import FileOutlineTool, FindSymbolTool
+    from devassist.tools.plan import ExitPlanModeTool
     from devassist.tools.search import SearchContentTool
     from devassist.tools.shell import RunShellTool
 
@@ -234,6 +244,7 @@ def build_default_registry() -> ToolRegistry:
         RunShellTool(),
         GitTool(),
         AskUserTool(),
+        ExitPlanModeTool(),
     ):
         reg.register(tool)
     return reg

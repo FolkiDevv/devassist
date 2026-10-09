@@ -35,6 +35,7 @@ from devassist.config import Config, ConfigError
 from devassist.llm.base import LLMError, LLMProvider
 from devassist.llm.gigachat import GigaChatProvider
 from devassist.llm.model_windows import ModelWindows
+from devassist.permissions import PermissionMode
 from devassist.tools.base import build_default_registry
 from devassist.ui.console import Console
 
@@ -57,6 +58,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--yes",
         action="store_true",
         help="Авто-подтверждение всех операций (используйте осознанно)",
+    )
+    p.add_argument(
+        "--mode",
+        choices=[mode.value for mode in PermissionMode],
+        help="Начальный режим: manual — всё с подтверждением, edits — правки файлов "
+        "без вопросов, plan — только исследование и план (Shift+Tab — сменить)",
     )
     chat = p.add_mutually_exclusive_group()
     chat.add_argument(
@@ -103,7 +110,7 @@ def _make_provider(config: Config) -> LLMProvider:
 
 
 def run_oneshot(agent: Agent, ui: Console, prompt: str, chats: ChatRecorder | None = None) -> int:
-    esc = esc_interrupt_for(ui)
+    esc = esc_interrupt_for(ui, agent=agent)
     try:
         with esc:
             agent.run_turn(prompt)
@@ -173,6 +180,7 @@ def main(argv: list[str] | None = None) -> int:
             project_root=root,
             model=args.model,
             auto_approve=args.yes,
+            mode=PermissionMode(args.mode) if args.mode else None,
             stream=not args.no_stream,
             save_chats=not args.no_save,
         )
