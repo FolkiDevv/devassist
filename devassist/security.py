@@ -15,15 +15,15 @@ import re
 from enum import IntEnum
 from pathlib import Path
 
+from devassist.errors import SandboxError
+
+__all__ = ["RiskLevel", "SandboxError", "classify_shell_command", "resolve_in_root"]
+
 
 class RiskLevel(IntEnum):
     SAFE = 0  # чтение, поиск — без подтверждения
     WRITE = 1  # изменение ФС (запись/редактирование/коммит)
     DANGEROUS = 2  # потенциально разрушительные команды
-
-
-class SandboxError(RuntimeError):
-    """Попытка выйти за пределы песочницы проекта."""
 
 
 def resolve_in_root(root: Path, path: str | Path) -> Path:
@@ -46,7 +46,8 @@ def resolve_in_root(root: Path, path: str | Path) -> Path:
 
 # Шаблоны заведомо опасных shell-конструкций.
 _DANGEROUS_PATTERNS = [
-    r"\brm\s+(-[a-zA-Z]*\s+)*-?[rf]",  # rm -rf и вариации
+    # rm с флагом -r/-R/-f (в любой позиции и комбинации) или --recursive/--force
+    r"\brm\s+(?:\S+\s+)*?-(?:[a-zA-Z]*[rRf][a-zA-Z]*|-recursive|-force)\b",
     r"\bsudo\b",
     r"\bmkfs\b",
     r"\bdd\s+if=",

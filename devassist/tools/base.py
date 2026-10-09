@@ -17,9 +17,19 @@ from typing import Any, Generic, TypeVar
 
 from pydantic import BaseModel
 
+from devassist.errors import ToolError
 from devassist.llm.types import ToolSpec
 from devassist.project.workspace import Workspace
 from devassist.security import RiskLevel
+
+__all__ = [
+    "Tool",
+    "ToolContext",
+    "ToolError",
+    "ToolRegistry",
+    "ToolResult",
+    "build_default_registry",
+]
 
 P = TypeVar("P", bound=BaseModel)
 
@@ -52,10 +62,6 @@ class ToolResult:
         if self.ok:
             return self.content
         return f"ОШИБКА: {self.content}"
-
-
-class ToolError(Exception):
-    """Ожидаемая ошибка инструмента (возвращается модели, не роняет агента)."""
 
 
 def _normalize_property(prop: dict[str, Any]) -> dict[str, Any]:

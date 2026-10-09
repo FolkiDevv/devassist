@@ -12,7 +12,13 @@ from devassist.project.files import glob_match, walk_files
 from devassist.security import RiskLevel, resolve_in_root
 from devassist.tools.base import Tool, ToolContext, ToolError, ToolResult
 
-MAX_READ_BYTES = 400_000
+# Жёсткий предел размера читаемого файла (дальше — только search_content).
+MAX_READ_BYTES = 20_000_000
+# Сколько отдаётся модели за один вызов: строки, символы на строку, символы всего.
+MAX_READ_LINES = 1000
+MAX_LINE_CHARS = 1000
+MAX_READ_CHARS = 60_000
+_BINARY_PROBE = 8192
 
 
 def _rel(ctx: ToolContext, path: Path) -> str:
@@ -167,7 +173,8 @@ class ReadFileTool(Tool):
     name = "read_file"
     description = (
         "Читает содержимое текстового файла. Можно указать диапазон строк "
-        "(start_line/end_line). Возвращает текст с номерами строк."
+        "(start_line/end_line). Возвращает текст с номерами строк; за один вызов — "
+        f"не более {MAX_READ_LINES} строк, для продолжения укажите start_line."
     )
     Params = ReadFileParams
 
@@ -179,28 +186,49 @@ class ReadFileTool(Tool):
             raise ToolError(f"Это директория, а не файл: {params.path}")
         if p.stat().st_size > MAX_READ_BYTES:
             raise ToolError(
-                f"Файл слишком большой (>{MAX_READ_BYTES} байт). "
-                "Используйте диапазон строк или search_content."
+                f"Файл слишком большой (>{MAX_READ_BYTES} байт). Используйте search_content."
             )
+        with p.open("rb") as fh:
+            if b"\0" in fh.read(_BINARY_PROBE):
+                raise ToolError(f"Бинарный файл, чтение не поддерживается: {params.path}")
+
+        start = max(params.start_line or 1, 1)
+        end = params.end_line
+        selected: list[tuple[int, str]] = []
+        budget = MAX_READ_CHARS
+        total = 0
+        stopped_at: int | None = None  # первая строка, которая не поместилась
         try:
-            text = p.read_text(encoding="utf-8")
+            with p.open(encoding="utf-8") as fh:
+                for total, raw in enumerate(fh, start=1):
+                    if total < start or (end is not None and total > end):
+                        continue
+                    if stopped_at is not None:
+                        continue  # досчитываем общее число строк
+                    line = raw.rstrip("\r\n")
+                    if len(line) > MAX_LINE_CHARS:
+                        line = line[:MAX_LINE_CHARS] + " …[строка обрезана]"
+                    if len(selected) >= MAX_READ_LINES or len(line) + 1 > budget:
+                        stopped_at = total
+                        continue
+                    selected.append((total, line))
+                    budget -= len(line) + 1
         except UnicodeDecodeError as e:
             raise ToolError(f"Файл не является текстовым (UTF-8): {params.path}") from e
 
-        lines = text.splitlines()
-        start = (params.start_line or 1) - 1
-        end = params.end_line or len(lines)
-        start = max(start, 0)
-        sel = lines[start:end]
-        width = len(str(start + len(sel)))
-        numbered = "\n".join(
-            f"{str(start + i + 1).rjust(width)}\t{line}" for i, line in enumerate(sel)
-        )
-        if not sel:
-            numbered = "(пусто)"
+        if not selected:
+            numbered = "(пусто)" if total == 0 else f"(нет строк в диапазоне; всего строк: {total})"
+        else:
+            width = len(str(selected[-1][0]))
+            numbered = "\n".join(f"{str(n).rjust(width)}\t{line}" for n, line in selected)
+        if stopped_at is not None:
+            numbered += (
+                f"\n… показаны строки {selected[0][0] if selected else start}–"
+                f"{stopped_at - 1} из {total}. Продолжение: start_line={stopped_at}."
+            )
         return ToolResult(
             content=numbered,
-            summary=f"прочитан {_rel(ctx, p)} ({len(sel)} строк)",
+            summary=f"прочитан {_rel(ctx, p)} ({len(selected)} строк)",
         )
 
 

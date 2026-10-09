@@ -84,3 +84,20 @@ def test_loop_runs_tool_then_finishes(tmp_path):
     final = agent.run_turn("прочитай f.txt")
     assert final == "прочитал"
     assert provider.calls == 2
+
+
+def test_write_outside_sandbox_does_not_crash_without_auto_approve(tmp_path):
+    # Раньше SandboxError из preview() пробивал run_turn и ронял REPL.
+    root = tmp_path / "proj"
+    root.mkdir()
+    provider = ScriptedProvider(
+        [
+            _tool_turn("write_file", {"path": "../escape.txt", "content": "x"}),
+            AssistantTurn(message=Message(role="assistant", content="не вышло")),
+        ]
+    )
+    agent = _agent(provider, root, auto_approve=False)
+    assert agent.run_turn("запиши файл") == "не вышло"
+    assert not (tmp_path / "escape.txt").exists()
+    results = [m for m in agent.session.messages() if m.role == "function"]
+    assert "за пределы" in results[-1].content
