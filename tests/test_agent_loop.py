@@ -433,7 +433,7 @@ def test_session_counters(tmp_path):
     agent.run_turn("2")
     assert agent.context_tokens == 220 and agent.billed_tokens == 330
     assert events.stats[-1].duration_s >= 0
-    assert agent.config.context_budget_tokens > 0
+    assert agent.context_budget > 0
 
 
 def test_ask_user_reaches_ui_and_model(tmp_path):
@@ -468,3 +468,48 @@ def test_ask_user_without_ui_tells_model(tmp_path):
     agent = Agent(provider, build_default_registry(), cfg, AgentEvents())
     assert agent.run_turn("x") == "решу сам"
     assert "Нельзя задать вопрос" in provider.requests[-1]["messages"][-1].content
+
+
+# ------------------------------ окно контекста ------------------------------ #
+def _probe(model: str, window: int):
+    from devassist.llm.context_probe import ProbeResult
+
+    return ProbeResult(model, window, window + 1000, False, 5, window)
+
+
+def test_context_budget_follows_model_window(tmp_path):
+    from devassist.agent.context_window import DEFAULT_CONTEXT_WINDOW, budget_for_window
+    from devassist.llm.model_windows import ModelWindows
+
+    windows = ModelWindows()
+    windows.record(_probe("big", 128_000))
+    cfg = Config(access_key="x", project_root=tmp_path, stream=False, model="small")
+    agent = Agent(ScriptedProvider(), build_default_registry(), cfg, windows=windows)
+    assert agent.windows is windows
+    assert agent.context_window is None
+    assert agent.context_budget == budget_for_window(DEFAULT_CONTEXT_WINDOW)
+    agent.set_model("big")
+    assert agent.context_window == 128_000
+    assert agent.context_budget == budget_for_window(128_000) < 128_000 - 8_000
+
+    explicit = Config(access_key="x", project_root=tmp_path, context_budget_tokens=5_000)
+    agent = Agent(ScriptedProvider(), build_default_registry(), explicit, windows=windows)
+    agent.set_model("big")
+    assert agent.context_budget == 5_000
+
+
+def test_request_budget_includes_tool_schemas(tmp_path):
+    from devassist.agent.conversation import Conversation
+    from devassist.llm.types import Message, ToolSpec
+
+    conv = Conversation()
+    for i in range(20):
+        conv.add_user(f"вопрос {i} " + "x" * 1500)
+        conv.add_assistant(Message(role="assistant", content=f"ответ {i} " + "y" * 1500))
+    agent = _agent(ScriptedProvider(), tmp_path, context_budget_tokens=12_000)
+    agent.reset(conv)
+    heavy = [ToolSpec(name="t", description="d" * 15_000, parameters={})]  # ~5000 токенов
+    without = agent._build_request([])
+    with_specs = agent._build_request(heavy)
+    assert len(with_specs) < len(without) < len(conv) + 1
+    assert with_specs[-1].content.startswith("ответ 19")

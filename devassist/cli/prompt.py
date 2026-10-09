@@ -1,7 +1,8 @@
 """Строка ввода REPL на prompt_toolkit.
 
 * автодополнение слеш-команд из :class:`~devassist.cli.commands.CommandRegistry`
-  (имя + краткое описание), меню появляется при вводе ``/``;
+  (имя + краткое описание), меню появляется при вводе ``/``; аргументы команд —
+  из ``arg_choices`` (``/model`` — список моделей);
 * история ввода в ``.devassist/history`` (папка создаётся при первом сохранённом
   вводе) и подсказки из истории;
 * многострочный ввод: ``\\`` в конце строки + Enter или Alt+Enter — новая строка;
@@ -17,7 +18,7 @@ from __future__ import annotations
 
 import re
 import sys
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -41,6 +42,8 @@ if TYPE_CHECKING:  # commands импортирует KEY_HELP отсюда
 
 # Чтение строки; ``default`` — текст, которым заполнить ввод (набранный во время хода).
 InputReader = Callable[..., str]
+# Варианты аргумента команды: пары (значение, пояснение); вызывается при каждом дополнении.
+ArgChoices = Callable[[], Iterable[tuple[str, str]]]
 
 HISTORY_FILE = "history"
 PROMPT = "❯ "
@@ -60,6 +63,7 @@ KEY_HELP: tuple[tuple[str, str], ...] = (
 )
 
 _COMMAND_PREFIX_RE = re.compile(r"/[\w-]*")
+_COMMAND_ARG_RE = re.compile(r"(/[\w-]+)[ \t]+(\S*)")
 _CONTEXT_WARN = 50  # % заполнения контекста — жёлтый
 _CONTEXT_DANGER = 80  # % — красный
 
@@ -96,17 +100,38 @@ def toolbar_fragments(status: StatusInfo) -> list[tuple[str, str]]:
 
 # ------------------------------ автодополнение ----------------------------- #
 class SlashCommandCompleter(Completer):
-    """Дополняет первое слово, если это начало слеш-команды (не путь ``/home/...``)."""
+    """Дополняет первое слово, если это начало слеш-команды (не путь ``/home/...``),
+    и аргумент команды, для которой есть источник вариантов в ``arg_choices``
+    (ключ — имя команды): сначала совпадения по началу, затем по подстроке."""
 
-    def __init__(self, commands: CommandRegistry):
+    def __init__(self, commands: CommandRegistry, arg_choices: Mapping[str, ArgChoices] = {}):
         self._commands = commands
+        self._arg_choices = {name.lower(): source for name, source in arg_choices.items()}
 
     def get_completions(
         self, document: Document, complete_event: CompleteEvent
     ) -> Iterable[Completion]:
         text = document.text_before_cursor
-        if not _COMMAND_PREFIX_RE.fullmatch(text):
+        if _COMMAND_PREFIX_RE.fullmatch(text):
+            yield from self._complete_command(text)
             return
+        match = _COMMAND_ARG_RE.fullmatch(text)
+        if match is not None:
+            yield from self._complete_arg(match.group(1), match.group(2))
+
+    def _complete_arg(self, name: str, prefix: str) -> Iterable[Completion]:
+        command = self._commands.get(name)
+        source = self._arg_choices.get(command.name.lower()) if command is not None else None
+        if source is None:
+            return
+        needle = prefix.lower()
+        choices = list(source())
+        starts = [c for c in choices if c[0].lower().startswith(needle)]
+        inside = [c for c in choices if needle in c[0].lower() and c not in starts]
+        for value, meta in starts + inside:
+            yield Completion(value, start_position=-len(prefix), display_meta=meta)
+
+    def _complete_command(self, text: str) -> Iterable[Completion]:
         prefix = text.lower()
         for cmd in self._commands:
             for name in (cmd.name, *cmd.aliases):
@@ -178,6 +203,7 @@ def create_prompt_session(
     workspace: Workspace,
     status: Callable[[], StatusInfo],
     no_color: bool = False,
+    arg_choices: Mapping[str, ArgChoices] = {},
     **kwargs: Any,
 ) -> PromptSession[str]:
     """Сессия ввода. ``kwargs`` (``input``/``output``) подменяются в тестах."""
@@ -190,7 +216,7 @@ def create_prompt_session(
         message=[("class:prompt", PROMPT)],
         history=LazyFileHistory(workspace),
         auto_suggest=AutoSuggestFromHistory(),
-        completer=SlashCommandCompleter(commands),
+        completer=SlashCommandCompleter(commands, arg_choices),
         complete_while_typing=_typing_command,
         reserve_space_for_menu=min(8, len(list(commands)) + 1),
         key_bindings=_key_bindings(),
@@ -215,13 +241,18 @@ def make_input_reader(
     workspace: Workspace,
     status: Callable[[], StatusInfo],
     no_color: bool = False,
+    arg_choices: Mapping[str, ArgChoices] = {},
 ) -> InputReader:
     """Функция чтения строки: prompt_toolkit в терминале, иначе ``input()``."""
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         return _read_plain
     try:
         session = create_prompt_session(
-            commands=commands, workspace=workspace, status=status, no_color=no_color
+            commands=commands,
+            workspace=workspace,
+            status=status,
+            no_color=no_color,
+            arg_choices=arg_choices,
         )
     except Exception:  # терминал не поддерживается (например, mintty без консоли)
         return _read_plain

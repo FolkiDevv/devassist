@@ -46,6 +46,39 @@ def test_no_completion_outside_command_name(text):
     assert _complete(text) == []
 
 
+def _complete_args(text: str) -> list[tuple[str, str]]:
+    models = [
+        ("GigaChat-2-Max", "текущая · окно 128k"),
+        ("GigaChat-2-Pro", "окно не замерено"),
+        ("Qwen-Max", "окно 32k"),
+    ]
+    completer = SlashCommandCompleter(default_commands(), {"/model": lambda: models})
+    return [
+        (c.text, c.display_meta_text)
+        for c in completer.get_completions(Document(text), CompleteEvent())
+    ]
+
+
+def test_completes_model_argument():
+    assert [name for name, _ in _complete_args("/model ")] == [
+        "GigaChat-2-Max",
+        "GigaChat-2-Pro",
+        "Qwen-Max",
+    ]
+    assert _complete_args("/model giga") == [
+        ("GigaChat-2-Max", "текущая · окно 128k"),
+        ("GigaChat-2-Pro", "окно не замерено"),
+    ]
+    # сначала совпадения по началу, затем по подстроке
+    assert [name for name, _ in _complete_args("/MODEL max")] == ["GigaChat-2-Max", "Qwen-Max"]
+    assert _complete_args("/model Qwen-Max") == [("Qwen-Max", "окно 32k")]
+
+
+@pytest.mark.parametrize("text", ["/model", "/model a b", "/help ", "/nope Giga", "x /model "])
+def test_no_model_completion_elsewhere(text):
+    assert [name for name, _ in _complete_args(text)] == (["/model"] if text == "/model" else [])
+
+
 def test_history_creates_data_dir_lazily(tmp_path):
     ws = Workspace(tmp_path)
     history = LazyFileHistory(ws)

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pytest
-from fakes import ScriptedProvider, text_turn, tool_turn
+from fakes import ScriptedProvider, WindowProvider, text_turn, tool_turn
 
 import devassist.cli.app as app
 from devassist.agent.chat_store import ChatRecorder, ChatStore
@@ -195,7 +195,7 @@ def test_repl_status_and_auto_approve_banner(cli_env, capsys):
     agent, ui, commands, _, _ = cli_env  # cli_env собран с auto_approve=True
     status = status_of(agent)
     assert status.model == agent.model and status.auto_approve is True
-    assert status.context_budget == agent.config.context_budget_tokens
+    assert status.context_budget == agent.context_budget
     assert run_repl(agent, ui, commands, read_input=_reader("/exit")) == 0
     assert "авто-подтверждение" in _out(capsys)
 
@@ -546,3 +546,152 @@ def test_index_command(cli_env, capsys):
     assert "добавлено 1" in _out(capsys)
     commands.dispatch("/index что-то", ctx)
     assert "использование: /index [rebuild]" in _out(capsys)
+
+
+# ------------------------- модели и окно контекста ------------------------- #
+def _models_json(home):
+    import json
+
+    path = home / ".devassist" / "models.json"
+    return json.loads(path.read_text(encoding="utf-8"))["models"] if path.exists() else {}
+
+
+def test_test_context_measures_and_saves(tmp_path, oneshot, capsys, _isolated_home):
+    provider = WindowProvider(32_768)
+    oneshot(provider)
+    assert _main(tmp_path, "--test-context", "Qwen-32B") == 0
+    out = capsys.readouterr().out
+    assert "отказ (422)" in out and "прошло" in out and "окно Qwen-32B:" in out
+    entry = _models_json(_isolated_home)["Qwen-32B"]
+    assert 32_000 <= entry["context_window"] <= 32_768
+    assert {model for model, _ in provider.measured} == {"Qwen-32B"}
+
+
+def test_test_context_errors(tmp_path, oneshot, capsys, _isolated_home):
+    from devassist.llm.base import LLMError
+
+    oneshot(ScriptedProvider())
+    assert _main(tmp_path, "--test-context", "M") == 1
+    assert "не поддерживает" in capsys.readouterr().out
+    oneshot(WindowProvider(32_768, error=LLMError("нет такой модели")))
+    assert _main(tmp_path, "--test-context", "M") == 2
+    assert "не удалось замерить окно M" in capsys.readouterr().out
+    oneshot(WindowProvider(32_768, error=KeyboardInterrupt()))
+    assert _main(tmp_path, "--test-context", "M") == 130
+    assert _models_json(_isolated_home) == {}
+
+
+def test_oneshot_measures_unknown_window_once(tmp_path, oneshot, capsys, monkeypatch):
+    provider = WindowProvider(8_192, [text_turn("ok")])
+    oneshot(provider)
+    assert _main(tmp_path, "-m", "M1", "-p", "x") == 0
+    assert "не замерено — замеряю" in capsys.readouterr().out and provider.measured
+    provider = WindowProvider(8_192, [text_turn("ok")])
+    oneshot(provider)
+    assert _main(tmp_path, "-m", "M1", "-p", "x") == 0  # окно уже в ~/.devassist
+    assert provider.measured == [] and "замеряю" not in capsys.readouterr().out
+    monkeypatch.setenv("DEVASSIST_CONTEXT_TOKENS", "8000")  # явный бюджет — замер не нужен
+    oneshot(provider)
+    assert _main(tmp_path, "-m", "M2", "-p", "x") == 0
+    assert provider.measured == []
+
+
+def test_failed_measurement_falls_back(tmp_path, oneshot, capsys, _isolated_home):
+    from devassist.llm.base import LLMError
+
+    oneshot(WindowProvider(8_192, [text_turn("ok")], error=LLMError("сбой")))
+    assert _main(tmp_path, "-m", "M1", "-p", "x") == 0
+    out = capsys.readouterr().out
+    assert "не удалось замерить окно M1" in out and "пока считаем окно M1 равным 32k" in out
+    assert _models_json(_isolated_home) == {}
+
+
+@pytest.fixture
+def window_env(tmp_path, capsys):
+    cfg = Config(access_key="x", project_root=tmp_path, stream=False, auto_approve=True)
+    provider = WindowProvider(16_384, [text_turn("ответ")])
+    ui = Console(no_color=True)
+    agent = Agent(provider, build_default_registry(), cfg, ui)
+    commands = default_commands()
+    ctx = CommandContext(
+        agent=agent, ui=ui, commands=commands, chats=ChatRecorder(ChatStore(agent.workspace))
+    )
+    return agent, commands, ctx, provider
+
+
+def test_model_command_measures_and_saves_chat(window_env, capsys):
+    agent, commands, ctx, provider = window_env
+    agent.run_turn("вопрос")
+    commands.dispatch("/model Qwen-14B", ctx)
+    assert agent.model == "Qwen-14B" and 16_000 <= agent.context_window <= 16_384
+    assert {model for model, _ in provider.measured} == {"Qwen-14B"}
+    (chat,) = ctx.chats.store.recent()
+    assert chat.model == "Qwen-14B"  # смена модели сохранена без нового хода
+    provider.measured.clear()
+    commands.dispatch("/model GigaChat-3-Ultra", ctx)
+    commands.dispatch("/model Qwen-14B", ctx)  # уже замерена
+    assert {model for model, _ in provider.measured} == {"GigaChat-3-Ultra"}
+
+
+def test_model_command_lists_catalog(window_env, capsys, monkeypatch):
+    from devassist.cli.models import ModelCatalog
+
+    agent, commands, ctx, provider = window_env
+    monkeypatch.setattr(provider, "list_models", lambda: ["GigaChat-3-Ultra", "Qwen-14B"])
+    ctx.models = ModelCatalog(provider)
+    ctx.models.start()
+    ctx.models._thread.join(5)
+    assert ctx.models.choices(agent.windows, agent.model) == [
+        ("GigaChat-3-Ultra", "текущая · окно не замерено"),
+        ("Qwen-14B", "окно не замерено"),
+    ]
+    commands.dispatch("/model", ctx)
+    out = _out(capsys)
+    assert "доступные модели" in out and "• Qwen-14B — окно не замерено" in out
+    commands.dispatch("/model Unknown", ctx)
+    assert "нет в списке доступных" in _out(capsys)
+
+
+def test_model_catalog_swallows_errors():
+    from devassist.cli.models import ModelCatalog
+    from devassist.llm.base import LLMError
+
+    provider = ScriptedProvider()
+
+    def boom():
+        raise LLMError("сеть")
+
+    provider.list_models = boom
+    catalog = ModelCatalog(provider)
+    assert catalog.models is None
+    assert catalog.load() == [] and catalog.models == []
+
+
+def test_resume_restores_chat_model(repl_env, capsys):
+    agent, _, commands, ctx, provider = repl_env
+    provider._turns = [text_turn("старый ответ"), text_turn("ещё")]
+    agent.set_model("M-old")
+    agent.run_turn("старый вопрос")
+    ctx.chats.save(agent.conversation, model=agent.model)
+    old_id = ctx.chats.chat_id
+    commands.dispatch("/clear", ctx)
+    commands.dispatch("/model M-new", ctx)
+    commands.dispatch(f"/resume {old_id}", ctx)
+    assert agent.model == "M-old" and "модель чата: M-old" in _out(capsys)
+    agent.run_turn("ещё")
+    assert provider.requests[-1]["model"] == "M-old"
+
+
+def test_continue_restores_model_unless_overridden(tmp_path, oneshot):
+    oneshot(ScriptedProvider([text_turn("a")]))
+    assert _main(tmp_path, "-m", "M-chat", "-p", "первый") == 0
+    provider = ScriptedProvider([text_turn("b")])
+    oneshot(provider)
+    assert _main(tmp_path, "-c", "-p", "второй") == 0
+    assert provider.requests[-1]["model"] == "M-chat"
+    provider = ScriptedProvider([text_turn("c")])
+    oneshot(provider)
+    assert _main(tmp_path, "-c", "-m", "M-cli", "-p", "третий") == 0
+    assert provider.requests[-1]["model"] == "M-cli"
+    (chat,) = _store(tmp_path).recent()
+    assert chat.model == "M-cli"
