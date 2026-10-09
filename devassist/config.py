@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import os
+import re
 import ssl
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -53,10 +54,22 @@ def read_dotenv(path: Path) -> dict[str, str]:
         key = key.strip()
         if key.startswith("export "):
             key = key[len("export ") :].strip()
-        value = value.strip().strip('"').strip("'")
         if key:
-            values[key] = value
+            values[key] = _dotenv_value(value)
     return values
+
+
+_INLINE_COMMENT_RE = re.compile(r"\s#")
+
+
+def _dotenv_value(raw: str) -> str:
+    """Значение из .env: в кавычках — до парной закрывающей (остальное — комментарий),
+    без кавычек — до « #» (``MODEL=GigaChat-2-Max # быстрая``)."""
+    value = raw.strip()
+    if value[:1] in ("'", '"'):
+        end = value.find(value[0], 1)
+        return value[1:end] if end != -1 else value
+    return _INLINE_COMMENT_RE.split(value, maxsplit=1)[0].rstrip()
 
 
 def load_environment(

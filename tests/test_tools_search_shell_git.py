@@ -46,8 +46,9 @@ def test_search_skips_ignored_binary_large_and_secrets(ctx):
     (ctx.root / "big.txt").write_text("needle\n" * 200_000, encoding="utf-8")
     s = SearchContentTool()
     out = s.run(s.parse({"pattern": "needle"}), ctx).content
-    files = sorted({line.split(":", 1)[0] for line in out.splitlines()})
+    files = sorted({ln.split(":", 1)[0] for ln in out.splitlines() if not ln.startswith("…")})
     assert files == [".env.example", "src/a.py"]
+    assert "пропущено больших файлов (>1 МБ): 1" in out  # модель знает, где не искали
 
 
 def test_search_glob_with_path(ctx):
@@ -263,3 +264,18 @@ def test_git_describe_quotes_arguments():
     params = g.parse({"subcommand": "commit", "args": ["-m", "fix bug"]})
     assert g.describe(params) == "commit -m 'fix bug'"
     assert g.preview(params, None).text == "$ git commit -m 'fix bug'"
+
+
+def test_search_limit_note_only_when_more_matches(ctx):
+    _write(ctx, "a.txt", "hit\n" * 3)
+    s = SearchContentTool()
+    exact = s.run(s.parse({"pattern": "hit", "max_results": 3}), ctx).content
+    assert "показаны первые" not in exact and exact.count("a.txt:") == 3
+    more = s.run(s.parse({"pattern": "hit", "max_results": 2}), ctx).content
+    assert more.count("a.txt:") == 2 and "показаны первые 2 совпадений" in more
+
+
+def test_search_line_numbers_match_read_file(ctx):
+    _write(ctx, "f.txt", "a\x0cb\nneedle\n")
+    s = SearchContentTool()
+    assert s.run(s.parse({"pattern": "needle"}), ctx).content == "f.txt:2:needle"

@@ -23,6 +23,24 @@ def test_read_dotenv_parses_quotes_comments_export(tmp_path):
     assert read_dotenv(tmp_path / "missing.env") == {}
 
 
+def test_read_dotenv_inline_comments_and_quotes(tmp_path):
+    (tmp_path / ".env").write_text(
+        "MODEL=GigaChat-2-Max # быстрая\n"
+        'Q="x # не комментарий" # а это — да\n'
+        "S='it''s'\n"
+        "URL=https://h/a#b\n"
+        'OPEN="без закрывающей\n',
+        encoding="utf-8",
+    )
+    assert read_dotenv(tmp_path / ".env") == {
+        "MODEL": "GigaChat-2-Max",
+        "Q": "x # не комментарий",
+        "S": "it",
+        "URL": "https://h/a#b",
+        "OPEN": '"без закрывающей',
+    }
+
+
 def test_priority_environ_over_root_over_cwd(tmp_path):
     root, cwd = tmp_path / "proj", tmp_path / "cwd"
     _env_file(root, "GIGACHAT_MODEL=from-root\nGIGACHAT_SCOPE=root-scope\n")

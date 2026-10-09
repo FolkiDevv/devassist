@@ -56,6 +56,7 @@ class SearchContentTool(Tool):
         files = walk_files(ctx.root, base) if walking else [base]
         matches: list[str] = []
         scanned = skipped = 0
+        more = False  # совпадений больше лимита
         for f in files:
             rel = f.relative_to(ctx.root).as_posix()
             if params.glob and not glob_match(rel, params.glob):
@@ -77,17 +78,26 @@ class SearchContentTool(Tool):
                 continue
             scanned += 1
             text = data.decode("utf-8", errors="replace")
-            for i, line in enumerate(text.splitlines(), start=1):
+            # Строки — как у read_file (\n, \r\n, \r), а не str.splitlines: тот режет
+            # ещё и по \x0c, \x85, \u2028, и номера строк расходились бы.
+            lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+            for i, line in enumerate(lines, start=1):
                 if regex.search(line):
-                    matches.append(f"{rel}:{i}:{line.strip()[:_MAX_SNIPPET]}")
                     if len(matches) >= limit:
+                        more = True
                         break
-            if len(matches) >= limit:
+                    matches.append(f"{rel}:{i}:{line.strip()[:_MAX_SNIPPET]}")
+            if more:
                 break
 
         body = "\n".join(matches) if matches else "(совпадений не найдено)"
-        if len(matches) >= limit:
-            body += f"\n… достигнут лимит {limit} совпадений; уточните запрос"
+        if more:
+            body += f"\n… показаны первые {limit} совпадений; уточните запрос"
+        if skipped:
+            body += (
+                f"\n… пропущено больших файлов (>{_MAX_FILE_BYTES // 1_000_000} МБ): {skipped} "
+                "— в них ищите через run_shell (grep)"
+            )
         summary = f"совпадений: {len(matches)} (файлов просмотрено: {scanned})"
         if skipped:
             summary += f", пропущено больших файлов: {skipped}"
