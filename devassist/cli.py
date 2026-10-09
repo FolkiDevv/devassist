@@ -15,7 +15,8 @@ from pathlib import Path
 from devassist import __version__
 from devassist.agent.loop import Agent
 from devassist.config import Config
-from devassist.llm.gigachat import GigaChatError, GigaChatProvider
+from devassist.llm.base import LLMError
+from devassist.llm.gigachat import GigaChatProvider
 from devassist.tools.base import build_default_registry
 from devassist.ui.console import Console
 
@@ -52,7 +53,7 @@ def _make_provider(config: Config) -> GigaChatProvider:
 def run_oneshot(agent: Agent, ui: Console, prompt: str) -> int:
     try:
         agent.run_turn(prompt)
-    except GigaChatError as e:
+    except LLMError as e:
         ui.error(str(e))
         return 2
     return 0
@@ -92,7 +93,7 @@ def run_repl(agent: Agent, ui: Console, config: Config) -> int:
             ui.print()
             agent.run_turn(line)
             ui.print()
-        except GigaChatError as e:
+        except LLMError as e:
             ui.error(str(e))
         except KeyboardInterrupt:
             ui.system("\n(прервано)")

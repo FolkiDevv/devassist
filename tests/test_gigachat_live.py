@@ -33,7 +33,7 @@ def test_simple_completion(provider):
     )
     assert turn.finish_reason == "stop"
     assert "Москва" in turn.message.content
-    assert turn.usage.get("total_tokens", 0) > 0
+    assert turn.usage.total_tokens > 0
 
 
 def test_models_listing(provider):

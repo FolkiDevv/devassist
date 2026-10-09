@@ -59,7 +59,7 @@ class Agent:
             turn = self._next_turn(specs)
             msg = turn.message
             self._session.add_assistant(msg)
-            total_tokens += int(turn.usage.get("total_tokens", 0) or 0)
+            total_tokens += turn.usage.total_tokens
 
             if not turn.wants_tool:
                 final_text = msg.content
