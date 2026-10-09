@@ -100,13 +100,28 @@ class ProcessResult:
 
 
 def _kill_group(proc: subprocess.Popen) -> None:
+    """Убивает процесс вместе со всеми потомками."""
     try:
         if os.name == "posix":
             os.killpg(proc.pid, signal.SIGKILL)
-        else:
-            proc.kill()
-    except (ProcessLookupError, PermissionError, OSError):
+            return
+        # Windows: proc.kill() завершает только оболочку, потомки остались бы
+        # жить. taskkill /T убивает всё дерево процессов.
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            check=False,
+        )
+    except (ProcessLookupError, PermissionError, OSError, subprocess.TimeoutExpired):
         pass
+    if os.name != "posix":
+        try:
+            proc.kill()  # на случай, если taskkill недоступен
+        except OSError:
+            pass
 
 
 def _pump(stream, capture: _Capture) -> None:

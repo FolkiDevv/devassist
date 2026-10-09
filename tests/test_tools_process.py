@@ -279,3 +279,21 @@ def test_read_fifo_rejected(ctx):
     os.mkfifo(ctx.root / "pipe")
     with pytest.raises(ToolError):
         _read(ctx, path="pipe")
+
+
+def test_kill_group_on_windows_kills_tree(monkeypatch):
+    from devassist.tools import process
+
+    calls = []
+
+    class FakeProc:
+        pid = 4242
+
+        def kill(self):
+            calls.append("kill")
+
+    monkeypatch.setattr(process.os, "name", "nt")
+    monkeypatch.setattr(process.subprocess, "run", lambda cmd, **kw: calls.append(cmd))
+    process._kill_group(FakeProc())
+    assert calls[0] == ["taskkill", "/F", "/T", "/PID", "4242"]
+    assert calls[-1] == "kill"
