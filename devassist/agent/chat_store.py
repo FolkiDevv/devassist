@@ -101,8 +101,11 @@ class ChatStore:
     # ------------------------------------------------------------------ #
     @staticmethod
     def new_id(now: datetime | None = None) -> str:
-        """Id сортируется по времени создания; суффикс — от коллизий двух сессий."""
-        return f"{(now or _now()):%Y%m%d-%H%M%S}-{secrets.token_hex(2)}"
+        """Id сортируется по времени создания; суффикс — от коллизий чатов одной секунды."""
+        return f"{(now or _now()):%Y%m%d-%H%M%S}-{secrets.token_hex(4)}"
+
+    def exists(self, chat_id: str) -> bool:
+        return self._path(chat_id).exists()
 
     def _path(self, chat_id: str) -> Path:
         if not _ID_RE.match(chat_id):
@@ -275,6 +278,11 @@ class ChatRecorder:
         if not self.enabled or not any(m.role == "user" for m in conversation.messages):
             return None
         try:
+            if self._created_at is None:
+                # Первая запись нового чата: id не должен затереть чужой чат
+                # (другое окно devassist, начатое в ту же секунду).
+                while self.store.exists(self._chat_id):
+                    self._chat_id = self.store.new_id()
             info = self.store.save(
                 self._chat_id, conversation, model=model, created_at=self._created_at
             )

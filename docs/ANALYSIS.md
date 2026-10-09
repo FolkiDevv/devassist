@@ -207,8 +207,9 @@ tools.base`; `agent → llm, tools, project`; `tools → project, security, erro
 - **Хранилище** — `agent/chat_store.py` (ядро, без UI). Файл на чат:
   `.devassist/chats/<id>.json` = метаданные (`title` — первый запрос, `created_at`,
   `updated_at`, `model`, `requests`, `preview` — начало последнего ответа) +
-  `Conversation.to_dict()`; у обёртки своя `version`. Id `YYYYMMDD-HHMMSS-<4 hex>`:
-  сортируется по времени, суффикс исключает коллизии двух сессий. Запись атомарная
+  `Conversation.to_dict()`; у обёртки своя `version`. Id `YYYYMMDD-HHMMSS-<8 hex>`:
+  сортируется по времени; если при первой записи нового чата файл с таким id уже
+  есть (другое окно в ту же секунду), id выбирается заново. Запись атомарная
   (`mkstemp` в том же каталоге → `os.replace`), права 0600. `recent()` отбирает
   файлы по mtime и разбирает только верх списка, битые файлы и чужие версии
   пропускает; `find()` — по id или однозначному префиксу; `load()` делает `repair()`.

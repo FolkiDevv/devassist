@@ -201,6 +201,23 @@ def test_recorder_new_and_switch(store):
     assert len(store.recent()) == 1
 
 
+def test_recorder_never_overwrites_another_new_chat(store, monkeypatch):
+    first = ChatRecorder(store)
+    first.save(_conv("первый"))
+    ids = iter([first.chat_id, first.chat_id, "20260101-000000-ffffffff"])
+    monkeypatch.setattr(store, "new_id", lambda now=None: next(ids))
+    second = ChatRecorder(store)  # тот же id, что у первого
+    assert second.chat_id == first.chat_id
+    second.save(_conv("второй"))
+    assert second.chat_id == "20260101-000000-ffffffff"
+    assert store.load(first.chat_id).info.title == "первый"
+    # продолженный чат по-прежнему дописывается в свой файл
+    second.switch_to(store.load(first.chat_id).info)
+    second.save(_conv("первый", answer="дописано"))
+    assert second.chat_id == first.chat_id
+    assert store.load(first.chat_id).info.preview == "дописано"
+
+
 def test_recorder_disabled(store):
     rec = ChatRecorder(store, enabled=False)
     rec.save(_conv())
