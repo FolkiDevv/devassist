@@ -6,9 +6,14 @@ import os
 
 import pytest
 
-from devassist.agent.prompts import build_system_prompt
+from devassist.agent.prompts import SYSTEM_PROMPT, build_system_prompt, nested_instructions_prompt
 from devassist.project.files import build_file_tree, glob_match, walk_files
-from devassist.project.instructions import load_instructions
+from devassist.project.instructions import (
+    INSTRUCTION_FILES,
+    InstructionFile,
+    NestedInstructions,
+    load_instructions,
+)
 from devassist.project.workspace import Workspace
 
 
@@ -106,6 +111,94 @@ def test_load_instructions_order_and_truncation(tmp_path):
 def test_load_instructions_missing_and_empty(tmp_path):
     (tmp_path / "DEVASSIST.md").write_text("   \n", encoding="utf-8")
     assert load_instructions(tmp_path) == []
+
+
+def test_instruction_files_in_priority_order(tmp_path):
+    for name, text in [
+        ("DEVASSIST.local.md", "личное"),
+        ("DEVASSIST.md", "свои правила"),
+        ("GIGACODE.md", "для GigaCode"),
+        ("AGENTS.md", "для всех агентов"),
+    ]:
+        (tmp_path / name).write_text(text, encoding="utf-8")
+    docs = load_instructions(tmp_path)
+    assert [d.name for d in docs] == list(INSTRUCTION_FILES)
+    assert INSTRUCTION_FILES[:2] == ("AGENTS.md", "GIGACODE.md")
+    prompt = build_system_prompt(Workspace(tmp_path))
+    positions = [prompt.index(text) for text in ("для всех", "для GigaCode", "свои", "личное")]
+    assert positions == sorted(positions)
+    for name in INSTRUCTION_FILES:  # правило приоритета называет все файлы
+        assert name in SYSTEM_PROMPT
+
+
+def test_instruction_symlink_counted_once(tmp_path):
+    (tmp_path / "AGENTS.md").write_text("общие правила", encoding="utf-8")
+    try:
+        (tmp_path / "DEVASSIST.md").symlink_to("AGENTS.md")
+    except OSError:
+        pytest.skip("симлинки недоступны")
+    assert [d.name for d in load_instructions(tmp_path)] == ["AGENTS.md"]
+
+
+def test_instruction_total_limit_prefers_higher_priority(tmp_path):
+    (tmp_path / "AGENTS.md").write_text("a" * 50, encoding="utf-8")
+    (tmp_path / "DEVASSIST.md").write_text("d" * 50, encoding="utf-8")
+    agents, own = load_instructions(tmp_path, max_total=70)
+    assert own.content == "d" * 50 and not own.truncated
+    assert agents.content == "a" * 20 and agents.truncated
+
+
+def test_oversized_instructions_point_to_file(tmp_path):
+    for name in ("AGENTS.md", "DEVASSIST.md", "DEVASSIST.local.md"):
+        (tmp_path / name).write_text(name[0] * 25_000, encoding="utf-8")
+    agents, own, local = load_instructions(tmp_path)  # 20K на файл, 30K на все
+    assert (len(local.content), len(own.content), agents.content) == (20_000, 10_000, "")
+    prompt = build_system_prompt(Workspace(tmp_path))
+    assert "(AGENTS.md): не поместились в контекст" in prompt
+    assert "(DEVASSIST.md) (обрезано — полностью: read_file)" in prompt
+
+
+# ------------------------- инструкции подкаталогов ------------------------- #
+def test_nested_instructions_found_outside_in_once(tmp_path):
+    _make(tmp_path, "AGENTS.md", "корень")
+    _make(tmp_path, "pkg/AGENTS.md", "пакет")
+    _make(tmp_path, "pkg/api/GIGACODE.md", "api")
+    _make(tmp_path, "pkg/api/handlers.py")
+    nested = NestedInstructions(tmp_path)
+    found = nested.add_paths(["pkg/api/handlers.py"])
+    assert [(d.name, d.content) for d in found] == [
+        ("pkg/AGENTS.md", "пакет"),
+        ("pkg/api/GIGACODE.md", "api"),
+    ]
+    assert nested.add_paths(["pkg/api", "pkg/api/handlers.py", "pkg"]) == []  # уже проверены
+    assert len(nested.files) == 2
+    nested.reset()
+    assert nested.files == () and len(nested.add_paths(["pkg/api"])) == 2  # каталог как путь
+
+
+def test_nested_instructions_skip_ignored_dirs_and_outside_paths(tmp_path):
+    _make(tmp_path, ".gitignore", "build/\nDEVASSIST.local.md\n")
+    _make(tmp_path, "node_modules/lib/AGENTS.md", "чужое")
+    _make(tmp_path, "build/AGENTS.md", "сгенерировано")
+    _make(tmp_path, ".devassist/AGENTS.md", "служебное")
+    _make(tmp_path, "src/DEVASSIST.local.md", "моё")  # сам файл в .gitignore — не важно
+    nested = NestedInstructions(tmp_path)
+    found = nested.add_paths(
+        ["node_modules/lib/x.js", "build/out.js", ".devassist/x", "../x", "/etc/passwd", "", "src"]
+    )
+    assert [d.name for d in found] == ["src/DEVASSIST.local.md"]
+    assert nested.add_paths(["README.md", "."]) == []  # корень — уже в системном промпте
+
+
+def test_nested_instructions_prompt_limits(tmp_path):
+    assert nested_instructions_prompt([]) == ""
+    docs = [
+        InstructionFile("a/AGENTS.md", "правило a"),
+        InstructionFile("b/AGENTS.md", "b" * 30_000),
+    ]
+    prompt = nested_instructions_prompt(docs)
+    assert "Инструкции каталога a (a/AGENTS.md):\nправило a" in prompt
+    assert "bbbb" not in prompt and "Не поместились" in prompt and "b/AGENTS.md" in prompt
 
 
 def test_system_prompt_contains_project_context(tmp_path):

@@ -13,25 +13,36 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 
 from pydantic import BaseModel
 
+from devassist.agent.compaction import CompactionError, plan_compaction, summarize
 from devassist.agent.context_window import (
+    CHARS_PER_TOKEN,
     DEFAULT_CONTEXT_WINDOW,
+    MIN_HISTORY_TOKENS,
     budget_for_window,
     estimate_specs_tokens,
+    estimate_text_tokens,
     estimate_tokens,
     fit_history,
 )
-from devassist.agent.conversation import Conversation
-from devassist.agent.events import AgentEvents, ToolCallInfo, TurnStats
+from devassist.agent.conversation import Conversation, Summary
+from devassist.agent.events import AgentEvents, CompactResult, ToolCallInfo, TurnStats
 from devassist.agent.guard import CallCheck, LoopGuard, ToolOutcome
-from devassist.agent.prompts import build_system_prompt, mode_prompt
+from devassist.agent.prompts import (
+    build_system_prompt,
+    mode_prompt,
+    nested_instructions_prompt,
+    summary_prompt,
+)
 from devassist.config import Config
-from devassist.llm.base import LLMProvider
+from devassist.llm.base import LLMError, LLMProvider
 from devassist.llm.model_windows import ModelWindows
-from devassist.llm.types import AssistantTurn, Message, ToolSpec
+from devassist.llm.types import AssistantTurn, Message, ToolSpec, Usage
 from devassist.permissions import Decision, PermissionMode, decide, next_mode
+from devassist.project.instructions import NestedInstructions
 from devassist.project.workspace import Workspace
 from devassist.security import RiskLevel
 from devassist.tools.base import Tool, ToolContext, ToolError, ToolRegistry, ToolResult
@@ -52,6 +63,15 @@ PLAN_BLOCKED_NOTE = (
     "вносить их: опиши нужные изменения в плане и передай его пользователю "
     "инструментом exit_plan_mode."
 )
+
+
+# Сжатие контекста — доли бюджета истории (бюджет запроса за вычетом системного
+# промпта и схем инструментов).
+COMPACT_KEEP_SHARE = 0.25  # свежие сообщения, остающиеся дословно
+COMPACT_MIN_SHARE = 0.2  # меньше — сжимать не стоит запроса к модели
+SUMMARY_SHARE = 0.15  # предел краткого содержания
+MAX_SUMMARY_CHARS = 12_000
+MIN_SUMMARY_CHARS = 1_000
 
 
 def _with_note(content: str, note: str | None) -> str:
@@ -95,7 +115,11 @@ class Agent:
         self._mode = config.mode
         self._windows = ModelWindows() if windows is None else windows
         self._system_prompt: str | None = None  # строится лениво, сбрасывается в reset()
+        # Инструкции подкаталогов, с которыми агент работал в этом диалоге.
+        self._nested = NestedInstructions(self._workspace.root)
         self._billed_tokens = 0  # потрачено за сессию (reset() не сбрасывает)
+        # Оценка контекста после сжатия — пока модель не сообщит настоящий размер.
+        self._compacted_tokens = 0
 
     # ------------------------------------------------------------------ #
     @property
@@ -120,9 +144,23 @@ class Agent:
 
     @property
     def context_tokens(self) -> int:
-        """Размер контекста по последнему обращению к модели (0 — диалог пуст)."""
+        """Размер контекста по последнему обращению к модели (0 — диалог пуст).
+
+        После сжатия (и при продолжении сжатого чата) — оценка: настоящий размер
+        станет известен со следующим запросом. Считается один раз — свойство
+        читается при каждой перерисовке статус-строки.
+        """
         usage = self._conversation.last_usage
-        return usage.prompt_tokens + usage.completion_tokens if usage else 0
+        if usage is not None:
+            return usage.prompt_tokens + usage.completion_tokens
+        if self._conversation.summary is None:
+            return 0
+        if not self._compacted_tokens:
+            specs = self._registry.specs()
+            self._compacted_tokens = self._overhead_tokens(specs) + self._history_tokens(
+                self._conversation
+            )
+        return self._compacted_tokens
 
     @property
     def provider(self) -> LLMProvider:
@@ -172,6 +210,8 @@ class Agent:
         """
         self._conversation = Conversation() if conversation is None else conversation
         self._system_prompt = None
+        self._nested.reset()
+        self._compacted_tokens = 0
 
     # ------------------------------------------------------------------ #
     def run_turn(self, user_input: str) -> str:
@@ -197,11 +237,14 @@ class Agent:
         stats = TurnStats()
         started = time.monotonic()
         final_text = ""
+        compact_failed = False  # не удалось — до конца хода не пытаемся снова
 
         while True:
             stop = guard.before_step()
             if stop is None:
                 stats.steps = guard.steps
+                if self._cfg.auto_compact and not compact_failed:
+                    compact_failed = not self._auto_compact(specs, stats)
                 turn = self._next_turn(specs)
                 msg = turn.message
                 self._conversation.add_assistant(msg, turn.usage)
@@ -248,20 +291,146 @@ class Agent:
             self._system_prompt = build_system_prompt(self._workspace)
         return self._system_prompt
 
+    def _system_text(self) -> str:
+        """Системное сообщение без краткого содержания: промпт, инструкции
+        подкаталогов, правила режима."""
+        parts = [
+            self.system_prompt(),
+            nested_instructions_prompt(self._nested.files),
+            mode_prompt(self._mode),
+        ]
+        return "\n\n".join(part for part in parts if part)
+
+    def _overhead_tokens(self, specs: list[ToolSpec]) -> int:
+        """Системное сообщение и схемы инструментов (уходят в каждом запросе)."""
+        system = Message(role="system", content=self._system_text())
+        return estimate_tokens([system]) + estimate_specs_tokens(specs)
+
+    def _history_budget(self, specs: list[ToolSpec]) -> int:
+        """Бюджет истории: бюджет запроса за вычетом системного сообщения и схем."""
+        return max(self.context_budget - self._overhead_tokens(specs), MIN_HISTORY_TOKENS)
+
+    @staticmethod
+    def _history_tokens(conversation: Conversation) -> int:
+        """История, которую видит модель: краткое содержание + сообщения после него."""
+        size = estimate_tokens(conversation.context_messages())
+        if conversation.summary is not None:
+            size += estimate_text_tokens(summary_prompt(conversation.summary.text))
+        return size
+
     def _build_request(self, specs: list[ToolSpec]) -> list[Message]:
         """Сообщения для модели: системный промпт + история в пределах бюджета.
 
-        Единственная точка сборки запроса — сюда встраивается сжатие контекста.
+        Единственная точка сборки запроса. Краткое содержание сжатого начала диалога
+        дописывается к системному сообщению (GigaChat принимает одно системное
+        сообщение — первым); история — сообщения после него, а если и они не
+        укладываются в бюджет, старые отбрасываются (:func:`fit_history`).
         """
-        system_text = self.system_prompt()
-        note = mode_prompt(self._mode)
-        if note:
-            system_text = f"{system_text}\n\n{note}"
+        system_text = self._system_text()
+        summary = self._conversation.summary
+        if summary is not None:
+            system_text = f"{system_text}\n\n{summary_prompt(summary.text)}"
         system = Message(role="system", content=system_text)
         # Схемы инструментов уходят в каждом запросе и занимают то же окно.
         used = estimate_tokens([system]) + estimate_specs_tokens(specs)
-        budget = max(self.context_budget - used, 1_000)
-        return [system, *fit_history(self._conversation.messages, budget)]
+        budget = max(self.context_budget - used, MIN_HISTORY_TOKENS)
+        return [system, *fit_history(self._conversation.context_messages(), budget)]
+
+    # ------------------------------------------------------------------ #
+    def compact(self, instructions: str = "") -> CompactResult | None:
+        """Сжать весь диалог в краткое содержание (команда ``/compact``).
+
+        ``instructions`` — пожелания пользователя к резюме. None — сжимать нечего.
+        Ошибка модели — :class:`~devassist.llm.base.LLMError`; диалог тогда не меняется.
+        """
+        specs = self._registry.specs()
+        return self._compact(self._history_budget(specs), specs, instructions=instructions)
+
+    def _auto_compact(self, specs: list[ToolSpec], stats: TurnStats) -> bool:
+        """Сжать историю, если она подошла к порогу. False — сжать не удалось."""
+        budget = self._history_budget(specs)
+        if self._history_tokens(self._conversation) < self._cfg.compact_threshold * budget:
+            return True
+
+        def count(usage: Usage) -> None:
+            stats.prompt_tokens += usage.prompt_tokens
+            stats.completion_tokens += usage.completion_tokens
+
+        try:
+            self._compact(budget, specs, auto=True, on_usage=count)
+        except LLMError as e:
+            self._events.on_notice(
+                f"не удалось сжать контекст: {e} — старые сообщения будут отбрасываться",
+                level="warn",
+            )
+            return False
+        return True
+
+    def _compact(
+        self,
+        budget: int,
+        specs: list[ToolSpec],
+        *,
+        auto: bool = False,
+        instructions: str = "",
+        on_usage: Callable[[Usage], None] | None = None,
+    ) -> CompactResult | None:
+        """Свернуть начало диалога в краткое содержание (``budget`` — бюджет истории).
+
+        Автоматически (``auto``) свежие сообщения остаются дословно, а сжатие
+        пропускается, если сворачивать почти нечего; по команде сворачивается всё.
+        Диалог меняется только после успешного ответа модели.
+        """
+        conversation = self._conversation
+        if auto:
+            plan = plan_compaction(
+                conversation,
+                keep_tokens=int(budget * COMPACT_KEEP_SHARE),
+                min_tokens=int(budget * COMPACT_MIN_SHARE),
+            )
+        else:
+            plan = plan_compaction(conversation, keep_tokens=0)
+        if plan is None:
+            return None
+
+        def count(usage: Usage) -> None:
+            self._billed_tokens += usage.prompt_tokens + usage.completion_tokens
+            if on_usage is not None:
+                on_usage(usage)
+
+        overhead = self._overhead_tokens(specs)
+        before = self._history_tokens(conversation)
+        max_chars = int(budget * SUMMARY_SHARE) * CHARS_PER_TOKEN
+        result: CompactResult | None = None
+        self._events.on_compact_start(auto=auto)
+        try:
+            previous = conversation.summary.text if conversation.summary is not None else None
+            text = summarize(
+                self._provider,
+                plan.messages,
+                model=self._model,
+                temperature=self._cfg.temperature,
+                input_budget=self.context_budget,
+                max_chars=min(max(max_chars, MIN_SUMMARY_CHARS), MAX_SUMMARY_CHARS),
+                previous=previous,
+                instructions=instructions,
+                on_usage=count,
+            )
+            summary = Summary(text=text, upto=plan.upto)
+            after = self._history_tokens(Conversation(conversation.messages, summary=summary))
+            if after >= before:
+                raise CompactionError("краткое содержание вышло не короче самой истории")
+            conversation.set_summary(summary)
+            self._compacted_tokens = overhead + after
+            result = CompactResult(
+                before_tokens=overhead + before,
+                after_tokens=overhead + after,
+                messages=len(plan.messages),
+                auto=auto,
+            )
+        finally:
+            self._events.on_compact_end(result)
+        return result
 
     def _next_turn(self, specs: list[ToolSpec]) -> AssistantTurn:
         """Один проход модели с выводом текста (потоковым или цельным)."""
@@ -371,7 +540,23 @@ class Agent:
 
         self._events.on_tool_result(call, result, previewed=previewed)
         self._conversation.add_function_result(name, _with_note(result.as_function_content(), note))
+        if result.ok:
+            self._attach_instructions(tool, params)
         return ToolOutcome(ok=result.ok, changed=result.ok and risk >= RiskLevel.WRITE)
+
+    def _attach_instructions(self, tool: Tool, params: BaseModel) -> None:
+        """Подключить инструкции подкаталогов, которых коснулся вызов.
+
+        Они уходят в системном сообщении следующих запросов — поэтому переживают
+        обрезку и сжатие истории и не дублируются.
+        """
+        try:
+            found = self._nested.add_paths(tool.paths(params))
+        except Exception:  # инструкции не повод прерывать работу
+            return
+        if found:
+            names = ", ".join(doc.name for doc in found)
+            self._events.on_notice(f"подключены инструкции подкаталога: {names}")
 
     def _fail(
         self,

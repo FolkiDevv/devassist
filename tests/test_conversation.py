@@ -7,7 +7,7 @@ import json
 import pytest
 
 from devassist.agent.context_window import estimate_tokens, fit_history
-from devassist.agent.conversation import Conversation
+from devassist.agent.conversation import Conversation, Summary
 from devassist.agent.guard import LoopGuard, ToolOutcome, call_key
 from devassist.llm.types import FunctionCall, Message, Usage
 
@@ -41,6 +41,81 @@ def test_round_trip_preserves_everything():
 def test_from_dict_rejects_unknown_version():
     with pytest.raises(ValueError):
         Conversation.from_dict({"version": 999, "messages": []})
+
+
+def _mid_turn() -> Conversation:
+    conv = Conversation()
+    conv.add_user("старый запрос")
+    conv.add_assistant(Message(role="assistant", content="старый ответ"))
+    conv.add_user("ЗАДАЧА")
+    for i in range(3):
+        conv.add_assistant(_call(path=f"{i}.py"), Usage(prompt_tokens=100))
+        conv.add_function_result("read_file", f"файл {i}")
+    return conv
+
+
+def test_summary_round_trip_and_old_files_without_it():
+    conv = _mid_turn()
+    conv.set_summary(Summary("сводка", 5))
+    data = json.loads(json.dumps(conv.to_dict(), ensure_ascii=False))
+    assert data["version"] == 1  # ключ summary необязателен — формат прежний
+    restored = Conversation.from_dict(data)
+    assert restored.summary == Summary("сводка", 5)
+    assert restored.messages == conv.messages
+
+    del data["summary"]
+    assert Conversation.from_dict(data).summary is None
+
+
+@pytest.mark.parametrize(
+    "summary",
+    [
+        {"text": "x", "upto": 0},  # граница до начала
+        {"text": "x", "upto": 99},  # за концом журнала
+        {"text": "x", "upto": 4},  # на результате инструмента
+        {"text": "  ", "upto": 2},  # пустое
+        {"text": "x", "upto": "2"},
+        {"text": "x", "upto": True},
+        "сводка",
+    ],
+)
+def test_from_dict_rejects_broken_summary(summary):
+    data = _mid_turn().to_dict()
+    data["summary"] = summary
+    with pytest.raises(ValueError):
+        Conversation.from_dict(data)
+
+
+def test_context_messages_pin_current_task_mid_turn():
+    conv = _mid_turn()
+    assert conv.context_messages() == list(conv.messages)
+    conv.set_summary(Summary("сводка", 5))  # граница посреди хода: задача до неё
+    view = conv.context_messages()
+    assert [m.content for m in view[:1]] == ["ЗАДАЧА"]
+    assert view[1:] == list(conv.messages[5:])
+    assert conv.last_usage is None  # описывал контекст до сжатия
+
+    conv.add_assistant(Message(role="assistant", content="готово"))
+    conv.add_user("новый запрос")  # закрепление исчезает с новым запросом
+    assert conv.context_messages() == list(conv.messages[5:])
+
+
+def test_context_messages_empty_after_full_compaction():
+    conv = _mid_turn()
+    conv.set_summary(Summary("сводка", len(conv)))
+    assert conv.context_messages() == []
+    conv.add_user("дальше")
+    assert [m.content for m in conv.context_messages()] == ["дальше"]
+
+
+def test_set_summary_does_not_move_back():
+    conv = _mid_turn()
+    conv.set_summary(Summary("сводка", 5))
+    with pytest.raises(ValueError):
+        conv.set_summary(Summary("сводка", 3))
+    with pytest.raises(ValueError):
+        conv.set_summary(Summary("сводка", 6))  # результат инструмента
+    assert conv.summary == Summary("сводка", 5)
 
 
 def test_repair_closes_pending_call():

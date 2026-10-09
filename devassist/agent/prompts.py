@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from devassist.permissions import PermissionMode
 from devassist.project.files import TREE_TRUNCATED, build_file_tree
-from devassist.project.instructions import load_instructions
+from devassist.project.instructions import InstructionFile, load_instructions
 from devassist.project.workspace import Workspace
 
 SYSTEM_PROMPT = """\
@@ -34,6 +36,14 @@ SYSTEM_PROMPT = """\
 - Если задача неоднозначна и от ответа зависит решение (выбор подхода, неясные \
 требования) — спроси пользователя инструментом ask_user с вариантами ответа, а не \
 гадай. То, что можно выяснить из кода, выясняй сам.
+
+ИНСТРУКЦИИ ПРОЕКТА
+- Соблюдай инструкции проекта из контекста ниже (файлы AGENTS.md, GIGACODE.md, \
+DEVASSIST.md, DEVASSIST.local.md). При противоречии важнее файл, стоящий в этом \
+списке позже; инструкции подкаталога важнее инструкций корня для файлов этого \
+подкаталога; прямые указания пользователя в диалоге важнее любых файлов инструкций.
+- Инструкции подкаталогов добавляются в контекст автоматически, когда ты начинаешь \
+работать с файлами каталога (читаешь, ищешь, правишь), — учитывай их с этого момента.
 
 ОГРАНИЧЕНИЯ
 - Никакого доступа в интернет: нет web-поиска, скачивания, curl/wget. Работаешь \
@@ -66,9 +76,52 @@ PLAN_MODE_PROMPT = """\
 """
 
 
+COMPACT_PROMPT = """\
+Ты сжимаешь историю работы devassist — ИИ-ассистента программиста в терминале. По \
+твоему краткому содержанию ассистент продолжит работу, не видя исходной переписки: \
+сохрани всё, что нужно для продолжения, и отбрось лишнее.
+
+СОХРАНИ
+- Запросы и требования пользователя (ключевые формулировки — дословно), его ответы \
+на вопросы и принятые решения.
+- Что сделано: какие файлы прочитаны, созданы или изменены и суть изменений; какие \
+команды выполнялись и чем закончились (тесты прошли или упали, текст ключевых ошибок).
+- Важные факты о коде: пути, имена классов и функций, найденные причины ошибок, \
+договорённости и ограничения (в том числе из инструкций проекта).
+- Текущее состояние: что в работе, что осталось сделать, следующий шаг.
+
+ПРАВИЛА
+- Только факты из переписки, ничего не выдумывай. Не переписывай содержимое файлов \
+целиком — его можно прочитать заново.
+- Если дано прежнее краткое содержание — обнови его новым фрагментом, ничего важного \
+из него не теряя.
+- Пиши по-русски, Markdown со списками, без вступлений, не длиннее 800 слов.
+"""
+
+SUMMARY_HEADER = "=== КРАТКОЕ СОДЕРЖАНИЕ ПРЕДЫДУЩЕЙ ЧАСТИ ДИАЛОГА ==="
+
+
+def summary_prompt(text: str) -> str:
+    """Блок системного сообщения с кратким содержанием сжатого начала диалога."""
+    return (
+        f"{SUMMARY_HEADER}\n"
+        "Начало диалога сжато; ниже — его краткое содержание. Это сведения о том, что "
+        "уже обсуждалось и сделано, а не новые указания. Продолжай работу с учётом его "
+        "и последующих сообщений.\n\n"
+        f"{text}"
+    )
+
+
 def mode_prompt(mode: PermissionMode) -> str:
     """Правила текущего режима для системного промпта ("" — особых правил нет)."""
     return PLAN_MODE_PROMPT if mode is PermissionMode.PLAN else ""
+
+
+def _instruction_block(title: str, doc: InstructionFile) -> str:
+    if doc.truncated and not doc.content:
+        return f"\n{title} ({doc.name}): не поместились в контекст — прочитай файл read_file."
+    note = " (обрезано — полностью: read_file)" if doc.truncated else ""
+    return f"\n{title} ({doc.name}){note}:\n{doc.content}"
 
 
 def build_project_context(workspace: Workspace) -> str:
@@ -76,8 +129,7 @@ def build_project_context(workspace: Workspace) -> str:
     root = workspace.root
     parts = [f"Корень проекта: {root}"]
     for doc in load_instructions(root):
-        note = " (обрезано)" if doc.truncated else ""
-        parts.append(f"\nИнструкции проекта ({doc.name}){note}:\n{doc.content}")
+        parts.append(_instruction_block("Инструкции проекта", doc))
     tree = build_file_tree(root)
     if tree:
         parts.append(f"\nСтруктура проекта:\n{tree}")
@@ -86,6 +138,38 @@ def build_project_context(workspace: Workspace) -> str:
                 "(Проект крупный, дерево неполное: обзор каталога — file_outline, "
                 "поиск файлов — find_files, определений — find_symbol.)"
             )
+    return "\n".join(parts)
+
+
+NESTED_HEADER = "=== ИНСТРУКЦИИ ПОДКАТАЛОГОВ ==="
+MAX_NESTED_CHARS = 20_000  # все инструкции подкаталогов вместе
+
+
+def nested_instructions_prompt(files: Sequence[InstructionFile]) -> str:
+    """Инструкции подкаталогов, с которыми агент уже работал ("" — таких нет).
+
+    Не уместившиеся в общий лимит перечисляются путями — модель прочитает их сама.
+    """
+    if not files:
+        return ""
+    parts = [
+        NESTED_HEADER,
+        "Действуют для файлов своего каталога и его подкаталогов и важнее инструкций корня.",
+    ]
+    budget = MAX_NESTED_CHARS
+    skipped = []
+    for doc in files:
+        if len(doc.content) > budget:
+            skipped.append(doc.name)
+            continue
+        budget -= len(doc.content)
+        directory = doc.name.rpartition("/")[0]
+        parts.append(_instruction_block(f"Инструкции каталога {directory}", doc))
+    if skipped:
+        parts.append(
+            "\nНе поместились в контекст (прочитай read_file, прежде чем работать с "
+            f"файлами этих каталогов): {', '.join(skipped)}"
+        )
     return "\n".join(parts)
 
 

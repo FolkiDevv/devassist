@@ -54,6 +54,9 @@ def test_load_does_not_touch_os_environ(tmp_path, monkeypatch):
         {"DEVASSIST_TEMPERATURE": "warm"},
         {"DEVASSIST_TEMPERATURE": "5"},
         {"DEVASSIST_MODE": "yolo"},
+        {"DEVASSIST_COMPACT_THRESHOLD": "5"},
+        {"DEVASSIST_COMPACT_THRESHOLD": "99"},
+        {"DEVASSIST_COMPACT_THRESHOLD": "0.8"},
     ],
 )
 def test_bad_values_raise_config_error(tmp_path, env):
@@ -100,3 +103,13 @@ def test_mode_flag_and_env(tmp_path):
     )
     with pytest.raises(ConfigError, match="DEVASSIST_MODE"):
         load({"DEVASSIST_MODE": "auto"})
+
+
+def test_compaction_settings(tmp_path):
+    def load(env):
+        return Config.load(project_root=tmp_path, environ=env, cwd=tmp_path)
+
+    cfg = load({})
+    assert cfg.auto_compact is True and cfg.compact_threshold == 0.8
+    cfg = load({"DEVASSIST_AUTO_COMPACT": "0", "DEVASSIST_COMPACT_THRESHOLD": "65"})
+    assert cfg.auto_compact is False and cfg.compact_threshold == 0.65

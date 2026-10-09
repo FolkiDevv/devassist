@@ -52,6 +52,16 @@ class TurnStats:
         return self.prompt_tokens + self.completion_tokens
 
 
+@dataclass(frozen=True)
+class CompactResult:
+    """Итог сжатия контекста (оценки размера запроса в токенах)."""
+
+    before_tokens: int
+    after_tokens: int
+    messages: int  # сколько сообщений свёрнуто в краткое содержание
+    auto: bool = False  # запущено автоматически (контекст подошёл к порогу)
+
+
 class AgentEvents:
     """Получатель событий агента. Все методы — no-op; ``confirm`` → False."""
 
@@ -99,6 +109,13 @@ class AgentEvents:
         получит ошибку и решит сама, а не примет выдуманный ответ.
         """
         raise QuestionsUnavailable()
+
+    # --- сжатие контекста ---
+    def on_compact_start(self, *, auto: bool) -> None:
+        """Началось сжатие истории (``auto`` — по порогу, иначе по команде)."""
+
+    def on_compact_end(self, result: CompactResult | None) -> None:
+        """Сжатие закончилось (вызывается всегда). None — не удалось или прервано."""
 
     # --- служебное ---
     def on_notice(self, text: str, *, level: NoticeLevel = "info") -> None:

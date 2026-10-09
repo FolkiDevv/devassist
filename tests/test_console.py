@@ -153,6 +153,23 @@ def test_progress_without_terminal_prints_title_once():
     assert buf.getvalue() == "индексирую…\n"
 
 
+def test_compaction_progress_and_result():
+    from devassist.agent.events import CompactResult
+
+    ui, buf = _console()
+    ui.on_compact_start(auto=True)
+    ui.on_compact_end(CompactResult(before_tokens=24_000, after_tokens=6_500, messages=31))
+    out = buf.getvalue()
+    assert "контекст почти заполнен — сжимаю историю…" in out
+    assert "контекст сжат: ~24k → ~6.5k ток." in out and "31 сообщение" in out
+
+    ui, buf = _live_console()
+    ui.on_compact_start(auto=False)
+    assert ui._live is not None
+    ui.on_compact_end(None)  # не удалось — только убрать индикатор
+    assert ui._live is None and "сжат" not in _plain(buf)
+
+
 def test_no_live_area_without_terminal():
     ui, buf = _console()
     ui.on_stream_start()
