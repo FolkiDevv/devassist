@@ -195,3 +195,87 @@ def test_animation_thread_stops():
     ui.on_stream_end()
     assert area._thread is not None and not area._thread.is_alive()
     assert "текст" in _plain(buf)
+
+
+# ---------------------------- вопросы агента ---------------------------- #
+from devassist.tools.questions import Answer, Question, QuestionOption  # noqa: E402
+
+_DB = Question(
+    "Какую БД?",
+    (QuestionOption("PostgreSQL", "с сервером"), QuestionOption("SQLite", "файл")),
+    header="БД",
+)
+_PARTS = Question(
+    "Что добавить?", (QuestionOption("Логи"), QuestionOption("Метрики")), multi_select=True
+)
+
+
+def _asking_console(monkeypatch, *replies):
+    import devassist.ui.console as console_mod
+
+    monkeypatch.setattr(console_mod, "_stdin_is_terminal", lambda: True)
+    ui, buf = _console()
+    queue = list(replies)
+
+    def fake_input(prompt):
+        item = queue.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    monkeypatch.setattr(ui._c, "input", fake_input)
+    return ui, buf
+
+
+@pytest.mark.parametrize(
+    ("replies", "expected"),
+    [
+        (["2"], [Answer(("SQLite",)), Answer(("Логи",))]),
+        (["MongoDB"], [Answer(custom="MongoDB")]),
+        (["3", "Redis"], [Answer(custom="Redis")]),
+        (["1 2", "1"], [Answer(("PostgreSQL",))]),  # один вариант — повтор вопроса
+    ],
+)
+def test_plain_questions(monkeypatch, replies, expected):
+    second = ["1, 2"] if len(expected) == 1 else ["1"]
+    ui, buf = _asking_console(monkeypatch, *replies, *second)
+    answers = ui.ask_user([_DB, _PARTS])
+    assert answers[0] == expected[0]
+    out = buf.getvalue()
+    assert "Вопрос 1 из 2 · БД" in out and "с сервером" in out and "3. Свой ответ" in out
+    assert "? Какую БД?" in out  # итог в ленте
+
+
+def test_plain_multi_select(monkeypatch):
+    ui, _ = _asking_console(monkeypatch, "1", "1, 2")
+    assert ui.ask_user([_DB, _PARTS])[1] == Answer(("Логи", "Метрики"))
+
+
+def test_questions_declined(monkeypatch):
+    ui, buf = _asking_console(monkeypatch, KeyboardInterrupt())
+    assert ui.ask_user([_DB, _PARTS]) is None
+    assert "отказался" in buf.getvalue()
+
+
+def test_questions_need_keyboard(monkeypatch):
+    from devassist.tools.questions import QuestionsUnavailable
+
+    ui, _ = _console()
+    with pytest.raises(QuestionsUnavailable):
+        ui.ask_user([_DB])
+
+
+def test_questions_pause_esc_interrupt(monkeypatch):
+    import contextlib
+
+    ui, _ = _asking_console(monkeypatch, "1")
+    entered = []
+
+    @contextlib.contextmanager
+    def guard():
+        entered.append(True)
+        yield
+
+    ui.set_interrupt_keys("Esc — прервать", guard)
+    ui.ask_user([_DB])
+    assert entered == [True]

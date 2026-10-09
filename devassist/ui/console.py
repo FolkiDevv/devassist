@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import contextlib
 import re
+import sys
 import threading
 import time
 from collections.abc import Callable, Sequence
@@ -39,7 +40,9 @@ from rich.text import Text
 from rich.theme import Theme
 
 from devassist.agent.events import AgentEvents, NoticeLevel, ToolCallInfo, TurnStats
+from devassist.tools.ask_user import format_answer
 from devassist.tools.base import Display, ToolResult
+from devassist.tools.questions import Answer, Question, QuestionsUnavailable
 from devassist.ui.format import SKIPPED_MARK, clip_lines, format_tokens, plural
 from devassist.ui.markdown import Markdown
 from devassist.ui.markdown_stream import MarkdownStream
@@ -475,3 +478,79 @@ class Console(AgentEvents):
             self._c.print()
             return False
         return answer.strip().lower() in ("y", "yes", "д", "да")
+
+    # ---------------------------- вопросы агента ---------------------------- #
+    def ask_user(self, questions: Sequence[Question]) -> list[Answer] | None:
+        """Задаёт вопросы по очереди (меню со стрелками или ввод номера). None — отказ."""
+        self.stop_live()
+        if not _stdin_is_terminal():
+            raise QuestionsUnavailable("ввод не с клавиатуры")
+        answers: list[Answer] = []
+        with self._input_guard():
+            for i, question in enumerate(questions, 1):
+                answer = self._ask_one(question, i, len(questions))
+                if answer is None:
+                    self._c.print(Text("  ? пользователь отказался отвечать", style=MUTED))
+                    return None
+                line = Text("  ? ", style=f"bold {BRAND}")
+                line.append(sanitize(question.text), style="bold")
+                line.append(f" {ICON_ARROW} ", style=MUTED)
+                line.append(sanitize(format_answer(answer)), style=ACCENT)
+                self._c.print(line)
+                answers.append(answer)
+        return answers
+
+    def _ask_one(self, question: Question, index: int, total: int) -> Answer | None:
+        if self._live_ok:
+            try:
+                from devassist.ui.choice import choose
+
+                return choose(question, index, total, no_color=self._no_color)
+            except (KeyboardInterrupt, EOFError):
+                return None
+        return self._ask_plain(question, index, total)
+
+    def _ask_plain(self, question: Question, index: int, total: int) -> Answer | None:
+        """Запасной режим без интерактивного меню: номер(а) варианта или свой текст."""
+        title = Text(f"Вопрос {index} из {total}", style=f"bold {BRAND}")
+        if question.header:
+            title.append(f" · {question.header}", style=ACCENT)
+        self._c.print(title)
+        self._c.print(Text(question.text, style="bold"))
+        options = question.options
+        for k, option in enumerate(options, 1):
+            self._c.print(Text(f"  {k}. {option.label}"))
+            if option.description:
+                self._c.print(Text(f"     {option.description}", style=MUTED))
+        custom = len(options) + 1
+        self._c.print(Text(f"  {custom}. Свой ответ (или просто напишите текст)"))
+        hint = "номера через пробел" if question.multi_select else "номер"
+        while True:
+            try:
+                raw = self._c.input(Text(f"  {hint} или ответ: ", style=MUTED)).strip()
+                if not raw:
+                    continue
+                numbers = raw.replace(",", " ").split()
+                if not all(n.isdigit() and 1 <= int(n) <= custom for n in numbers):
+                    return Answer(custom=raw)  # не номера — это свой ответ
+                picked = sorted({int(n) for n in numbers})
+                if len(picked) > 1 and not question.multi_select:
+                    self.warn("здесь можно выбрать только один вариант")
+                    continue
+                text = ""
+                if custom in picked:
+                    text = self._c.input(Text("  ваш ответ: ", style=MUTED)).strip()
+                    if not text:
+                        continue
+                labels = tuple(options[n - 1].label for n in picked if n != custom)
+                return Answer(labels, text)
+            except (EOFError, KeyboardInterrupt):
+                self._c.print()
+                return None
+
+
+def _stdin_is_terminal() -> bool:
+    try:
+        return sys.stdin.isatty()
+    except (AttributeError, ValueError):
+        return False
