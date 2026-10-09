@@ -112,8 +112,8 @@ def test_edit_tolerant_indentation(ctx):
         ctx,
     )
     assert res.ok
-    text = (ctx.root / "i.py").read_text()
-    assert "x = 10" in text and "y = 20" in text
+    # отступ файла сохранён — иначе тело класса «выпало» бы (SyntaxError)
+    assert (ctx.root / "i.py").read_text() == "class A:\n        x = 10\n        y = 20\n"
 
 
 def test_edit_with_double_escaped_old_string(ctx):
@@ -539,3 +539,69 @@ def test_edit_keeps_file_mode(ctx):
     script.chmod(0o755)
     _edit(ctx, "run.sh", "echo 1", "echo 2")
     assert script.stat().st_mode & 0o777 == 0o755
+
+
+# -------------------------- edit_file: пустой фрагмент и отступы -------------------------- #
+@pytest.mark.parametrize("replace_all", [False, True])
+def test_edit_rejects_empty_old_string(ctx, replace_all):
+    (ctx.root / "e.txt").write_text("abc\n", encoding="utf-8")
+    e = EditFileTool()
+    params = e.parse(
+        {"path": "e.txt", "old_string": "", "new_string": "X", "replace_all": replace_all}
+    )
+    for call in (e.preview, e.run):
+        with pytest.raises(ToolError, match="old_string пуст"):
+            call(params, ctx)
+    assert (ctx.root / "e.txt").read_text(encoding="utf-8") == "abc\n"
+
+
+def test_edit_tolerant_removes_extra_indentation(ctx):
+    (ctx.root / "f.py").write_text("def f():\n    a = 1\n    return a\n", encoding="utf-8")
+    _edit(ctx, "f.py", "        a = 1\n        return a", "        a = 2\n        return a")
+    assert (ctx.root / "f.py").read_text() == "def f():\n    a = 2\n    return a\n"
+
+
+def test_edit_tolerant_keeps_nested_structure(ctx):
+    (ctx.root / "n.py").write_text("class A:\n    def f(self):\n        pass\n", encoding="utf-8")
+    _edit(
+        ctx,
+        "n.py",
+        "def f(self):\n    pass",
+        "def f(self):\n    if self:\n        return 1\n    return 0",
+    )
+    assert (ctx.root / "n.py").read_text() == (
+        "class A:\n    def f(self):\n        if self:\n            return 1\n        return 0\n"
+    )
+
+
+def test_edit_tolerant_maps_spaces_to_tabs(ctx):
+    (ctx.root / "t.go").write_text("func f() {\n\tif x {\n\t\ty()\n\t}\n}\n", encoding="utf-8")
+    _edit(
+        ctx,
+        "t.go",
+        "    if x {\n        y()\n    }",
+        "    if x {\n        y()\n        z()\n    }",
+    )
+    assert (ctx.root / "t.go").read_text() == ("func f() {\n\tif x {\n\t\ty()\n\t\tz()\n\t}\n}\n")
+
+
+def test_edit_tolerant_refuses_inconsistent_indentation(ctx):
+    original = "if a:\n    b = 1\n    if b:\n        c = 2\n"
+    (ctx.root / "i.py").write_text(original, encoding="utf-8")
+    e = EditFileTool()
+    # один и тот же отступ шаблона соответствует разным отступам файла — не угадываем
+    params = e.parse(
+        {"path": "i.py", "old_string": "b = 1\nif b:\nc = 2", "new_string": "b = 1\nif b:\nc = 3"}
+    )
+    with pytest.raises(ToolError, match="не найден"):
+        e.run(params, ctx)
+    assert (ctx.root / "i.py").read_text() == original
+
+
+def test_edit_tolerant_does_not_add_blank_lines(ctx):
+    (ctx.root / "b.py").write_text("def f():\n    return 1   \nz = 0\n", encoding="utf-8")
+    _edit(ctx, "b.py", "def f():\n    return 1\n", "def f():\n    return 2\n")
+    assert (ctx.root / "b.py").read_text() == "def f():\n    return 2\nz = 0\n"
+    (ctx.root / "c.py").write_text("a = 1  \nb = 2\n", encoding="utf-8")
+    _edit(ctx, "c.py", "\na = 1\nb = 2", "\na = 10\nb = 2")
+    assert (ctx.root / "c.py").read_text() == "a = 10\nb = 2\n"

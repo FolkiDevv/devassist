@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath, PureWindowsPath
 
@@ -280,12 +281,89 @@ def _numbered_excerpt(text: str, max_lines: int = 60) -> str:
     return body
 
 
-def _tolerant_find(text: str, pattern: str):
+def _leading(line: str) -> str:
+    return line[: len(line) - len(line.lstrip(" \t"))]
+
+
+IndentRule = Callable[[str], "str | None"]
+
+
+def _indent_rule(pairs: list[tuple[str, str]]) -> IndentRule | None:
+    """Как перевести отступ из фрагмента модели в отступ файла.
+
+    ``pairs`` — (отступ строки шаблона, отступ совпавшей строки файла). Годится
+    единый добавленный префикс (модель потеряла общий отступ), единый убранный
+    (лишний общий отступ) или согласованное соответствие отступов (пробелы ↔ табы,
+    в том числе кратными единицами). Иначе None — правку не угадываем.
+    """
+    added = {f[: len(f) - len(p)] if f.endswith(p) else None for p, f in pairs}
+    if len(added) == 1 and None not in added:
+        prefix = added.pop()
+        return lambda indent: prefix + indent
+    removed = {p[: len(p) - len(f)] if p.endswith(f) else None for p, f in pairs}
+    if len(removed) == 1 and None not in removed:
+        extra = removed.pop()
+        return lambda indent: indent[len(extra) :] if indent.startswith(extra) else None
+    mapping: dict[str, str] = {}
+    for p, f in pairs:
+        if mapping.setdefault(p, f) != f:
+            return None
+    units = [(p, f) for p, f in mapping.items() if p and f]
+    if units:
+        pu, fu = min(units, key=lambda pf: len(pf[0]))
+        if all(
+            p == pu * (len(p) // len(pu)) and f == fu * (len(p) // len(pu))
+            for p, f in mapping.items()
+        ):
+
+            def by_units(indent: str) -> str | None:
+                k = len(indent) // len(pu)
+                return fu * k if indent == pu * k else None
+
+            return by_units
+    return mapping.get
+
+
+@dataclass(frozen=True)
+class _Match:
+    """Несторогое совпадение: где заменять и как подогнать ``new_string``."""
+
+    start: int
+    end: int
+    lead: int  # сколько пустых строк срезано с начала шаблона
+    trail: int  # … и с конца
+    indent: IndentRule | None = None  # None — отступы шаблона совпали с файлом
+
+    def adapt(self, new_string: str) -> str | None:
+        """``new_string`` под совпавший блок; None — отступы не перевести."""
+        lines = new_string.split("\n")
+        for _ in range(self.lead):
+            if len(lines) > 1 and not lines[0].strip():
+                lines.pop(0)
+        for _ in range(self.trail):
+            if len(lines) > 1 and not lines[-1].strip():
+                lines.pop()
+        if self.indent is None:
+            return "\n".join(lines)
+        out = []
+        for line in lines:
+            if not line.strip():
+                out.append(line)
+                continue
+            indent = self.indent(_leading(line))
+            if indent is None:
+                return None
+            out.append(indent + line.lstrip(" \t"))
+        return "\n".join(out)
+
+
+def _tolerant_find(text: str, pattern: str) -> _Match | None:
     """Ищет блок строк, совпадающий с pattern с точностью до пробелов/отступов.
 
-    Возвращает (start_offset, end_offset) в исходном тексте при ЕДИНСТВЕННОМ
-    совпадении, иначе None. Используется как запасной вариант, когда точное
-    совпадение не найдено (модель часто слегка путает отступы/хвостовые пробелы).
+    Возвращает совпадение при ЕДИНСТВЕННОМ вхождении, иначе None. Используется
+    как запасной вариант, когда точного совпадения нет (модель часто слегка путает
+    отступы/хвостовые пробелы). Блок заменяется целыми строками, поэтому при
+    совпадении «без учёта отступов» ``new_string`` переотступается под файл.
     """
     raw = _lines(text)
     if not raw:
@@ -298,28 +376,44 @@ def _tolerant_find(text: str, pattern: str):
     contents = [ln.rstrip("\n") for ln in raw]
 
     pat_lines = pattern.split("\n")
+    lead = trail = 0
     while pat_lines and not pat_lines[0].strip():
         pat_lines.pop(0)
+        lead += 1
     while pat_lines and not pat_lines[-1].strip():
         pat_lines.pop()
+        trail += 1
     n = len(pat_lines)
     if n == 0:
         return None
 
     # От более строгой нормализации (только хвостовые пробелы) к более мягкой
     # (полный strip — игнор отступов). Берём первый режим с уникальным совпадением.
-    for norm in (lambda s: s.rstrip(), lambda s: s.strip()):
+    for strict in (True, False):
+
+        def norm(s: str, strict: bool = strict) -> str:
+            return s.rstrip() if strict else s.strip()
+
         target = [norm(ln) for ln in pat_lines]
         hits = [
             i
             for i in range(len(contents) - n + 1)
             if [norm(contents[j]) for j in range(i, i + n)] == target
         ]
-        if len(hits) == 1:
-            i = hits[0]
-            start = offsets[i]
-            end = offsets[i + n - 1] + len(contents[i + n - 1])
-            return (start, end)
+        if len(hits) != 1:
+            continue
+        i = hits[0]
+        start = offsets[i]
+        end = offsets[i + n - 1] + len(contents[i + n - 1])
+        if strict:
+            return _Match(start, end, lead, trail)
+        pairs = [
+            (_leading(pat), _leading(contents[i + j]))
+            for j, pat in enumerate(pat_lines)
+            if pat.strip()
+        ]
+        rule = _indent_rule(pairs)
+        return None if rule is None else _Match(start, end, lead, trail, rule)
     return None
 
 
@@ -510,6 +604,13 @@ class EditFileTool(Tool):
         # Сравнение и правка — в виде с \n; переводы строк файла вернёт запись.
         old_param = params.old_string.replace("\r\n", "\n")
         new_param = params.new_string.replace("\r\n", "\n")
+        if not old_param:
+            # "" нашлось бы между каждой парой символов: replace_all вставил бы
+            # new_string повсюду.
+            raise ToolError(
+                "old_string пуст — укажите заменяемый фрагмент. Чтобы создать файл "
+                "или заменить его целиком, используйте write_file."
+            )
         if old_param == new_param:
             raise ToolError("old_string и new_string совпадают — нечего менять.")
 
@@ -531,7 +632,7 @@ class EditFileTool(Tool):
         seen = set()
         for tf in transforms:
             old_string = tf(old_param)
-            if old_string in seen:
+            if not old_string or old_string in seen:
                 continue
             seen.add(old_string)
             new_string = tf(new_param)
@@ -547,10 +648,10 @@ class EditFileTool(Tool):
                     "фрагмент стал уникальным, или укажите replace_all=true."
                 )
             # Тир 2: совпадение с поправкой на пробелы/отступы (одиночная замена).
-            span = _tolerant_find(old, old_string)
-            if span is not None:
-                start, end = span
-                new = old[:start] + new_string + old[end:]
+            match = _tolerant_find(old, old_string)
+            replacement = match.adapt(new_string) if match is not None else None
+            if match is not None and replacement is not None:
+                new = old[: match.start] + replacement + old[match.end :]
                 return p, file, new, 1
 
         # Не найдено — даём модели контекст файла, чтобы скопировать точно.
