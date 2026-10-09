@@ -31,12 +31,18 @@ from devassist.agent.context_window import (
 from devassist.agent.conversation import Conversation, Summary
 from devassist.agent.events import AgentEvents, CompactResult, ToolCallInfo, TurnStats
 from devassist.agent.guard import CallCheck, LoopGuard, ToolOutcome
-from devassist.agent.prompts import build_system_prompt, mode_prompt, summary_prompt
+from devassist.agent.prompts import (
+    build_system_prompt,
+    mode_prompt,
+    nested_instructions_prompt,
+    summary_prompt,
+)
 from devassist.config import Config
 from devassist.llm.base import LLMError, LLMProvider
 from devassist.llm.model_windows import ModelWindows
 from devassist.llm.types import AssistantTurn, Message, ToolSpec, Usage
 from devassist.permissions import Decision, PermissionMode, decide, next_mode
+from devassist.project.instructions import NestedInstructions
 from devassist.project.workspace import Workspace
 from devassist.security import RiskLevel
 from devassist.tools.base import Tool, ToolContext, ToolError, ToolRegistry, ToolResult
@@ -109,6 +115,8 @@ class Agent:
         self._mode = config.mode
         self._windows = ModelWindows() if windows is None else windows
         self._system_prompt: str | None = None  # строится лениво, сбрасывается в reset()
+        # Инструкции подкаталогов, с которыми агент работал в этом диалоге.
+        self._nested = NestedInstructions(self._workspace.root)
         self._billed_tokens = 0  # потрачено за сессию (reset() не сбрасывает)
         # Оценка контекста после сжатия — пока модель не сообщит настоящий размер.
         self._compacted_tokens = 0
@@ -193,6 +201,7 @@ class Agent:
         """
         self._conversation = Conversation() if conversation is None else conversation
         self._system_prompt = None
+        self._nested.reset()
         self._compacted_tokens = 0
 
     # ------------------------------------------------------------------ #
@@ -274,10 +283,14 @@ class Agent:
         return self._system_prompt
 
     def _system_text(self) -> str:
-        """Системное сообщение без краткого содержания: промпт + правила режима."""
-        text = self.system_prompt()
-        note = mode_prompt(self._mode)
-        return f"{text}\n\n{note}" if note else text
+        """Системное сообщение без краткого содержания: промпт, инструкции
+        подкаталогов, правила режима."""
+        parts = [
+            self.system_prompt(),
+            nested_instructions_prompt(self._nested.files),
+            mode_prompt(self._mode),
+        ]
+        return "\n\n".join(part for part in parts if part)
 
     def _overhead_tokens(self, specs: list[ToolSpec]) -> int:
         """Системное сообщение и схемы инструментов (уходят в каждом запросе)."""
@@ -518,7 +531,23 @@ class Agent:
 
         self._events.on_tool_result(call, result, previewed=previewed)
         self._conversation.add_function_result(name, _with_note(result.as_function_content(), note))
+        if result.ok:
+            self._attach_instructions(tool, params)
         return ToolOutcome(ok=result.ok, changed=result.ok and risk >= RiskLevel.WRITE)
+
+    def _attach_instructions(self, tool: Tool, params: BaseModel) -> None:
+        """Подключить инструкции подкаталогов, которых коснулся вызов.
+
+        Они уходят в системном сообщении следующих запросов — поэтому переживают
+        обрезку и сжатие истории и не дублируются.
+        """
+        try:
+            found = self._nested.add_paths(tool.paths(params))
+        except Exception:  # инструкции не повод прерывать работу
+            return
+        if found:
+            names = ", ".join(doc.name for doc in found)
+            self._events.on_notice(f"подключены инструкции подкаталога: {names}")
 
     def _fail(
         self,

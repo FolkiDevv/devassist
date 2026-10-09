@@ -4,7 +4,8 @@
   * объявляет имя, описание и pydantic-модель параметров (Params);
   * из модели автоматически строится JSON-schema для function calling;
   * объявляет уровень риска (для модели прав);
-  * кратко описывает вызов для UI (``describe``);
+  * кратко описывает вызов для UI (``describe``) и называет пути проекта, с
+    которыми работает (``paths`` — по ним подключаются инструкции подкаталогов);
   * умеет (опционально) показать превью (например, дифф) перед выполнением;
   * выполняется методом ``run`` и возвращает ``ToolResult``.
 
@@ -173,6 +174,14 @@ class Tool(ABC, Generic[P]):
         if "path" in d:
             return str(d["path"])
         return ""
+
+    def paths(self, params: BaseModel) -> tuple[str, ...]:
+        """Пути проекта, с которыми работает вызов (для инструкций подкаталогов).
+
+        По умолчанию — поле ``path``, если оно есть (файл или каталог).
+        """
+        path = getattr(params, "path", None)
+        return (path,) if isinstance(path, str) and path.strip() else ()
 
     def risk(self, params: BaseModel, ctx: ToolContext) -> RiskLevel:  # noqa: ARG002
         """Уровень риска по умолчанию. Переопределяется инструментами."""

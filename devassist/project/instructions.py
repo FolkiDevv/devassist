@@ -1,26 +1,41 @@
 """Файлы инструкций проекта, которые агент держит в контексте.
 
-Пользователь кладёт в корень проекта соглашения, команды сборки и заметки;
-они добавляются в системный промпт. ``DEVASSIST.local.md`` — личные заметки,
-обычно в ``.gitignore``. Поддержка новых соглашений (например, ``AGENTS.md``)
-сводится к добавлению имени в :data:`INSTRUCTION_FILES`.
+Пользователь кладёт в проект соглашения, команды сборки и заметки — они попадают
+в системный промпт. Имена (:data:`INSTRUCTION_FILES`) — по возрастанию приоритета:
+
+* ``AGENTS.md`` — общий формат инструкций для разных ИИ-агентов;
+* ``GIGACODE.md`` — инструкции GigaCode;
+* ``DEVASSIST.md`` — инструкции именно для devassist;
+* ``DEVASSIST.local.md`` — личные заметки (обычно в ``.gitignore``).
+
+Файлы корня проекта входят в системный промпт всегда. Те же имена в подкаталогах
+подключаются, когда агент начинает работать с файлами каталога
+(:class:`NestedInstructions`): инструкции ближайшего к файлу каталога важнее общих.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from devassist.project.files import is_within
+from devassist.errors import SandboxError
+from devassist.project.files import is_excluded, is_within
+from devassist.security import resolve_in_root
 
-INSTRUCTION_FILES: tuple[str, ...] = ("DEVASSIST.md", "DEVASSIST.local.md")
-MAX_INSTRUCTION_CHARS = 20_000
+INSTRUCTION_FILES: tuple[str, ...] = (
+    "AGENTS.md",
+    "GIGACODE.md",
+    "DEVASSIST.md",
+    "DEVASSIST.local.md",
+)
+MAX_INSTRUCTION_CHARS = 20_000  # один файл
+MAX_DIRECTORY_CHARS = 30_000  # все файлы одного каталога вместе
 
 
 @dataclass(frozen=True)
 class InstructionFile:
-    name: str
+    name: str  # путь от корня проекта (POSIX): "AGENTS.md", "src/api/AGENTS.md"
     content: str
     truncated: bool = False
 
@@ -29,26 +44,108 @@ def load_instructions(
     root: Path,
     names: Sequence[str] = INSTRUCTION_FILES,
     max_chars: int = MAX_INSTRUCTION_CHARS,
+    *,
+    directory: Path | None = None,
+    max_total: int = MAX_DIRECTORY_CHARS,
 ) -> list[InstructionFile]:
-    """Читает существующие файлы инструкций в порядке ``names``.
+    """Читает существующие файлы инструкций каталога ``directory`` (по умолчанию —
+    корня) в порядке ``names``.
 
-    Пустые и нечитаемые файлы пропускаются; слишком длинные обрезаются до
-    ``max_chars``. Симлинки, ведущие за пределы корня, игнорируются.
+    Пустые и нечитаемые файлы пропускаются, симлинки за пределы корня и повторы
+    одного файла под разными именами (симлинк ``DEVASSIST.md → AGENTS.md``) —
+    тоже. Файл длиннее ``max_chars`` обрезается; если все вместе длиннее
+    ``max_total``, место сначала получают более приоритетные (поздние в ``names``).
     """
     root = root.resolve()
-    result: list[InstructionFile] = []
+    base = root if directory is None else directory
+    found: list[tuple[str, str]] = []
+    seen: set[Path] = set()
     for name in names:
-        path = root / name
+        path = base / name
         if not path.is_file() or not is_within(root, path):
+            continue
+        real = path.resolve()
+        if real in seen:
             continue
         try:
             text = path.read_text(encoding="utf-8").strip()
         except (OSError, UnicodeDecodeError):
             continue
-        if not text:
-            continue
-        truncated = len(text) > max_chars
+        if text:
+            seen.add(real)
+            found.append((path.relative_to(root).as_posix(), text))
+
+    budget = max_total
+    result: list[InstructionFile] = []
+    for name, text in reversed(found):
+        limit = max(min(max_chars, budget), 0)
+        truncated = len(text) > limit
         if truncated:
-            text = text[:max_chars]
+            text = text[:limit]
+        budget -= len(text)
         result.append(InstructionFile(name=name, content=text, truncated=truncated))
+    result.reverse()
     return result
+
+
+class NestedInstructions:
+    """Инструкции подкаталогов, с которыми агент уже работал в этом диалоге.
+
+    :meth:`add_paths` получает пути из вызовов инструментов и ищет файлы инструкций
+    в каталогах от корня (не включая — его инструкции и так в промпте) до каталога
+    пути, снаружи вовнутрь. Каждый каталог проверяется один раз. Служебные и
+    исключённые ``.gitignore`` каталоги (``node_modules``, ``.devassist``…) не
+    рассматриваются: чужие инструкции из зависимостей агенту не нужны. Сами файлы
+    инструкций при этом могут быть в ``.gitignore`` (``DEVASSIST.local.md``).
+
+    Конструктор не трогает файловую систему.
+    """
+
+    def __init__(self, root: Path):
+        self._root = root
+        self._checked: set[str] = set()
+        self._files: list[InstructionFile] = []
+
+    @property
+    def files(self) -> tuple[InstructionFile, ...]:
+        """Найденные инструкции — в порядке обнаружения, внешние каталоги раньше."""
+        return tuple(self._files)
+
+    def reset(self) -> None:
+        self._checked.clear()
+        self._files.clear()
+
+    def add_paths(self, paths: Iterable[str]) -> list[InstructionFile]:
+        """Ищет инструкции для ``paths``; возвращает только новые файлы."""
+        root = self._root.resolve()
+        new: list[InstructionFile] = []
+        for raw in paths:
+            directory = _directory_of(root, raw)
+            if directory is None:
+                continue
+            parts = directory.relative_to(root).parts
+            for depth in range(1, len(parts) + 1):
+                rel = "/".join(parts[:depth])
+                if rel in self._checked:
+                    continue
+                self._checked.add(rel)
+                current = root.joinpath(*parts[:depth])
+                if is_excluded(root, current):
+                    continue
+                new += load_instructions(root, directory=current)
+        self._files += new
+        return new
+
+
+def _directory_of(root: Path, raw: str) -> Path | None:
+    """Каталог пути внутри корня: сам путь, если это каталог, иначе родитель."""
+    if not raw or not raw.strip():
+        return None
+    try:
+        path = resolve_in_root(root, raw.strip())
+    except (SandboxError, OSError, ValueError):
+        return None
+    directory = path if path.is_dir() else path.parent
+    if root not in directory.parents:
+        return None  # сам корень: его инструкции и так в системном промпте
+    return directory

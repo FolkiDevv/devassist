@@ -802,3 +802,37 @@ def test_compaction_that_does_not_shrink_is_rejected(tmp_path):
     with pytest.raises(CompactionError):
         agent.compact()
     assert agent.conversation.summary is None
+
+
+# ------------------------- инструкции подкаталогов ------------------------- #
+def test_subdirectory_instructions_join_system_message(tmp_path):
+    from devassist.agent.prompts import NESTED_HEADER
+
+    (tmp_path / "api").mkdir()
+    (tmp_path / "api" / "AGENTS.md").write_text("В api только async-код.", encoding="utf-8")
+    (tmp_path / "api" / "views.py").write_text("x = 1\n", encoding="utf-8")
+    provider = ScriptedProvider(
+        [
+            tool_turn("read_file", {"path": "api/missing.py"}),  # неудачный вызов — не в счёт
+            tool_turn("read_file", {"path": "api/views.py"}),
+            tool_turn("list_dir", {"path": "api"}),
+            text_turn("готово"),
+            text_turn("снова"),
+        ]
+    )
+    events = RecordingEvents()
+    agent = _agent(provider, tmp_path, events=events, auto_approve=False)
+    agent.run_turn("посмотри api")
+
+    systems = [r["messages"][0].content for r in provider.requests]
+    assert [NESTED_HEADER in text for text in systems] == [False, False, True, True]
+    assert "В api только async-код." in systems[-1]
+    assert [text for _, text in events.notices] == [
+        "подключены инструкции подкаталога: api/AGENTS.md"
+    ]
+    # Результат инструмента не дублирует инструкции — они в системном сообщении.
+    assert all("async-код" not in m.content for m in agent.conversation.messages)
+
+    agent.reset()  # новый диалог — инструкции подключатся заново при обращении
+    agent.run_turn("ещё")
+    assert NESTED_HEADER not in provider.requests[-1]["messages"][0].content

@@ -11,7 +11,12 @@ from devassist.project.files import (
     walk_files,
 )
 from devassist.project.index import INDEX_ERRORS, ProjectIndex
-from devassist.project.instructions import INSTRUCTION_FILES, InstructionFile, load_instructions
+from devassist.project.instructions import (
+    INSTRUCTION_FILES,
+    InstructionFile,
+    NestedInstructions,
+    load_instructions,
+)
 from devassist.project.symbols import Symbol, extract_symbols, language_of
 from devassist.project.workspace import DATA_DIR_NAME, Workspace
 
@@ -21,6 +26,7 @@ __all__ = [
     "INDEX_ERRORS",
     "INSTRUCTION_FILES",
     "InstructionFile",
+    "NestedInstructions",
     "ProjectIndex",
     "Symbol",
     "Workspace",
