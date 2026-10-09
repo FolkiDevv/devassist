@@ -42,6 +42,9 @@ class ToolOutcome:
     ok: bool
     changed: bool = False  # успешная изменяющая операция (риск ≥ WRITE)
     rejected: bool = False  # отклонено пользователем
+    # Неуспех, который не говорит о застревании: команда отработала с ненулевым кодом
+    # (grep без совпадений, упавшие тесты). Серию ошибок не меняет.
+    soft: bool = False
 
 
 @dataclass(frozen=True)
@@ -125,7 +128,7 @@ class LoopGuard:
         key = call_key(call)
         if outcome.rejected:
             self._rejected.add(key)  # серия ошибок не меняется: модель не застряла
-        else:
+        elif not outcome.soft:
             self._failures = 0 if outcome.ok else self._failures + 1
         if outcome.changed:
             self._changes += 1

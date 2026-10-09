@@ -84,6 +84,9 @@ class ToolResult:
     ok: bool = True
     summary: str = ""  # краткая строка для UI
     display: Display | None = None  # доп. вывод для пользователя (дифф/листинг)
+    # Неуспех — обычный исход работы (команда вернула ненулевой код), а не сбой
+    # инструмента: не приближает остановку хода по серии ошибок.
+    soft: bool = False
 
     def as_function_content(self) -> str:
         if self.ok:
