@@ -362,3 +362,84 @@ def test_data_dir_symlink_target_is_not_writable(ctx):
     for path in (".devassist/index.sqlite3", "agent-data/index.sqlite3"):
         with pytest.raises(ToolError, match="Служебная папка"):
             w.preview(w.parse({"path": path, "content": "x"}), ctx)
+
+
+# ------------------------------ внутренности git ------------------------------ #
+def _git_layout(root):
+    (root / ".git" / "hooks").mkdir(parents=True)
+    (root / ".git" / "config").write_text("[core]\n", encoding="utf-8")
+    (root / "sub" / ".git").mkdir(parents=True)
+    (root / "sub" / ".git" / "config").write_text("[core]\n", encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    "path",
+    [".git/config", ".GIT/config", ".git/hooks/pre-commit", "sub/.git/config", ".git", "./.git/x"],
+)
+def test_git_internals_are_not_writable(ctx, path):
+    """Правка .git/config превратила бы `git status` (без подтверждения) в запуск
+    произвольной команды (core.fsmonitor, diff.external) — отказ ещё в превью."""
+    _git_layout(ctx.root)
+    w, e = WriteFileTool(), EditFileTool()
+    write = w.parse({"path": path, "content": "[core]\n\tfsmonitor = touch pwned\n"})
+    edit = e.parse({"path": path, "old_string": "[core]", "new_string": "[core]\n\tx = 1"})
+    for tool, params in ((w, write), (e, edit)):
+        with pytest.raises(ToolError, match="Внутренности git"):
+            tool.preview(params, ctx)
+        with pytest.raises(ToolError, match="Внутренности git"):
+            tool.run(params, ctx)
+    assert (ctx.root / ".git" / "config").read_text(encoding="utf-8") == "[core]\n"
+    assert (ctx.root / "sub" / ".git" / "config").read_text(encoding="utf-8") == "[core]\n"
+
+
+def test_git_dir_via_symlink_and_gitdir_file_is_not_writable(ctx):
+    import os
+
+    if os.name == "nt":
+        pytest.skip("симлинки")
+    # раскладка «.git-файл → .bare/»: каталог git лежит в проекте под другим именем
+    (ctx.root / ".bare").mkdir()
+    (ctx.root / ".bare" / "config").write_text("[core]\n", encoding="utf-8")
+    (ctx.root / ".git").write_text("gitdir: ./.bare\n", encoding="utf-8")
+    (ctx.root / "alias").symlink_to(ctx.root / ".bare", target_is_directory=True)
+    w = WriteFileTool()
+    for path in (".bare/config", "alias/config", ".git"):
+        with pytest.raises(ToolError, match="Внутренности git"):
+            w.preview(w.parse({"path": path, "content": "x"}), ctx)
+    assert (ctx.root / ".bare" / "config").read_text(encoding="utf-8") == "[core]\n"
+
+
+def test_git_like_names_stay_writable(ctx):
+    _git_layout(ctx.root)
+    w = WriteFileTool()
+    for path in (".github/workflows/ci.yml", ".gitignore", ".gitattributes", "docs/.gitkeep"):
+        assert w.run(w.parse({"path": path, "content": "x\n"}), ctx).ok
+
+
+def test_git_config_write_rejected_in_accept_edits_mode(tmp_path):
+    """В режиме авто-правок правки не подтверждаются — запись в .git не должна пройти."""
+    from fakes import RecordingEvents, ScriptedProvider, text_turn, tool_turn
+
+    from devassist.agent.loop import Agent
+    from devassist.config import Config
+    from devassist.permissions import PermissionMode
+    from devassist.tools.base import build_default_registry
+
+    _git_layout(tmp_path)
+    provider = ScriptedProvider(
+        [
+            tool_turn(
+                "write_file",
+                {"path": ".git/config", "content": "[core]\n\tfsmonitor = touch pwned\n"},
+            ),
+            text_turn("ок"),
+        ]
+    )
+    events = RecordingEvents()
+    cfg = Config(
+        access_key="x", project_root=tmp_path, stream=False, mode=PermissionMode.ACCEPT_EDITS
+    )
+    Agent(provider, build_default_registry(), cfg, events).run_turn("настрой git")
+    assert events.confirms == []
+    assert (tmp_path / ".git" / "config").read_text(encoding="utf-8") == "[core]\n"
+    assert "Внутренности git" in provider.requests[-1]["messages"][-1].content

@@ -21,6 +21,7 @@ MAX_READ_LINES = 1000
 MAX_LINE_CHARS = 1000
 MAX_READ_CHARS = 60_000
 _BINARY_PROBE = 8192
+GIT_DIR_NAME = ".git"
 
 
 def _rel(ctx: ToolContext, path: Path) -> str:
@@ -30,11 +31,47 @@ def _rel(ctx: ToolContext, path: Path) -> str:
         return str(path)
 
 
-def _writable_path(ctx: ToolContext, path: str) -> Path:
-    """Путь для записи: внутри корня и не в служебной папке ``.devassist/``.
+def _git_dirs(root: Path) -> list[Path]:
+    """Каталоги git проекта: ``<root>/.git`` (раскрытый) или цель ``gitdir:`` из
+    ``.git``-файла (рабочие деревья, сабмодули, раскладка с ``.bare``)."""
+    dot_git = root / GIT_DIR_NAME
+    try:
+        if dot_git.is_dir():
+            return [dot_git.resolve()]
+        if not dot_git.is_file():
+            return []
+        for line in dot_git.read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("gitdir:"):
+                target = Path(line[len("gitdir:") :].strip())
+                return [(target if target.is_absolute() else root / target).resolve()]
+    except OSError:
+        pass
+    return []
 
-    Там лежат индекс, история ввода и чаты агента — модель не должна их править.
-    Проверка срабатывает и в превью, то есть до вопроса о подтверждении.
+
+def _is_git_internal(root: Path, path: Path) -> bool:
+    """Разрешённый путь внутри корня — сам ``.git`` или лежит в каталоге git.
+
+    Компонент ``.git`` сравнивается без учёта регистра (``.GIT`` на macOS/Windows),
+    на любой глубине (вложенные репозитории); ``.github``, ``.gitignore`` — обычные.
+    """
+    try:
+        parts = path.relative_to(root).parts
+    except ValueError:
+        return False
+    if any(part.casefold() == GIT_DIR_NAME for part in parts):
+        return True
+    return any(path == d or d in path.parents for d in _git_dirs(root))
+
+
+def _writable_path(ctx: ToolContext, path: str) -> Path:
+    """Путь для записи: внутри корня, не в ``.devassist/`` и не во внутренностях git.
+
+    В ``.devassist/`` лежат индекс, история ввода и чаты агента — модель не должна
+    их править. Запись в ``.git/`` (``config``, хуки) превратила бы правку файла в
+    выполнение команды: ``core.fsmonitor`` и ``diff.external`` запускаются уже на
+    ``git status``/``git diff``, которые выполняются без подтверждения. Проверка
+    срабатывает и в превью, то есть до вопроса о подтверждении.
     """
     p = resolve_in_root(ctx.root, path)
     data_dir = ctx.workspace.data_dir.resolve()  # .devassist может быть симлинком
@@ -43,6 +80,11 @@ def _writable_path(ctx: ToolContext, path: str) -> Path:
         raise ToolError(
             f"Служебная папка {DATA_DIR_NAME}/ (индекс, история, чаты агента) "
             f"недоступна для записи: {path}"
+        )
+    if _is_git_internal(ctx.root, p):
+        raise ToolError(
+            f"Внутренности git ({GIT_DIR_NAME}/) недоступны для записи: {path}. "
+            "Для операций с репозиторием используйте инструмент git."
         )
     return p
 

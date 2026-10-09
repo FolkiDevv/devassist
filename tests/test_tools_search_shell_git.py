@@ -149,6 +149,86 @@ def test_git_disallowed_subcommand(git_repo):
         g.run(g.parse({"subcommand": "push"}), git_repo)
 
 
+def test_git_command_disables_external_programs():
+    g = GitTool()
+    cmd = g._command(g.parse({"subcommand": "diff", "args": ["--", "a.py"]}))
+    assert cmd[:5] == ["git", "-c", "core.fsmonitor=false", "-c", "safe.bareRepository=explicit"]
+    assert cmd[5:] == ["diff", "--no-ext-diff", "--", "a.py"]
+    assert g._command(g.parse({"subcommand": "log"}))[5:] == [
+        "log",
+        "--no-ext-diff",
+        "--oneline",
+        "-n",
+        "20",
+    ]
+    stash = g._command(g.parse({"subcommand": "stash", "args": ["show", "-p"]}))
+    assert stash[5:] == ["stash", "show", "--no-ext-diff", "-p"]
+    assert g._command(g.parse({"subcommand": "status"}))[5:] == ["status"]
+
+
+def _marker_script(root, name):
+    script = root / f"{name}.sh"
+    marker = root / f"{name}.marker"
+    script.write_text(f'#!/bin/sh\ntouch "{marker}"\nexit 0\n', encoding="utf-8")
+    script.chmod(0o755)
+    return script, marker
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="sh-скрипты")
+def test_git_status_does_not_run_fsmonitor_hook(git_repo):
+    """Подменённый .git/config не запускает команду на `git status` (SAFE, без вопроса)."""
+    root = git_repo.root
+    hook, marker = _marker_script(root, "fsmonitor")
+    subprocess.run(["git", "config", "core.fsmonitor", str(hook)], cwd=root, check=True)
+    subprocess.run(["git", "status"], cwd=root, capture_output=True)
+    if not marker.exists():
+        pytest.skip("эта версия git не запускает fsmonitor-хук")
+    marker.unlink()
+    g = GitTool()
+    g.run(g.parse({"subcommand": "status"}), git_repo)
+    assert not marker.exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="sh-скрипты")
+def test_git_diff_does_not_run_external_diff(git_repo):
+    root = git_repo.root
+    _write(git_repo, "f.txt", "one\n")
+    subprocess.run(["git", "add", "f.txt"], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=root, check=True)
+    _write(git_repo, "f.txt", "two\n")
+    ext, marker = _marker_script(root, "extdiff")
+    subprocess.run(["git", "config", "diff.external", str(ext)], cwd=root, check=True)
+    subprocess.run(["git", "diff"], cwd=root, capture_output=True)
+    assert marker.exists()  # голый git внешнюю программу запускает
+    marker.unlink()
+    g = GitTool()
+    res = g.run(g.parse({"subcommand": "diff"}), git_repo)
+    assert not marker.exists()
+    assert "-one" in res.content and "+two" in res.content
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="sh-скрипты")
+def test_git_ignores_implicit_bare_repository(ctx):
+    """HEAD/config/objects обычными файлами в проекте не делают его bare-репозиторием."""
+    if subprocess.run(["git", "--version"], capture_output=True).returncode:
+        pytest.skip("нет git")
+    bare = ctx.root / "planted"
+    subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+    hook, marker = _marker_script(ctx.root, "planted")
+    subprocess.run(["git", "config", "core.fsmonitor", str(hook)], cwd=bare, check=True)
+    res = subprocess.run(
+        ["git", "-c", "safe.bareRepository=explicit", "status"], cwd=bare, capture_output=True
+    )
+    if res.returncode == 0:
+        pytest.skip("эта версия git не знает safe.bareRepository")
+    from devassist.project.workspace import Workspace
+    from devassist.tools.base import ToolContext
+
+    g = GitTool()
+    out = g.run(g.parse({"subcommand": "log"}), ToolContext(workspace=Workspace(bare)))
+    assert not out.ok and "safe.bareRepository" in out.content and not marker.exists()
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="FIFO")
 def test_search_skips_fifo(ctx):
     import os

@@ -51,6 +51,13 @@ _BRANCH_LIST_FLAGS = {
 _MAX_OUTPUT = 30_000
 _TIMEOUT = 60
 
+# Защита в глубину: даже если настройки репозитория подменены, git не запускает
+# внешние программы на просмотре. fsmonitor-хук выполняется на `status`, внешний
+# diff — на `diff` (и без --ext-diff); неявный bare-репозиторий (HEAD, config,
+# objects/ обычными файлами в каталоге проекта) не распознаётся.
+_SAFE_CONFIG = ("-c", "core.fsmonitor=false", "-c", "safe.bareRepository=explicit")
+_NO_EXT_DIFF = {"diff", "log", "show"}
+
 
 def _is_forbidden(arg: str) -> bool:
     if not arg.startswith("--") or arg == "--":
@@ -114,6 +121,17 @@ class GitTool(Tool):
             if _is_forbidden(arg):
                 raise ToolError(f"Опция '{arg}' запрещена политикой безопасности devassist.")
 
+    @staticmethod
+    def _command(params: GitParams) -> list[str]:
+        sub, args = params.subcommand, list(params.args)
+        if sub == "log" and not args:
+            args = ["--oneline", "-n", "20"]  # компактный лог по умолчанию
+        if sub in _NO_EXT_DIFF:
+            args = ["--no-ext-diff", *args]
+        elif sub == "stash" and args[:1] == ["show"]:
+            args = ["show", "--no-ext-diff", *args[1:]]
+        return ["git", *_SAFE_CONFIG, sub, *args]
+
     def describe(self, params: GitParams) -> str:
         return f"{params.subcommand} {' '.join(params.args)}".strip()
 
@@ -126,10 +144,7 @@ class GitTool(Tool):
 
     def run(self, params: GitParams, ctx: ToolContext) -> ToolResult:
         self._check(params)
-        cmd = ["git", params.subcommand, *params.args]
-        # компактный лог по умолчанию
-        if params.subcommand == "log" and not params.args:
-            cmd = ["git", "log", "--oneline", "-n", "20"]
+        cmd = self._command(params)
         try:
             res = run_process(cmd, cwd=ctx.root, timeout=_TIMEOUT)
         except FileNotFoundError as e:
