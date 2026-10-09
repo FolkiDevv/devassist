@@ -13,6 +13,7 @@ from devassist.agent.session import Session
 from devassist.config import Config
 from devassist.llm.base import LLMProvider
 from devassist.llm.types import Message
+from devassist.project.workspace import Workspace
 from devassist.security import RiskLevel
 from devassist.tools.base import (
     ToolContext,
@@ -36,7 +37,7 @@ class Agent:
         self._registry = registry
         self._cfg = config
         self._ui = ui
-        self._ctx = ToolContext(config=config)
+        self._ctx = ToolContext(workspace=Workspace(config.project_root))
         self._session = session or Session(config.project_root)
 
     @property

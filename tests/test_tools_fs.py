@@ -247,3 +247,40 @@ def test_sandbox_escape_blocked(ctx):
     r = ReadFileTool()
     with pytest.raises(SandboxError):
         r.run(r.parse({"path": "/etc/passwd"}), ctx)
+
+
+def test_find_files_rejects_escape_patterns(ctx):
+    f = FindFilesTool()
+    for pattern in ("../*.toml", "src/../../x", "/etc/*"):
+        with pytest.raises(ToolError):
+            f.run(f.parse({"pattern": pattern}), ctx)
+
+
+def test_find_files_glob_semantics_and_ignored_dirs(ctx):
+    w = WriteFileTool()
+    for path in ("src/a.py", "src/x/b.py", "node_modules/c.py", "z.py"):
+        w.run(w.parse({"path": path, "content": "x"}), ctx)
+    f = FindFilesTool()
+    out = f.run(f.parse({"pattern": "src/**/*.py"}), ctx).content
+    assert out.splitlines() == ["src/a.py", "src/x/b.py"]
+    out = f.run(f.parse({"pattern": "*.py"}), ctx).content
+    assert "node_modules" not in out
+    assert out.splitlines() == ["src/a.py", "src/x/b.py", "z.py"]  # отсортировано
+
+
+def test_find_files_truncation_is_reported(ctx):
+    w = WriteFileTool()
+    for i in range(5):
+        w.run(w.parse({"path": f"f{i}.txt", "content": "x"}), ctx)
+    f = FindFilesTool()
+    out = f.run(f.parse({"pattern": "*.txt", "max_results": 2}), ctx).content
+    assert out.splitlines()[:2] == ["f0.txt", "f1.txt"]
+    assert "показано 2 из 5" in out
+
+
+def test_list_dir_shows_hidden(ctx):
+    (ctx.root / ".github").mkdir()
+    (ctx.root / ".gitignore").write_text("x", encoding="utf-8")
+    lister = ListDirTool()
+    out = lister.run(lister.parse({}), ctx).content
+    assert ".github/" in out and ".gitignore" in out

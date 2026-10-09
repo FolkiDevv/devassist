@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import difflib
-import fnmatch
 import re
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from pydantic import BaseModel, Field
 
+from devassist.project.files import glob_match, walk_files
 from devassist.security import RiskLevel, resolve_in_root
 from devassist.tools.base import Tool, ToolContext, ToolError, ToolResult
 
@@ -357,13 +357,16 @@ class EditFileTool(Tool):
 # --------------------------------------------------------------------------- #
 # list_dir
 # --------------------------------------------------------------------------- #
+MAX_LIST_ENTRIES = 500
+
+
 class ListDirParams(BaseModel):
     path: str = Field(default=".", description="Путь к директории (по умолчанию корень)")
 
 
 class ListDirTool(Tool):
     name = "list_dir"
-    description = "Выводит список файлов и поддиректорий в указанной директории."
+    description = "Выводит список файлов и поддиректорий (включая скрытые) в указанной директории."
     Params = ListDirParams
 
     def run(self, params: ListDirParams, ctx: ToolContext) -> ToolResult:
@@ -371,52 +374,57 @@ class ListDirTool(Tool):
         if not p.is_dir():
             raise ToolError(f"Не директория: {params.path}")
         entries = sorted(p.iterdir(), key=lambda e: (e.is_file(), e.name.lower()))
-        lines = []
-        for e in entries:
-            if e.name.startswith(".") and e.name not in (".env.example",):
-                continue
-            lines.append(f"{e.name}/" if e.is_dir() else e.name)
+        lines = [f"{e.name}/" if e.is_dir() else e.name for e in entries[:MAX_LIST_ENTRIES]]
         body = "\n".join(lines) if lines else "(пусто)"
-        return ToolResult(content=body, summary=f"{_rel(ctx, p)}: {len(lines)} элементов")
+        if len(entries) > MAX_LIST_ENTRIES:
+            body += f"\n… показано {MAX_LIST_ENTRIES} из {len(entries)}"
+        return ToolResult(content=body, summary=f"{_rel(ctx, p)}: {len(entries)} элементов")
 
 
 # --------------------------------------------------------------------------- #
 # find_files
 # --------------------------------------------------------------------------- #
+MAX_FIND_RESULTS = 1000
+
+
 class FindFilesParams(BaseModel):
-    pattern: str = Field(description="Glob-шаблон имени, например '*.py' или 'src/**/*.ts'")
+    pattern: str = Field(
+        description="Glob-шаблон: '*.py' — по имени в любом каталоге, 'src/**/*.ts' — путь от корня"
+    )
     max_results: int = Field(default=200, description="Максимум результатов")
 
 
-_IGNORE_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", ".pytest_cache"}
+def _check_pattern(pattern: str) -> None:
+    """Шаблон должен быть относительным и не подниматься выше корня проекта."""
+    if not pattern:
+        raise ToolError("Пустой шаблон.")
+    if PurePosixPath(pattern).is_absolute() or PureWindowsPath(pattern).is_absolute():
+        raise ToolError("Шаблон должен быть относительным путём от корня проекта.")
+    if ".." in re.split(r"[\\/]", pattern):
+        raise ToolError("Шаблон не может содержать '..' — поиск только внутри проекта.")
 
 
 class FindFilesTool(Tool):
     name = "find_files"
     description = (
-        "Ищет файлы по glob-шаблону имени (рекурсивно). "
+        "Ищет файлы по glob-шаблону (рекурсивно, внутри проекта). Шаблон без '/' "
+        "сравнивается с именем файла, с '/' — с путём от корня ('**' — любые каталоги). "
         "Игнорирует служебные директории (.git, node_modules и т.п.)."
     )
     Params = FindFilesParams
 
     def run(self, params: FindFilesParams, ctx: ToolContext) -> ToolResult:
+        pattern = params.pattern.strip()
+        _check_pattern(pattern)
+        limit = min(max(params.max_results, 1), MAX_FIND_RESULTS)
         root = ctx.root
-        results: list[str] = []
-        # Поддержка как 'glob' от корня, так и простого имени-шаблона рекурсивно.
-        pattern = params.pattern
-        candidates = root.rglob("*") if "/" not in pattern else root.glob(pattern)
-        for path in candidates:
-            if not path.is_file():
-                continue
-            if any(part in _IGNORE_DIRS for part in path.parts):
-                continue
-            rel = _rel(ctx, path)
-            if "/" in pattern:
-                results.append(rel)
-            elif fnmatch.fnmatch(path.name, pattern):
-                results.append(rel)
-            if len(results) >= params.max_results:
-                break
-        results.sort()
-        body = "\n".join(results) if results else "(ничего не найдено)"
-        return ToolResult(content=body, summary=f"найдено файлов: {len(results)}")
+        matches = sorted(
+            rel
+            for rel in (path.relative_to(root).as_posix() for path in walk_files(root))
+            if glob_match(rel, pattern)
+        )
+        shown = matches[:limit]
+        body = "\n".join(shown) if shown else "(ничего не найдено)"
+        if len(matches) > limit:
+            body += f"\n… показано {limit} из {len(matches)}; уточните шаблон"
+        return ToolResult(content=body, summary=f"найдено файлов: {len(matches)}")

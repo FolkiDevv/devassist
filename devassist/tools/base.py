@@ -17,22 +17,26 @@ from typing import Any, Generic, TypeVar
 
 from pydantic import BaseModel
 
-from devassist.config import Config
 from devassist.llm.types import ToolSpec
+from devassist.project.workspace import Workspace
 from devassist.security import RiskLevel
 
 P = TypeVar("P", bound=BaseModel)
 
 
-@dataclass
+@dataclass(frozen=True)
 class ToolContext:
-    """Контекст выполнения, доступный инструменту."""
+    """Контекст выполнения, доступный инструменту.
 
-    config: Config
+    Намеренно не содержит Config: инструментам не нужны (и не должны быть
+    доступны) реквизиты API.
+    """
+
+    workspace: Workspace
 
     @property
     def root(self) -> Path:
-        return self.config.project_root
+        return self.workspace.root
 
 
 @dataclass

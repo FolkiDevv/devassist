@@ -9,15 +9,14 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from devassist.agent.prompts import SYSTEM_PROMPT
-from devassist.context import build_project_context
+from devassist.agent.prompts import build_system_prompt
 from devassist.llm.types import Message
+from devassist.project.workspace import Workspace
 
 
 class Session:
     def __init__(self, project_root: Path, *, max_messages: int = 80):
-        context = build_project_context(project_root)
-        system = f"{SYSTEM_PROMPT}\n\n=== КОНТЕКСТ ПРОЕКТА ===\n{context}"
+        system = build_system_prompt(Workspace(project_root))
         self._system = Message(role="system", content=system)
         self._history: list[Message] = []
         self._max_messages = max_messages

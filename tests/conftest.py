@@ -12,6 +12,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from devassist.config import Config, load_environment  # noqa: E402
+from devassist.project.workspace import Workspace  # noqa: E402
 from devassist.tools.base import ToolContext  # noqa: E402
 
 
@@ -27,8 +28,8 @@ def config(project: Path) -> Config:
 
 
 @pytest.fixture
-def ctx(config: Config) -> ToolContext:
-    return ToolContext(config=config)
+def ctx(project: Path) -> ToolContext:
+    return ToolContext(workspace=Workspace(project))
 
 
 @pytest.fixture(scope="session")
