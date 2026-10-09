@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from devassist.agent.chat_store import ChatRecorder, ChatStoreError, SavedChat
 from devassist.agent.loop import Agent
 from devassist.cli.indexing import describe_index, run_indexing
+from devassist.cli.models import ModelCatalog, describe_model, ensure_context_window
 from devassist.cli.prompt import KEY_HELP
 from devassist.project.index import ProjectIndex
 from devassist.ui.console import Console
@@ -28,6 +29,7 @@ class CommandContext:
     chats: ChatRecorder | None = None  # None — чаты не сохраняются (тесты)
     # Прерывание долгих команд клавишей Esc (как хода агента); None — только Ctrl+C.
     interrupt: AbstractContextManager[object] | None = None
+    models: ModelCatalog | None = None  # список моделей для /model (None — не загружался)
 
 
 # Обработчик получает контекст и аргумент (текст после имени команды).
@@ -99,11 +101,24 @@ def _help(ctx: CommandContext, _arg: str) -> bool:
 
 
 def _model(ctx: CommandContext, arg: str) -> bool:
-    if arg:
-        ctx.agent.set_model(arg)
-        ctx.ui.info(f"модель теперь: {arg} (применится со следующего запроса)")
-    else:
-        ctx.ui.info(f"текущая модель: {ctx.agent.model}")
+    agent = ctx.agent
+    known = ctx.models.models if ctx.models is not None else None
+    if not arg:
+        lines = [f"текущая модель: {agent.model} ({describe_model(agent.model, agent.windows)})"]
+        if known:
+            lines.append("доступные модели:")
+            lines += [f"  • {name} — {describe_model(name, agent.windows)}" for name in known]
+        ctx.ui.info("\n".join(lines))
+        return True
+    agent.set_model(arg)
+    if known and arg not in known:
+        ctx.ui.warn(f"модели {arg} нет в списке доступных чат-моделей")
+    ctx.ui.info(f"модель теперь: {arg} (применится со следующего запроса)")
+    ensure_context_window(agent, ctx.ui, interrupt=ctx.interrupt)
+    if ctx.chats is not None:  # модель — часть чата: сохраняем, не дожидаясь хода
+        warning = ctx.chats.save(agent.conversation, model=agent.model)
+        if warning:
+            ctx.ui.warn(warning)
     return True
 
 
@@ -118,9 +133,16 @@ def _clear(ctx: CommandContext, _arg: str) -> bool:
 RESUME_LIMIT = 100  # сколько последних чатов показывает селектор
 
 
-def resume_chat(agent: Agent, chats: ChatRecorder, saved: SavedChat) -> None:
-    """Продолжить сохранённый чат: дальнейшие ходы дописываются в него же."""
+def resume_chat(
+    agent: Agent, chats: ChatRecorder, saved: SavedChat, *, keep_model: bool = False
+) -> None:
+    """Продолжить сохранённый чат: дальнейшие ходы дописываются в него же.
+
+    Модель чата становится текущей, если не ``keep_model`` (модель задана явно, ``-m``).
+    """
     agent.reset(saved.conversation)
+    if saved.info.model and not keep_model:
+        agent.set_model(saved.info.model)
     chats.switch_to(saved.info)
 
 
@@ -144,8 +166,12 @@ def _resume(ctx: CommandContext, arg: str) -> bool:
     except ChatStoreError as e:
         ctx.ui.error(str(e))
         return True
+    previous = ctx.agent.model
     resume_chat(ctx.agent, ctx.chats, saved)
     ctx.ui.chat_resumed(saved.info, saved.conversation.messages)
+    if ctx.agent.model != previous:
+        ctx.ui.info(f"модель чата: {ctx.agent.model}")
+        ensure_context_window(ctx.agent, ctx.ui, interrupt=ctx.interrupt)
     return True
 
 

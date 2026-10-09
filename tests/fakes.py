@@ -8,7 +8,7 @@ from typing import Any
 from pydantic import BaseModel
 
 from devassist.agent.events import AgentEvents, ToolCallInfo, TurnStats
-from devassist.llm.base import LLMProvider
+from devassist.llm.base import LLMProvider, PromptTooLong
 from devassist.llm.types import AssistantTurn, FunctionCall, Message, Usage
 from devassist.tools.base import Display, Tool, ToolContext, ToolResult
 
@@ -46,6 +46,51 @@ class ScriptedProvider(LLMProvider):
         if on_delta and turn.message.content:
             on_delta(turn.message.content)
         return turn
+
+
+class WindowProvider(ScriptedProvider):
+    """Провайдер с окном ``window`` токенов для замера (токен ≈ ``chars_per_token`` символа).
+
+    Отказ — :class:`PromptTooLong` со статусом ``status``; ``hint`` — текст отказа
+    называет лимит (как vLLM). Каждая проба пишется в ``measured`` (модель, токены).
+    """
+
+    supports_measure = True
+
+    def __init__(
+        self,
+        window: int,
+        turns: Iterable[AssistantTurn | BaseException] = (),
+        *,
+        chars_per_token: float = 3.3,
+        hint: bool = False,
+        status: int | None = 422,
+        error: BaseException | None = None,
+        overhead: int = 5,
+    ):
+        super().__init__(turns)
+        self.window = window
+        self.chars_per_token = chars_per_token
+        self.hint = hint
+        self.status = status
+        self.error = error
+        self.overhead = overhead  # служебные токены сообщения
+        self.measured: list[tuple[str | None, int]] = []
+
+    def measure_prompt(self, text: str, *, model: str | None = None) -> int:
+        if self.error is not None:
+            raise self.error
+        tokens = int(len(text) / self.chars_per_token) + self.overhead
+        self.measured.append((model, tokens))
+        if tokens + 1 > self.window:
+            detail = (
+                f"This model's maximum context length is {self.window} tokens. "
+                f"However, you requested {tokens + 1} tokens"
+                if self.hint
+                else "Request too large"
+            )
+            raise PromptTooLong(self.status, detail)
+        return tokens
 
 
 def text_turn(text: str, usage: Usage | None = None) -> AssistantTurn:

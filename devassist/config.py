@@ -100,6 +100,13 @@ def _env_int(env: Mapping[str, str], name: str, default: int, *, minimum: int = 
     return value
 
 
+def _env_optional_int(env: Mapping[str, str], name: str, *, minimum: int = 1) -> int | None:
+    raw = env.get(name)
+    if raw is None or not raw.strip():
+        return None
+    return _env_int(env, name, 0, minimum=minimum)
+
+
 def _env_float(env: Mapping[str, str], name: str, default: float, *, lo: float, hi: float) -> float:
     raw = env.get(name)
     if raw is None or not raw.strip():
@@ -150,8 +157,9 @@ class Config:
     temperature: float = 0.2
     stream: bool = True  # потоковый (посимвольный) вывод ответа модели
     # Бюджет контекста (оценка в токенах), в который укладывается история при
-    # отправке модели. Старые сообщения сверх бюджета отбрасываются.
-    context_budget_tokens: int = 60_000
+    # отправке модели; старые сообщения сверх бюджета отбрасываются. None — от
+    # замеренного окна модели (~/.devassist/models.json), число — явное переопределение.
+    context_budget_tokens: int | None = None
     # Сохранять чаты в .devassist/chats/ (продолжение — /resume, --continue).
     save_chats: bool = True
 
@@ -198,7 +206,7 @@ class Config:
             auto_approve=auto_approve,
             stream=stream,
             temperature=_env_float(env, "DEVASSIST_TEMPERATURE", 0.2, lo=0.0, hi=2.0),
-            context_budget_tokens=_env_int(env, "DEVASSIST_CONTEXT_TOKENS", 60_000, minimum=4_000),
+            context_budget_tokens=_env_optional_int(env, "DEVASSIST_CONTEXT_TOKENS", minimum=4_000),
             save_chats=save_chats and _env_bool(env, "DEVASSIST_SAVE_CHATS", True),
         )
 

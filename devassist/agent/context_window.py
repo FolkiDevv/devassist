@@ -14,11 +14,24 @@ from __future__ import annotations
 import json
 from collections.abc import Iterable, Sequence
 
-from devassist.llm.types import Message
+from devassist.llm.types import Message, ToolSpec
 
 # Грубая оценка для русского/кода: ~3 символа на токен (с запасом).
 CHARS_PER_TOKEN = 3
 MESSAGE_OVERHEAD_TOKENS = 4
+
+# Окно, если провайдер не знает модель: консервативно, как у самых старых моделей.
+DEFAULT_CONTEXT_WINDOW = 32_000
+# Место под ответ модели: max_tokens в запросе не задаётся.
+RESPONSE_RESERVE_TOKENS = 8_000
+# Доля окна, отдаваемая под запрос, — запас на погрешность оценки токенов.
+ESTIMATE_SAFETY = 0.9
+MIN_BUDGET_TOKENS = 4_000
+
+
+def budget_for_window(window: int) -> int:
+    """Бюджет запроса (по оценке) для модели с окном ``window`` токенов."""
+    return max(int((window - RESPONSE_RESERVE_TOKENS) * ESTIMATE_SAFETY), MIN_BUDGET_TOKENS)
 
 
 def estimate_text_tokens(text: str) -> int:
@@ -35,6 +48,11 @@ def estimate_message_tokens(message: Message) -> int:
 
 def estimate_tokens(messages: Iterable[Message]) -> int:
     return sum(estimate_message_tokens(m) for m in messages)
+
+
+def estimate_specs_tokens(specs: Iterable[ToolSpec]) -> int:
+    """Схемы инструментов уходят в каждом запросе и тоже занимают окно."""
+    return sum(estimate_text_tokens(json.dumps(s.model_dump(), ensure_ascii=False)) for s in specs)
 
 
 def _blocks(history: Sequence[Message]) -> list[list[Message]]:
