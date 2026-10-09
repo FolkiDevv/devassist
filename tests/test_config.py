@@ -113,3 +113,10 @@ def test_compaction_settings(tmp_path):
     assert cfg.auto_compact is True and cfg.compact_threshold == 0.8
     cfg = load({"DEVASSIST_AUTO_COMPACT": "0", "DEVASSIST_COMPACT_THRESHOLD": "65"})
     assert cfg.auto_compact is False and cfg.compact_threshold == 0.65
+
+
+def test_yes_all_implies_auto_approve(tmp_path):
+    cfg = Config.load(project_root=tmp_path, yes_all=True, environ={}, cwd=tmp_path)
+    assert cfg.auto_approve and cfg.yes_all
+    cfg = Config.load(project_root=tmp_path, auto_approve=True, environ={}, cwd=tmp_path)
+    assert cfg.auto_approve and not cfg.yes_all

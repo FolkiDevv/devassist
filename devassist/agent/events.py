@@ -15,8 +15,10 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from enum import Enum
 from typing import Literal
 
+from devassist.permissions import ToolKind
 from devassist.tools.base import Display, ToolResult
 from devassist.tools.questions import Answer, Question, QuestionsUnavailable
 
@@ -29,6 +31,17 @@ class ToolCallInfo:
 
     name: str
     summary: str = ""
+    kind: ToolKind = ToolKind.OTHER  # правка файлов, команда или прочее (для формулировок)
+
+
+class Approval(Enum):
+    """Ответ на подтверждение операции."""
+
+    NO = "no"
+    YES = "yes"
+    # Да, и не спрашивать до конца сессии: для правок файлов — режим авто-правок,
+    # для прочего — этот же вызов (те же аргументы).
+    ALWAYS = "always"
 
 
 @dataclass
@@ -86,8 +99,14 @@ class AgentEvents:
     def on_tool_call(self, call: ToolCallInfo) -> None:
         """Модель вызвала инструмент."""
 
-    def confirm(self, call: ToolCallInfo, preview: Display | None, *, dangerous: bool) -> bool:
-        """Спросить пользователя, выполнять ли изменяющую/опасную операцию."""
+    def confirm(
+        self, call: ToolCallInfo, preview: Display | None, *, dangerous: bool
+    ) -> bool | Approval:
+        """Спросить пользователя, выполнять ли изменяющую/опасную операцию.
+
+        ``True``/``False`` — да/нет; :attr:`Approval.ALWAYS` — да и не спрашивать
+        такое до конца сессии (для опасных операций не предлагается).
+        """
         return False
 
     def on_tool_start(self, call: ToolCallInfo) -> None:

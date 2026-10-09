@@ -41,13 +41,14 @@ from rich.theme import Theme
 from devassist.agent.chat_store import ChatInfo
 from devassist.agent.events import (
     AgentEvents,
+    Approval,
     CompactResult,
     NoticeLevel,
     ToolCallInfo,
     TurnStats,
 )
 from devassist.llm.types import Message
-from devassist.permissions import PermissionMode
+from devassist.permissions import PermissionMode, ToolKind
 from devassist.tools.ask_user import format_answer
 from devassist.tools.base import Display, ToolResult
 from devassist.tools.questions import Answer, Question, QuestionsUnavailable
@@ -349,7 +350,10 @@ class Console(AgentEvents):
             hint.append(f" {desc}", style=MUTED)
         self._c.print(hint)
         if auto_approve:
-            self.warn("авто-подтверждение включено (-y): изменения применяются без вопросов")
+            self.warn(
+                "авто-подтверждение включено (-y): изменения применяются без вопросов, "
+                "опасные команды — с вопросом (--yes-all — и они без вопроса)"
+            )
         self._c.print()
 
     def help(
@@ -533,31 +537,52 @@ class Console(AgentEvents):
         self._c.print(Text("  " + "  ·  ".join(parts), style=MUTED))
 
     # -------------------------- подтверждения --------------------------- #
-    def confirm(self, call: ToolCallInfo, preview: Display | None, *, dangerous: bool) -> bool:
+    def confirm(self, call: ToolCallInfo, preview: Display | None, *, dangerous: bool) -> Approval:
         if preview and preview.text.strip():
             if preview.kind == "diff":
                 self.diff(preview.text, title=preview.title or None)
             else:
                 self.output_block(preview.text, title=preview.title or "превью")
-        action = "Выполнить" if dangerous else "Применить"
+        edit = call.kind is ToolKind.EDIT
+        action = "Применить" if edit else "Выполнить"
         target = f" ({sanitize(call.summary)})" if call.summary else ""
-        return self.ask(f"{action} {call.name}{target}?", dangerous=dangerous)
+        always = None
+        if not dangerous:  # опасное «навсегда» не разрешается
+            always = (
+                "правки файлов без вопросов до конца сессии (режим «авто-правки»)"
+                if edit
+                else "не спрашивать этот вызов до конца сессии"
+            )
+        answer = self._question(
+            f"{action} {call.name}{target}?", dangerous=dangerous, always=always
+        )
+        if answer in _YES:
+            return Approval.YES
+        if always is not None and answer in _ALWAYS:
+            return Approval.ALWAYS
+        return Approval.NO
 
     def ask(self, question: str, *, dangerous: bool = False) -> bool:
         """Вопрос да/нет. Ctrl+C/Ctrl+D — «нет»."""
+        return self._question(question, dangerous=dangerous) in _YES
+
+    def _question(self, question: str, *, dangerous: bool, always: str | None = None) -> str:
+        """Ответ на вопрос (в нижнем регистре); Ctrl+C/Ctrl+D — пустой."""
         self.stop_live()
         color = DANGER if dangerous else WARN
+        if always is not None:
+            self._c.print(Text(f"  a — {always}", style=MUTED))
         prompt = Text("  ")
         prompt.append("⚠ ОПАСНО: " if dangerous else "? ", style=f"bold {color}")
         prompt.append(question, style="bold")
-        prompt.append(" [y/N] ", style=MUTED)
+        prompt.append(" [y/N/a] " if always is not None else " [y/N] ", style=MUTED)
         try:
             with self._input_guard():
                 answer = self._c.input(prompt)
         except (EOFError, KeyboardInterrupt):
             self._c.print()
-            return False
-        return answer.strip().lower() in ("y", "yes", "д", "да")
+            return ""
+        return answer.strip().lower()
 
     # ---------------------------- вопросы агента ---------------------------- #
     def ask_user(self, questions: Sequence[Question]) -> list[Answer] | None:
@@ -727,6 +752,10 @@ class Console(AgentEvents):
             else:
                 self._c.print(Text("  (ответа нет — ход не был завершён)", style=MUTED))
         self._c.print()
+
+
+_YES = ("y", "yes", "д", "да")
+_ALWAYS = ("a", "always", "в", "всегда")
 
 
 def _stdin_is_terminal() -> bool:

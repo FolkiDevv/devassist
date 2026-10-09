@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import shlex
+
 from pydantic import BaseModel, Field
 
 from devassist.security import RiskLevel
@@ -133,7 +135,8 @@ class GitTool(Tool):
         return ["git", *_SAFE_CONFIG, sub, *args]
 
     def describe(self, params: GitParams) -> str:
-        return f"{params.subcommand} {' '.join(params.args)}".strip()
+        # с кавычками, как в shell: `commit -m 'fix bug'`, а не `commit -m fix bug`
+        return f"{params.subcommand} {shlex.join(params.args)}".strip()
 
     def preview(self, params: GitParams, ctx: ToolContext) -> Display | None:
         # Сначала валидация: недопустимую команду не предлагаем подтверждать.

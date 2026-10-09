@@ -969,3 +969,55 @@ def test_invalid_call_is_shown_with_tool_line(tmp_path):
     assert ("tool_call", "(неизвестный инструмент)") in kinds
     first_call = kinds.index(("tool_call", "(неверные аргументы)"))
     assert kinds[first_call + 1][0] == "tool_result"
+
+
+# --------------------------- «всегда» и -y для опасного --------------------------- #
+class _ApprovingEvents(RecordingEvents):
+    def __init__(self, answers):
+        super().__init__()
+        self._answers = list(answers)
+
+    def confirm(self, call, preview, *, dangerous):
+        self.confirms.append((call, preview, dangerous))
+        return self._answers.pop(0)
+
+
+def test_always_for_edit_switches_to_accept_edits(tmp_path):
+    from devassist.agent.events import Approval
+
+    writes = [tool_turn("write_file", {"path": f"f{i}.txt", "content": "x"}) for i in range(2)]
+    provider = ScriptedProvider([*writes, text_turn("ок")])
+    events = _ApprovingEvents([Approval.ALWAYS])
+    agent = _agent(provider, tmp_path, events=events, auto_approve=False)
+    agent.run_turn("x")
+    assert len(events.confirms) == 1  # вторая правка — уже без вопроса
+    assert agent.mode is PermissionMode.ACCEPT_EDITS
+    assert (tmp_path / "f1.txt").exists()
+    assert any("авто-правки" in text for _, text in events.notices)
+
+
+def test_always_for_command_allows_only_the_same_call(tmp_path):
+    from devassist.agent.events import Approval
+
+    echo = tool_turn("run_shell", {"command": "echo 1"})
+    other = tool_turn("run_shell", {"command": "echo 2"})
+    provider = ScriptedProvider([echo, text_turn("ок"), echo, other, text_turn("ок")])
+    events = _ApprovingEvents([Approval.ALWAYS, Approval.YES])
+    agent = _agent(provider, tmp_path, events=events, auto_approve=False)
+    agent.run_turn("x")
+    agent.run_turn("ещё")  # разрешение действует и в следующих ходах
+    assert [call.summary for call, _, _ in events.confirms] == ["echo 1", "echo 2"]
+    assert agent.mode is PermissionMode.MANUAL
+
+
+def test_yes_flag_still_asks_for_dangerous_commands(tmp_path):
+    rm = tool_turn("run_shell", {"command": "rm -rf build"})
+    provider = ScriptedProvider([rm, text_turn("ок")])
+    events = RecordingEvents(confirm_answer=False)
+    agent = _agent(provider, tmp_path, events=events)  # auto_approve=True
+    agent.run_turn("почисти")
+    assert [dangerous for _, _, dangerous in events.confirms] == [True]
+    provider = ScriptedProvider([rm, text_turn("ок")])
+    events = RecordingEvents(confirm_answer=False)
+    _agent(provider, tmp_path, events=events, yes_all=True).run_turn("почисти")
+    assert events.confirms == []

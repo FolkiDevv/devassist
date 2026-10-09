@@ -29,8 +29,14 @@ from devassist.agent.context_window import (
     fit_history,
 )
 from devassist.agent.conversation import Conversation, Summary
-from devassist.agent.events import AgentEvents, CompactResult, ToolCallInfo, TurnStats
-from devassist.agent.guard import CallCheck, LoopGuard, ToolOutcome
+from devassist.agent.events import (
+    AgentEvents,
+    Approval,
+    CompactResult,
+    ToolCallInfo,
+    TurnStats,
+)
+from devassist.agent.guard import CallCheck, LoopGuard, ToolOutcome, call_key
 from devassist.agent.prompts import (
     build_system_prompt,
     mode_prompt,
@@ -41,7 +47,7 @@ from devassist.config import Config
 from devassist.llm.base import LLMError, LLMProvider
 from devassist.llm.model_windows import ModelWindows
 from devassist.llm.types import AssistantTurn, Message, ToolSpec, Usage
-from devassist.permissions import Decision, PermissionMode, decide, next_mode
+from devassist.permissions import Decision, PermissionMode, ToolKind, decide, next_mode
 from devassist.project.instructions import NestedInstructions
 from devassist.project.workspace import Workspace
 from devassist.security import RiskLevel
@@ -135,6 +141,9 @@ class Agent:
         # Реальные токены / оценка по модели: оценка ~3 символа на токен грубая, а
         # бюджеты считаются в её единицах (калибруется по prompt_tokens ответов).
         self._token_scale: dict[str, float] = {}
+        # Вызовы, которые пользователь разрешил «всегда» (до конца сессии; reset() не
+        # сбрасывает — как и режим).
+        self._session_allowed: set[str] = set()
         self._last_estimate = 0  # оценка последнего отправленного запроса
 
     # ------------------------------------------------------------------ #
@@ -586,15 +595,24 @@ class Agent:
             self._events.on_tool_call(invalid)
             return self._fail(invalid, f"валидация аргументов: {e}", note=note)
 
-        call = ToolCallInfo(name, self._describe(tool, params))
+        call = ToolCallInfo(name, self._describe(tool, params), tool.kind)
         self._events.on_tool_call(call)
+        key = call_key(msg.function_call)
 
         # 2) Разрешение по режиму: выполнить, спросить или заблокировать
         previewed = False
         risk = RiskLevel.SAFE
         try:
             risk = tool.risk(params, self._ctx)
-            decision = decide(self._mode, risk, tool.kind, auto_approve=self._cfg.auto_approve)
+            decision = decide(
+                self._mode,
+                risk,
+                tool.kind,
+                auto_approve=self._cfg.auto_approve,
+                yes_all=self._cfg.yes_all,
+            )
+            if decision is Decision.ASK and key in self._session_allowed:
+                decision = Decision.ALLOW  # пользователь разрешил этот вызов «всегда»
             if decision is Decision.BLOCK:
                 return self._fail(
                     call,
@@ -616,7 +634,12 @@ class Agent:
                 # не запускается и подтверждение не запрашивается.
                 preview = tool.preview(params, self._ctx)
                 dangerous = risk >= RiskLevel.DANGEROUS
-                if not self._events.confirm(call, preview, dangerous=dangerous):
+                answer = self._events.confirm(call, preview, dangerous=dangerous)
+                if isinstance(answer, bool):
+                    answer = Approval.YES if answer else Approval.NO
+                if answer is Approval.ALWAYS and not dangerous:
+                    self._allow_always(call, key)
+                elif answer is not Approval.YES:
                     self._fail(call, "отклонено пользователем", model_text=REJECTED_NOTE, note=note)
                     return ToolOutcome(ok=False, rejected=True)
                 previewed = preview is not None
@@ -646,6 +669,21 @@ class Agent:
             self._attach_instructions(tool, params)
         return ToolOutcome(
             ok=result.ok, changed=result.ok and risk >= RiskLevel.WRITE, soft=result.soft
+        )
+
+    def _allow_always(self, call: ToolCallInfo, key: str) -> None:
+        """«Да, и не спрашивать»: правки — режим авто-правок, прочее — этот вызов."""
+        if call.kind is ToolKind.EDIT:
+            if self._mode is PermissionMode.MANUAL:
+                self.set_mode(PermissionMode.ACCEPT_EDITS)
+                self._events.on_notice(
+                    "режим «авто-правки»: дальнейшие правки файлов — без вопросов "
+                    "(Shift+Tab — сменить)"
+                )
+            return
+        self._session_allowed.add(key)
+        self._events.on_notice(
+            f"{call.name} с этими аргументами больше не требует подтверждения до конца сессии"
         )
 
     def _attach_instructions(self, tool: Tool, params: BaseModel) -> None:

@@ -256,3 +256,10 @@ def test_search_skips_symlinks_to_secrets(tmp_path):
     ctx = ToolContext(workspace=Workspace(tmp_path))
     result = SearchContentTool().run(SearchContentParams(pattern="s3cr3t"), ctx)
     assert "s3cr3t" not in result.content
+
+
+def test_git_describe_quotes_arguments():
+    g = GitTool()
+    params = g.parse({"subcommand": "commit", "args": ["-m", "fix bug"]})
+    assert g.describe(params) == "commit -m 'fix bug'"
+    assert g.preview(params, None).text == "$ git commit -m 'fix bug'"

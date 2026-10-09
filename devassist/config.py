@@ -169,7 +169,8 @@ class Config:
 
     # --- Агент / окружение ---
     project_root: Path = field(default_factory=Path.cwd)
-    auto_approve: bool = False  # пропускать подтверждения (опасно)
+    auto_approve: bool = False  # пропускать подтверждения, кроме опасных операций (-y)
+    yes_all: bool = False  # пропускать и подтверждения опасных операций (--yes-all)
     # Начальный режим разрешений (ручной / авто-правки / план); в работе режим
     # меняется в агенте (Shift+Tab, /mode).
     mode: PermissionMode = PermissionMode.MANUAL
@@ -201,6 +202,7 @@ class Config:
         project_root: Path | None = None,
         model: str | None = None,
         auto_approve: bool = False,
+        yes_all: bool = False,
         mode: PermissionMode | None = None,
         stream: bool = True,
         save_chats: bool = True,
@@ -235,7 +237,8 @@ class Config:
             verify_ssl=_env_bool(env, "GIGACHAT_VERIFY_SSL", False),
             timeout=_env_int(env, "GIGACHAT_TIMEOUT", 120),
             project_root=root,
-            auto_approve=auto_approve,
+            auto_approve=auto_approve or yes_all,
+            yes_all=yes_all,
             mode=mode or _env_mode(env, "DEVASSIST_MODE"),
             stream=stream,
             temperature=_env_float(env, "DEVASSIST_TEMPERATURE", 0.2, lo=0.0, hi=2.0),

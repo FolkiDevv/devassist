@@ -31,3 +31,26 @@ def test_classify_shell():
     assert classify_shell_command("sudo apt update") == RiskLevel.DANGEROUS
     assert classify_shell_command("curl http://x") == RiskLevel.DANGEROUS
     assert classify_shell_command("git reset --hard") == RiskLevel.DANGEROUS
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "git push -f origin main",
+        "git push -fu origin main",
+        "git push origin +main",
+        "git branch -D feature",
+        "git stash drop",
+        "git stash clear",
+        "find . -name '*.pyc' -delete",
+    ],
+)
+def test_destructive_commands_are_dangerous(command):
+    assert classify_shell_command(command) == RiskLevel.DANGEROUS
+
+
+@pytest.mark.parametrize(
+    "command", ["git push origin main", "git branch -d merged", "git stash list", "find . -name x"]
+)
+def test_ordinary_commands_are_not_dangerous(command):
+    assert classify_shell_command(command) == RiskLevel.WRITE

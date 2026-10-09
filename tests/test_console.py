@@ -193,13 +193,23 @@ def test_long_tool_output_is_clipped():
 
 
 def test_confirm_question_includes_summary(monkeypatch):
+    from devassist.agent.events import Approval
+    from devassist.permissions import ToolKind
+
     ui, buf = _console()
-    monkeypatch.setattr(ui._c, "input", lambda prompt: (ui._c.print(prompt), "д")[1])
-    assert ui.confirm(ToolCallInfo("edit_file", "a.py"), None, dangerous=False) is True
-    assert "Применить edit_file (a.py)?" in buf.getvalue()
-    monkeypatch.setattr(ui._c, "input", lambda prompt: (ui._c.print(prompt), "")[1])
-    assert ui.confirm(ToolCallInfo("run_shell", "rm -rf x"), None, dangerous=True) is False
-    assert "ОПАСНО" in buf.getvalue()
+    answers = iter(["д", "", "a", "a"])
+    monkeypatch.setattr(ui._c, "input", lambda prompt: (ui._c.print(prompt), next(answers))[1])
+    edit = ToolCallInfo("edit_file", "a.py", ToolKind.EDIT)
+    assert ui.confirm(edit, None, dangerous=False) is Approval.YES
+    out = buf.getvalue()
+    assert "Применить edit_file (a.py)? [y/N/a]" in out and "режим «авто-правки»" in out
+    danger = ToolCallInfo("run_shell", "rm -rf x", ToolKind.COMMAND)
+    assert ui.confirm(danger, None, dangerous=True) is Approval.NO
+    assert "ОПАСНО: Выполнить run_shell (rm -rf x)? [y/N] " in buf.getvalue()
+    command = ToolCallInfo("run_shell", "pytest -q", ToolKind.COMMAND)
+    assert ui.confirm(command, None, dangerous=False) is Approval.ALWAYS
+    assert "Выполнить run_shell (pytest -q)?" in buf.getvalue()
+    assert ui.confirm(danger, None, dangerous=True) is Approval.NO  # «a» для опасного — нет
 
 
 def test_format_helpers():

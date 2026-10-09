@@ -59,7 +59,12 @@ def build_parser() -> argparse.ArgumentParser:
         "-y",
         "--yes",
         action="store_true",
-        help="Авто-подтверждение всех операций (используйте осознанно)",
+        help="Авто-подтверждение операций, кроме опасных (rm -rf, git reset --hard…)",
+    )
+    p.add_argument(
+        "--yes-all",
+        action="store_true",
+        help="Авто-подтверждение всех операций, включая опасные (используйте осознанно)",
     )
     p.add_argument(
         "--mode",
@@ -187,6 +192,7 @@ def main(argv: list[str] | None = None) -> int:
             project_root=root,
             model=args.model,
             auto_approve=args.yes,
+            yes_all=args.yes_all,
             mode=PermissionMode(args.mode) if args.mode else None,
             stream=not args.no_stream,
             save_chats=not args.no_save,

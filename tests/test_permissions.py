@@ -63,7 +63,14 @@ def test_decision_matrix(mode, risk, kind, expected):
     ],
 )
 def test_auto_approve(mode, kind, expected):
-    assert decide(mode, RiskLevel.DANGEROUS, kind, auto_approve=True) is expected
+    assert decide(mode, RiskLevel.WRITE, kind, auto_approve=True) is expected
+    # опасное без вопроса — только с --yes-all
+    assert decide(mode, RiskLevel.DANGEROUS, kind, auto_approve=True, yes_all=True) is expected
+
+
+@pytest.mark.parametrize("mode", [MANUAL, EDITS, PLAN])
+def test_auto_approve_still_asks_for_dangerous(mode):
+    assert decide(mode, RiskLevel.DANGEROUS, ToolKind.COMMAND, auto_approve=True) is ASK
 
 
 def test_cycle_order():

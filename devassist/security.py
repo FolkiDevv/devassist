@@ -56,6 +56,11 @@ _DANGEROUS_PATTERNS = [
     r"\bchmod\s+-R\b",
     r"\bchown\s+-R\b",
     r"\bgit\s+push\b.*--force",
+    r"\bgit\s+push\b.*\s-[a-zA-Z]*f[a-zA-Z]*\b",  # -f, -fu…
+    r"\bgit\s+push\b.*\s\+\S",  # +refspec — тоже принудительный push
+    r"\bgit\s+branch\b.*\s(?-i:-D)\b",
+    r"\bgit\s+stash\s+(?:drop|clear)\b",
+    r"\bfind\b.*\s-delete\b",
     r"\bgit\s+reset\s+--hard\b",
     r"\bgit\s+clean\b",
     r"\bshutdown\b|\breboot\b",
