@@ -208,6 +208,7 @@ def test_repl_prefills_typeahead_and_uses_esc(cli_env, capsys):
     import contextlib
 
     agent, ui, commands, _, provider = cli_env
+    (agent.workspace.root / ".git").mkdir()  # автоиндекс при старте — только в репозитории
 
     class FakeEsc:
         enabled = True
@@ -512,6 +513,7 @@ def _index_complete(agent) -> bool:
 
 def test_repl_builds_index_before_first_input(cli_env, capsys):
     agent, ui, commands, _, _ = cli_env
+    (agent.workspace.root / ".git").mkdir()  # автоиндекс — только в git-репозитории
     (agent.workspace.root / "mod.py").write_text("def f():\n    pass\n", encoding="utf-8")
     seen = []
 
@@ -529,6 +531,18 @@ def test_repl_builds_index_before_first_input(cli_env, capsys):
     assert "индексирую" not in _out(capsys)
 
 
+def test_repl_does_not_index_outside_git_repo(cli_env, capsys):
+    """Запуск в $HOME или другой не-проектной папке не обходит всё её дерево."""
+    agent, ui, commands, ctx, _ = cli_env
+    (agent.workspace.root / "mod.py").write_text("def f():\n    pass\n", encoding="utf-8")
+    assert run_repl(agent, ui, commands, read_input=_reader("/exit")) == 0
+    out = _out(capsys)
+    assert "не в git-репозитории" in out and "индексирую" not in out
+    assert not (agent.workspace.root / ".devassist").exists()
+    commands.dispatch("/index", ctx)  # вручную — строится
+    assert "индекс проекта: 1 файл, 1 определение" in _out(capsys)
+
+
 def test_repl_without_index_on_start(cli_env):
     agent, ui, commands, _, _ = cli_env
     run_repl(agent, ui, commands, read_input=_reader("/exit"), index_on_start=False)
@@ -539,6 +553,7 @@ def test_cancelled_index_build_lets_user_continue(cli_env, capsys, monkeypatch):
     from devassist.project import index as index_mod
 
     agent, ui, commands, _, _ = cli_env
+    (agent.workspace.root / ".git").mkdir()
     for i in range(3):
         (agent.workspace.root / f"m{i}.py").write_text("x = 1\n", encoding="utf-8")
     real_refresh = index_mod.ProjectIndex.refresh
@@ -566,6 +581,7 @@ def test_index_build_error_does_not_block_repl(cli_env, capsys, monkeypatch):
     from devassist.project import index as index_mod
 
     agent, ui, commands, _, _ = cli_env
+    (agent.workspace.root / ".git").mkdir()
 
     def broken(self):
         raise OSError("только чтение")

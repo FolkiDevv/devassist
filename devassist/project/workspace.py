@@ -50,6 +50,11 @@ class Workspace:
             return False
         return bool(parts) and parts[0].casefold() == DATA_DIR_NAME.casefold()
 
+    def in_git_repo(self) -> bool:
+        """Проект внутри git-репозитория: ``.git`` (каталог или файл рабочего дерева)
+        в корне или выше. Только проверка ФС — git не запускается."""
+        return any((d / ".git").exists() for d in (self.root, *self.root.parents))
+
     def ensure_data_dir(self) -> Path:
         """Создаёт ``.devassist/`` с ``.gitignore`` (идемпотентно) и возвращает путь.
 
