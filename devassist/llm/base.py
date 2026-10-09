@@ -26,7 +26,14 @@ class LLMProvider(ABC):
     @property
     @abstractmethod
     def model(self) -> str:
-        """Идентификатор текущей модели."""
+        """Идентификатор модели по умолчанию."""
+
+    def close(self) -> None:  # noqa: B027 — необязательный хук
+        """Освобождает ресурсы (соединения). По умолчанию ничего не делает."""
+
+    def list_models(self) -> list[str]:
+        """Доступные модели (для диагностики). По умолчанию — только текущая."""
+        return [self.model]
 
     @abstractmethod
     def complete(

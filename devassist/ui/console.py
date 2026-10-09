@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from typing import IO
 
 from rich.box import HEAVY, ROUNDED
@@ -21,22 +22,20 @@ from rich.text import Text
 
 from devassist.agent.events import AgentEvents, NoticeLevel, ToolCallInfo, TurnStats
 from devassist.tools.base import Display, ToolResult
-
-# ------------------------------- палитра ------------------------------- #
-BRAND = "#A78BFA"  # фиолетовый — бренд
-ACCENT = "#22D3EE"  # бирюзовый — акценты/пути
-OK = "#34D399"  # зелёный — успех
-WARN = "#FBBF24"  # жёлтый — предупреждение/подтверждение
-DANGER = "#F87171"  # красный — ошибки/опасность
-MUTED = "#7C7C8A"  # серый — второстепенное
-USER = "#93C5FD"  # голубой — пользователь
-
-ICON_TOOL = "●"
-ICON_OK = "✔"
-ICON_FAIL = "✘"
-ICON_BRAND = "✦"
-ICON_ARROW = "↳"
-SPINNER = "✦"
+from devassist.ui.theme import (
+    ACCENT,
+    BRAND,
+    DANGER,
+    ICON_ARROW,
+    ICON_BRAND,
+    ICON_FAIL,
+    ICON_OK,
+    ICON_TOOL,
+    MUTED,
+    OK,
+    SPINNER,
+    WARN,
+)
 
 # Управляющие символы, которые нельзя пропускать в терминал из текста модели и
 # вывода команд: ESC-последовательности могут перекрасить/стереть экран,
@@ -85,7 +84,15 @@ class Console(AgentEvents):
         self._c.print(Text(f"{ICON_OK} {text}", style=f"bold {OK}"))
 
     # ------------------------------ баннер ------------------------------ #
-    def banner(self, *, version: str, model: str, root: str) -> None:
+    def banner(
+        self,
+        *,
+        version: str,
+        model: str,
+        root: str,
+        hints: Sequence[tuple[str, str]] = (),
+    ) -> None:
+        """Приветственная панель; ``hints`` — пары (команда, краткое описание)."""
         logo = Text()
         logo.append(f"{ICON_BRAND} ", style=f"bold {BRAND}")
         logo.append("dev", style=f"bold {BRAND}")
@@ -111,14 +118,7 @@ class Console(AgentEvents):
             )
         )
         hint = Text("  ", style=MUTED)
-        for i, (cmd, desc) in enumerate(
-            [
-                ("/help", "справка"),
-                ("/model", "сменить модель"),
-                ("/clear", "сброс"),
-                ("/exit", "выход"),
-            ]
-        ):
+        for i, (cmd, desc) in enumerate(hints):
             if i:
                 hint.append("   ", style=MUTED)
             hint.append(cmd, style=ACCENT)
