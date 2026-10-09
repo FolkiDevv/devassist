@@ -104,6 +104,19 @@ def test_recent_order_and_skips_broken(store):
     assert [c.id for c in store.recent(limit=2)] == ["c-new", "c-mid"]
 
 
+def test_recent_accepts_timestamps_without_timezone(store):
+    store.save("aware", _conv("обычный"))
+    store.save("naive", _conv("правленый вручную"))
+    path = store.directory / "naive.json"
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["created_at"] = data["updated_at"] = "2026-01-01T10:00:00"
+    path.write_text(json.dumps(data), encoding="utf-8")
+    chats = store.recent()
+    assert [c.id for c in chats] == ["aware", "naive"]
+    assert all(c.updated_at.tzinfo is not None for c in chats)
+    assert store.load("naive").info.created_at.tzinfo is not None
+
+
 def test_recent_on_missing_dir(store):
     assert store.recent() == []
     assert store.latest() is None

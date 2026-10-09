@@ -58,6 +58,15 @@ def _now() -> datetime:
     return datetime.now().astimezone().replace(microsecond=0)
 
 
+def _parse_time(value: str) -> datetime:
+    """Время из файла; без часового пояса (файл правили вручную) — считается местным.
+
+    Иначе наивное и aware-время нельзя было бы сравнить при сортировке списка чатов.
+    """
+    when = datetime.fromisoformat(value)
+    return when if when.tzinfo is not None else when.astimezone()
+
+
 def _one_line(text: str, limit: int) -> str:
     line = " ".join(text.split())
     return line if len(line) <= limit else line[: limit - 1].rstrip() + "…"
@@ -171,8 +180,8 @@ class ChatStore:
         return ChatInfo(
             id=chat_id,
             title=str(data.get("title") or "(без названия)"),
-            created_at=datetime.fromisoformat(data["created_at"]),
-            updated_at=datetime.fromisoformat(data["updated_at"]),
+            created_at=_parse_time(data["created_at"]),
+            updated_at=_parse_time(data["updated_at"]),
             model=str(data.get("model") or ""),
             requests=int(data.get("requests") or 0),
             preview=str(data.get("preview") or ""),
