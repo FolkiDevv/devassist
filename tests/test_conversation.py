@@ -8,7 +8,7 @@ import pytest
 
 from devassist.agent.context_window import estimate_tokens, fit_history
 from devassist.agent.conversation import Conversation
-from devassist.agent.guard import LoopGuard
+from devassist.agent.guard import LoopGuard, ToolOutcome, call_key
 from devassist.llm.types import FunctionCall, Message, Usage
 
 
@@ -109,13 +109,81 @@ def test_guard_step_limit():
     assert stop is not None and stop.kind == "max_steps"
 
 
+OK = ToolOutcome(ok=True)
+FAIL = ToolOutcome(ok=False)
+CHANGED = ToolOutcome(ok=True, changed=True)
+REJECTED = ToolOutcome(ok=False, rejected=True)
+
+
 def test_guard_failures_reset_on_success():
     guard = LoopGuard(max_steps=100, max_failures=3)
     call = FunctionCall(name="x")
-    assert guard.after_tool(call, False) is None
-    assert guard.after_tool(call, False) is None
-    assert guard.after_tool(call, True) is None  # успех сбрасывает серию
-    assert guard.after_tool(call, False) is None
-    assert guard.after_tool(call, False) is None
-    stop = guard.after_tool(call, False)
+    assert guard.after_tool(call, FAIL) is None
+    assert guard.after_tool(call, FAIL) is None
+    assert guard.after_tool(call, OK) is None  # успех сбрасывает серию
+    assert guard.after_tool(call, FAIL) is None
+    assert guard.after_tool(call, FAIL) is None
+    stop = guard.after_tool(call, FAIL)
+    assert stop is not None and stop.kind == "tool_failures"
+
+
+def test_call_key_is_canonical():
+    a = FunctionCall(name="f", arguments={"b": 1, "a": "я"})
+    b = FunctionCall(name="f", arguments={"a": "я", "b": 1})
+    assert call_key(a) == call_key(b)
+    assert call_key(a) != call_key(FunctionCall(name="f", arguments={"a": "я", "b": 2}))
+    assert call_key(a) != call_key(FunctionCall(name="g", arguments={"a": "я", "b": 1}))
+
+
+def _run(guard: LoopGuard, call: FunctionCall, outcome: ToolOutcome = OK):
+    check = guard.before_tool(call)
+    if check.stop is None:
+        guard.after_tool(call, outcome)
+    return check
+
+
+@pytest.mark.parametrize("outcome", [OK, CHANGED])
+def test_guard_repeats_warn_then_stop(outcome):
+    # собственное изменение вызова повтор не сбрасывает (pytest без правок)
+    guard = LoopGuard(max_steps=100, max_failures=100, max_repeats=3)
+    call = FunctionCall(name="read_file", arguments={"path": "a"})
+    checks = [_run(guard, call, outcome) for _ in range(4)]
+    assert [c.repeats for c in checks] == [1, 2, 3, 4]
+    assert [c.warning is not None for c in checks] == [False, False, True, False]
+    assert [c.stop is not None for c in checks[:3]] == [False, False, False]
+    assert checks[3].stop is not None and checks[3].stop.kind == "tool_repeats"
+
+
+def test_guard_change_by_other_call_resets_repeats():
+    guard = LoopGuard(max_steps=100, max_failures=100, max_repeats=3)
+    test = FunctionCall(name="run_shell", arguments={"command": "pytest"})
+    edit = FunctionCall(name="edit_file", arguments={"path": "a.py"})
+    for _ in range(5):
+        assert _run(guard, test, CHANGED).repeats == 1
+        _run(guard, edit, CHANGED)
+    # неудачная или безвредная операция между повторами — не изменение
+    guard = LoopGuard(max_steps=100, max_failures=100, max_repeats=3)
+    _run(guard, test)
+    _run(guard, edit, FAIL)
+    assert _run(guard, test).repeats == 2
+
+
+def test_guard_detects_alternating_calls():
+    guard = LoopGuard(max_steps=100, max_failures=100, max_repeats=3)
+    a = FunctionCall(name="read_file", arguments={"path": "a"})
+    b = FunctionCall(name="list_dir", arguments={})
+    checks = [_run(guard, call) for call in (a, b, a, b, a, b, a)]
+    assert checks[-1].stop is not None and checks[-1].stop.kind == "tool_repeats"
+
+
+def test_guard_rejection_is_neutral_and_remembered():
+    guard = LoopGuard(max_steps=100, max_failures=2, max_repeats=10)
+    call = FunctionCall(name="write_file", arguments={"path": "a"})
+    assert guard.before_tool(call).rejected_before is False
+    assert guard.after_tool(call, FAIL) is None  # серия ошибок: 1
+    assert guard.after_tool(call, REJECTED) is None  # отказ не продолжает серию...
+    assert guard.before_tool(call).rejected_before is True
+    other = FunctionCall(name="write_file", arguments={"path": "b"})
+    assert guard.before_tool(other).rejected_before is False
+    stop = guard.after_tool(other, FAIL)  # ...и не сбрасывает её
     assert stop is not None and stop.kind == "tool_failures"
