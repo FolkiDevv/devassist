@@ -50,6 +50,18 @@ def is_secret_file(name: str) -> bool:
     return name == ".env" or (name.startswith(".env.") and name != ".env.example")
 
 
+def is_secret_path(path: Path) -> bool:
+    """Файл с секретами — сам или как цель симлинка (``settings.py -> .env``)."""
+    if is_secret_file(path.name):
+        return True
+    if path.is_symlink():
+        try:
+            return is_secret_file(path.resolve().name)
+        except OSError:
+            return True
+    return False
+
+
 def is_within(root: Path, path: Path) -> bool:
     """``path`` после раскрытия симлинков лежит внутри ``root``."""
     try:

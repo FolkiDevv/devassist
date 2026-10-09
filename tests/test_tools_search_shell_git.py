@@ -158,3 +158,21 @@ def test_search_skips_fifo(ctx):
     s = SearchContentTool()
     out = s.run(s.parse({"pattern": "needle"}), ctx).content
     assert "a.txt" in out
+
+
+def test_search_skips_symlinks_to_secrets(tmp_path):
+    import os
+
+    import pytest as _pytest
+
+    from devassist.project.workspace import Workspace
+    from devassist.tools.base import ToolContext
+    from devassist.tools.search import SearchContentParams, SearchContentTool
+
+    if os.name == "nt":
+        _pytest.skip("симлинки")
+    (tmp_path / ".env").write_text("TOKEN=s3cr3t\n", encoding="utf-8")
+    (tmp_path / "config.txt").symlink_to(tmp_path / ".env")
+    ctx = ToolContext(workspace=Workspace(tmp_path))
+    result = SearchContentTool().run(SearchContentParams(pattern="s3cr3t"), ctx)
+    assert "s3cr3t" not in result.content

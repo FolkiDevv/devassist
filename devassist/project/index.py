@@ -23,7 +23,7 @@ from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
-from devassist.project.files import glob_match, is_excluded, is_secret_file, walk_files
+from devassist.project.files import glob_match, is_excluded, is_secret_path, walk_files
 from devassist.project.symbols import Symbol, extract_symbols, language_of
 from devassist.project.workspace import Workspace
 
@@ -289,7 +289,10 @@ class ProjectIndex:
                 with db:
                     self._set_meta("complete", "0")
             for path in self._candidates(base):
-                if is_secret_file(path.name):
+                if is_secret_path(path):
+                    continue
+                # симлинк на исключённое (.gitignore, служебные каталоги) — тоже мимо
+                if path.is_symlink() and is_excluded(self.root, path.resolve()):
                     continue
                 try:
                     st = path.stat()

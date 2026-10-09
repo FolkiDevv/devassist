@@ -26,6 +26,9 @@ _MAX_RULES_BYTES = 1_000_000  # больше — явно не файл прав
 def compile_glob(pattern: str) -> re.Pattern[str]:
     """glob → regex: ``**`` — любое число каталогов, ``*``/``?`` — в пределах сегмента.
 
+    Как в ``.gitignore``, ``**`` пересекает ``/`` только целым сегментом пути
+    (``**/x``, ``a/**``, ``a/**/b``); в остальных местах (``foo**bar``) это ``*``.
+
     ``\\x`` — символ ``x`` буквально (как в ``.gitignore``). Шаблон, который не
     компилируется (``[z-a]``), сравнивается как обычная строка.
     """
@@ -38,7 +41,10 @@ def compile_glob(pattern: str) -> re.Pattern[str]:
             i += 2
             continue
         if c == "*":
-            if pattern.startswith("**", i):
+            whole_segment = (i == 0 or pattern[i - 1] == "/") and (
+                i + 2 == n or pattern[i + 2 : i + 3] == "/"
+            )
+            if pattern.startswith("**", i) and whole_segment:
                 i += 2
                 if i < n and pattern[i] == "/":
                     i += 1
@@ -46,6 +52,8 @@ def compile_glob(pattern: str) -> re.Pattern[str]:
                 else:
                     out.append(".*")
                 continue
+            while i + 1 < n and pattern[i + 1] == "*":
+                i += 1  # "***", "**" внутри сегмента — то же, что "*"
             out.append("[^/]*")
         elif c == "?":
             out.append("[^/]")
@@ -127,9 +135,11 @@ def parse_rules(text: str) -> tuple[IgnoreRule, ...]:
     return tuple(rule for rule in map(parse_rule, text.splitlines()) if rule is not None)
 
 
-def _read_rules(path: Path) -> tuple[IgnoreRule, ...]:
+def _read_rules(path: Path, *, follow_symlink: bool = True) -> tuple[IgnoreRule, ...]:
     """Правила из файла; отсутствующий, нечитаемый или огромный файл — нет правил."""
     try:
+        if not follow_symlink and path.is_symlink():
+            return ()
         if not path.is_file() or path.stat().st_size > _MAX_RULES_BYTES:
             return ()
         text = path.read_text(encoding="utf-8", errors="replace")
@@ -152,7 +162,8 @@ class IgnoreStack:
     def enter(self, root: Path, rel_dir: str) -> IgnoreStack:
         """Стек для подкаталога ``rel_dir``: добавляются правила его ``.gitignore``."""
         directory = root / rel_dir if rel_dir else root
-        return self.push(rel_dir, _read_rules(directory / GITIGNORE_NAME))
+        # как git (2.32+): .gitignore-симлинк в рабочем дереве не читается
+        return self.push(rel_dir, _read_rules(directory / GITIGNORE_NAME, follow_symlink=False))
 
     def is_ignored(self, rel_posix: str, is_dir: bool) -> bool:
         """Путь (от корня проекта) исключён правилами; решает последнее совпадение."""

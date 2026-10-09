@@ -142,10 +142,12 @@ def _python_symbols(text: str) -> list[Symbol]:
                 kind = "method" if in_class else "function"
             elif isinstance(node, (ast.If, ast.Try)):
                 # определения под `if TYPE_CHECKING:` / `try: import ...` — того же уровня
-                for block in (node.body, node.orelse, getattr(node, "finalbody", [])):
-                    visit(block, parent, depth, in_class)
+                # в порядке исходника: try → except → else → finally
+                visit(node.body, parent, depth, in_class)
                 for handler in getattr(node, "handlers", []):
                     visit(handler.body, parent, depth, in_class)
+                for block in (node.orelse, getattr(node, "finalbody", [])):
+                    visit(block, parent, depth, in_class)
                 continue
             elif depth == 0 and isinstance(node, (ast.Assign, ast.AnnAssign)):
                 targets = node.targets if isinstance(node, ast.Assign) else [node.target]

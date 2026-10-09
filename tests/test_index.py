@@ -218,3 +218,17 @@ def test_unreadable_file_is_retried_when_unchanged(index, project, monkeypatch):
     assert index.refresh().updated == 1
     assert index.file_entry("app/agent.py").status == "indexed"
     assert index.refresh().changed == 0
+
+
+@pytest.mark.skipif(os.name == "nt", reason="симлинки")
+def test_symlinks_to_secrets_and_excluded_files_are_not_indexed(index, project):
+    _make(project, ".env", 'SECRET_KEY = "s3cr3t"\n')
+    (project / "settings.py").symlink_to(project / ".env")
+    _make(project, ".gitignore", "vendor/\n")
+    _make(project, "vendor/lib.py", "def vendored(): pass\n")
+    (project / "lib_link.py").symlink_to(project / "vendor" / "lib.py")
+    index.refresh()
+    paths = _paths(index)
+    assert "settings.py" not in paths and "lib_link.py" not in paths
+    assert index.find_symbols("SECRET")[1] == 0
+    assert index.find_symbols("vendored")[1] == 0

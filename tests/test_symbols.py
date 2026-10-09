@@ -301,3 +301,19 @@ def test_python_methods_under_class_level_if_and_try():
         ("method", "C.fast", 1),
         ("method", "C.slow", 1),
     ]
+
+
+def test_python_try_blocks_in_source_order():
+    src = textwrap.dedent(
+        """\
+        try:
+            def a(): pass
+        except ImportError:
+            def b(): pass
+        else:
+            def c(): pass
+        finally:
+            def d(): pass
+        """
+    )
+    assert [s.name for s in extract_symbols(src, "python")] == ["a", "b", "c", "d"]

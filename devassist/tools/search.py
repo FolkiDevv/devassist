@@ -6,7 +6,7 @@ import re
 
 from pydantic import BaseModel, Field
 
-from devassist.project.files import glob_match, is_secret_file, walk_files
+from devassist.project.files import glob_match, is_secret_path, walk_files
 from devassist.security import resolve_in_root
 from devassist.tools.base import Tool, ToolContext, ToolError, ToolResult
 
@@ -61,7 +61,7 @@ class SearchContentTool(Tool):
             if params.glob and not glob_match(rel, params.glob):
                 continue
             # секреты не ищем при обходе каталога; явно указанный файл — можно
-            if walking and is_secret_file(f.name):
+            if walking and is_secret_path(f):
                 continue
             try:
                 # FIFO, сокеты, устройства: открытие на чтение может заблокироваться

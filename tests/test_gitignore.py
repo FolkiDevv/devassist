@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from devassist.project.files import build_file_tree, walk_files
@@ -168,3 +170,27 @@ def test_malformed_pattern_does_not_break_traversal(tmp_path):
     _make(tmp_path, "b.log")
     assert _rels(tmp_path) == [".gitignore", "a.py"]
     assert not _ignored("[z-a]", "a.py")  # правило просто ничего не исключает
+
+
+@pytest.mark.parametrize(
+    "rules, path, expected",
+    [
+        ("/foo**bar", "foobar", True),
+        ("/foo**bar", "fooXbar", True),
+        ("/foo**bar", "foo/x/bar", False),  # '**' не целым сегментом — это '*'
+        ("a/**/b", "a/x/y/b", True),
+        ("**/b", "x/y/b", True),
+        ("a/**", "a/x/y", True),
+    ],
+)
+def test_double_star_crosses_slash_only_as_whole_segment(rules, path, expected):
+    assert _ignored(rules, path) is expected
+
+
+@pytest.mark.skipif(os.name == "nt", reason="симлинки")
+def test_symlinked_gitignore_is_not_read(tmp_path):
+    """Как git: .gitignore-симлинк в рабочем дереве не действует."""
+    _make(tmp_path, "rules.txt", "*.py\n")
+    (tmp_path / ".gitignore").symlink_to(tmp_path / "rules.txt")
+    _make(tmp_path, "a.py")
+    assert "a.py" in _rels(tmp_path)

@@ -13,7 +13,7 @@ from contextlib import contextmanager
 
 from pydantic import BaseModel, Field
 
-from devassist.project.files import is_excluded, is_secret_file
+from devassist.project.files import is_excluded, is_secret_path
 from devassist.project.index import (
     INDEX_ERRORS,
     MAX_INDEX_FILE_BYTES,
@@ -148,7 +148,7 @@ class FileOutlineTool(Tool):
         if not target.exists():
             raise ToolError(f"Путь не найден: {params.path}")
         if target.is_file():
-            if is_secret_file(target.name):
+            if is_secret_path(target):
                 raise ToolError(f"Файлы с секретами не индексируются: {params.path}")
             if is_excluded(ctx.root, target):
                 raise ToolError(
