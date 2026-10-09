@@ -18,10 +18,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import re
 import threading
 import time
 from collections.abc import Callable, Sequence
+from contextlib import AbstractContextManager
 from typing import IO
 
 from rich.box import ROUNDED
@@ -76,9 +78,16 @@ class _LiveView:
     то, что ушло за верх экрана, временная область уже не сможет стереть.
     """
 
-    def __init__(self, label: str, tail: Callable[[], list[list[Segment]]] | None = None):
+    def __init__(
+        self,
+        label: str,
+        tail: Callable[[], list[list[Segment]]] | None = None,
+        *,
+        hint: str = "Ctrl+C — прервать",
+    ):
         self._label = label
         self._tail = tail
+        self._hint = hint
         self._started = time.monotonic()
         self._spinner = Spinner("dots", style=BRAND)
 
@@ -88,7 +97,7 @@ class _LiveView:
             text=Text.assemble(
                 (f" {self._label}… ", MUTED),
                 (f"{elapsed} с", MUTED),
-                ("  ·  Ctrl+C — прервать", MUTED),
+                (f"  ·  {self._hint}", MUTED),
             )
         )
         lines = self._tail() if self._tail else []
@@ -174,6 +183,19 @@ class Console(AgentEvents):
         self._live: _LiveArea | None = None
         self._md: MarkdownStream | None = None  # потоковый ответ (живой режим)
         self._raw_started = False  # потоковый ответ (не-терминал): метка уже напечатана
+        self._interrupt_hint = "Ctrl+C — прервать"
+        self._input_guard: Callable[[], AbstractContextManager[None]] = contextlib.nullcontext
+
+    def set_interrupt_keys(
+        self, hint: str, input_guard: Callable[[], AbstractContextManager[None]]
+    ) -> None:
+        """Подсказка о прерывании в индикаторе и защита ввода во время хода.
+
+        ``input_guard`` оборачивает вопрос пользователю (подтверждение) — например,
+        чтобы на это время отпустить терминал, который слушает клавишу Esc.
+        """
+        self._interrupt_hint = hint
+        self._input_guard = input_guard
 
     @property
     def no_color(self) -> bool:
@@ -294,7 +316,7 @@ class Console(AgentEvents):
         """Запрос отправлен: индикатор ожидания до первого токена."""
         self._md = None
         self._raw_started = False
-        self._start_live(_LiveView("думаю"))
+        self._start_live(_LiveView("думаю", hint=self._interrupt_hint))
 
     def on_stream_delta(self, text: str) -> None:
         """Очередной кусок текста модели."""
@@ -311,7 +333,9 @@ class Console(AgentEvents):
         if self._md is None:
             self._md = MarkdownStream(self._c)
             self._assistant_label()  # при активной области печатается над ней
-            self._start_live(_LiveView("печатает", tail=self._md.tail_lines))
+            self._start_live(
+                _LiveView("печатает", tail=self._md.tail_lines, hint=self._interrupt_hint)
+            )
         lines = self._md.feed(text)
         if lines:
             self._print_above_live(SegmentLines(lines, new_lines=True))
@@ -340,7 +364,7 @@ class Console(AgentEvents):
         self._c.print(line)
 
     def on_tool_start(self, call: ToolCallInfo) -> None:
-        self._start_live(_LiveView("выполняется"))
+        self._start_live(_LiveView("выполняется", hint=self._interrupt_hint))
 
     def on_tool_end(self, call: ToolCallInfo) -> None:
         self.stop_live()
@@ -445,7 +469,8 @@ class Console(AgentEvents):
         prompt.append(question, style="bold")
         prompt.append(" [y/N] ", style=MUTED)
         try:
-            answer = self._c.input(prompt)
+            with self._input_guard():
+                answer = self._c.input(prompt)
         except (EOFError, KeyboardInterrupt):
             self._c.print()
             return False

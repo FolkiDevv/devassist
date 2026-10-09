@@ -5,6 +5,7 @@
 * история ввода в ``.devassist/history`` (папка создаётся при первом сохранённом
   вводе) и подсказки из истории;
 * многострочный ввод: ``\\`` в конце строки + Enter или Alt+Enter — новая строка;
+  Esc Esc — очистить ввод (черновик сохраняется в истории);
   вставка многострочного текста не отправляет его;
 * статус-строка: модель, заполнение контекста, потраченные токены, режим ``-y``.
 
@@ -38,7 +39,8 @@ from devassist.ui.theme import PROMPT_STYLES
 if TYPE_CHECKING:  # commands импортирует KEY_HELP отсюда
     from devassist.cli.commands import CommandRegistry
 
-InputReader = Callable[[], str]
+# Чтение строки; ``default`` — текст, которым заполнить ввод (набранный во время хода).
+InputReader = Callable[..., str]
 
 HISTORY_FILE = "history"
 PROMPT = "❯ "
@@ -51,6 +53,8 @@ KEY_HELP: tuple[tuple[str, str], ...] = (
     ("\\ + Enter, Alt+Enter", "новая строка (вставка многострочного текста не отправляет)"),
     ("Tab, ↑ ↓", "автодополнение команд, история ввода"),
     ("→", "принять подсказку из истории"),
+    ("Esc", "во время ответа — прервать ход"),
+    ("Esc Esc", "очистить ввод (черновик остаётся в истории, ↑ вернёт его)"),
     ("Ctrl+C", "сбросить ввод; во время ответа — прервать ход"),
     ("Ctrl+D", "выход"),
 )
@@ -138,6 +142,14 @@ class LazyFileHistory(FileHistory):
 def _key_bindings() -> KeyBindings:
     kb = KeyBindings()
 
+    @kb.add("escape", "escape")
+    def _clear(event: KeyPressEvent) -> None:
+        buffer = event.current_buffer
+        if buffer.text.strip():
+            buffer.reset(append_to_history=True)  # черновик не теряется: ↑ вернёт его
+        else:
+            buffer.reset()
+
     @kb.add("escape", "enter")
     def _newline(event: KeyPressEvent) -> None:
         event.current_buffer.insert_text("\n")
@@ -191,7 +203,7 @@ def create_prompt_session(
     )
 
 
-def _read_plain() -> str:
+def _read_plain(default: str = "") -> str:
     return input(PLAIN_PROMPT)
 
 
@@ -211,4 +223,8 @@ def make_input_reader(
         )
     except Exception:  # терминал не поддерживается (например, mintty без консоли)
         return _read_plain
-    return session.prompt
+
+    def read(default: str = "") -> str:
+        return session.prompt(default=default)
+
+    return read

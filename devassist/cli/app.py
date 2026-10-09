@@ -17,7 +17,7 @@ from pathlib import Path
 from devassist import __version__
 from devassist.agent.loop import Agent
 from devassist.cli.commands import default_commands
-from devassist.cli.repl import run_repl
+from devassist.cli.repl import esc_interrupt_for, run_repl
 from devassist.config import Config, ConfigError
 from devassist.llm.base import LLMError, LLMProvider
 from devassist.llm.gigachat import GigaChatProvider
@@ -60,8 +60,10 @@ def _make_provider(config: Config) -> LLMProvider:
 
 
 def run_oneshot(agent: Agent, ui: Console, prompt: str) -> int:
+    esc = esc_interrupt_for(ui)
     try:
-        agent.run_turn(prompt)
+        with esc:
+            agent.run_turn(prompt)
     except LLMError as e:
         ui.stop_live()
         ui.error(str(e))

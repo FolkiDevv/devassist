@@ -2,7 +2,8 @@
 
 Семантика клавиш:
   * Ctrl+C на приглашении — сбросить ввод (не выход);
-  * Ctrl+C во время ответа — прервать текущий ход агента;
+  * Ctrl+C или Esc во время ответа — прервать текущий ход агента;
+  * Esc Esc на приглашении — очистить ввод;
   * Ctrl+D (EOF) или /exit — выход.
 """
 
@@ -11,6 +12,7 @@ from __future__ import annotations
 from devassist import __version__
 from devassist.agent.loop import Agent
 from devassist.cli.commands import CommandContext, CommandRegistry, is_repl_command
+from devassist.cli.interrupt import EscInterrupt
 from devassist.cli.prompt import InputReader, StatusInfo, make_input_reader
 from devassist.llm.base import LLMError
 from devassist.ui.console import Console
@@ -27,13 +29,27 @@ def status_of(agent: Agent) -> StatusInfo:
     )
 
 
+def esc_interrupt_for(ui: Console, interrupt: EscInterrupt | None = None) -> EscInterrupt:
+    """Прерывание ходов клавишей Esc (если stdin — терминал) + подсказка в индикаторе."""
+    interrupt = EscInterrupt() if interrupt is None else interrupt
+    if interrupt.enabled:
+        ui.set_interrupt_keys("Esc — прервать", interrupt.paused)
+    return interrupt
+
+
 def run_repl(
     agent: Agent,
     ui: Console,
     commands: CommandRegistry,
     *,
     read_input: InputReader | None = None,
+    interrupt: EscInterrupt | None = None,
 ) -> int:
+    """``interrupt`` подменяется в тестах; по умолчанию Esc слушается только вместе с
+    настоящей строкой ввода (``read_input is None``)."""
+    if interrupt is None:
+        interrupt = EscInterrupt(enabled=None if read_input is None else False)
+    esc = esc_interrupt_for(ui, interrupt)
     read = read_input or make_input_reader(
         commands=commands,
         workspace=agent.workspace,
@@ -48,10 +64,12 @@ def run_repl(
         auto_approve=agent.config.auto_approve,
     )
     ctx = CommandContext(agent=agent, ui=ui, commands=commands)
+    typeahead = ""  # набранное во время хода — в следующую строку ввода
 
     while True:
         try:
-            line = read().strip()
+            line = (read(default=typeahead) if typeahead else read()).strip()
+            typeahead = ""
         except EOFError:
             ui.system("\nдо встречи!")
             return 0
@@ -68,7 +86,8 @@ def run_repl(
 
         try:
             ui.print()
-            agent.run_turn(line)
+            with esc:
+                agent.run_turn(line)
             ui.print()
         except LLMError as e:
             ui.stop_live()
@@ -79,3 +98,4 @@ def run_repl(
         except Exception as e:  # ошибка внутри хода не должна закрывать REPL
             ui.stop_live()
             ui.error(f"внутренняя ошибка: {type(e).__name__}: {e}")
+        typeahead = esc.take_typeahead()

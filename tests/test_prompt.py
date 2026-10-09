@@ -116,3 +116,30 @@ def test_toolbar_contents():
     assert "GigaChat-2-Max" in text and "12.3k/60k (21%)" in text
     assert "потрачено 45.1k" in text and "авто-подтверждение" in text
     assert "авто" not in "".join(t for _, t in toolbar_fragments(StatusInfo(model="m")))
+
+
+def test_double_escape_clears_input_into_history(tmp_path):
+    with create_pipe_input() as pipe:
+        session = create_prompt_session(
+            commands=default_commands(),
+            workspace=Workspace(tmp_path),
+            status=lambda: StatusInfo(model="m"),
+            input=pipe,
+            output=DummyOutput(),
+        )
+        pipe.send_text("черновик\x1b\x1bok\r")
+        assert session.prompt() == "ok"
+    assert list(session.history.get_strings()) == ["черновик", "ok"]
+
+
+def test_default_text_is_prefilled(tmp_path):
+    with create_pipe_input() as pipe:
+        session = create_prompt_session(
+            commands=default_commands(),
+            workspace=Workspace(tmp_path),
+            status=lambda: StatusInfo(model="m"),
+            input=pipe,
+            output=DummyOutput(),
+        )
+        pipe.send_text(" ещё\r")
+        assert session.prompt(default="набрано") == "набрано ещё"
