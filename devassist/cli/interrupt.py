@@ -176,6 +176,8 @@ class EscInterrupt:
     def __enter__(self) -> EscInterrupt:
         if not self.enabled:
             return self
+        if self._thread is not None:
+            self._shutdown()  # прошлый выход прервали — не оставляем второй поток чтения
         self._stop.clear()
         self._pause.clear()
         self._idle.clear()
@@ -189,13 +191,22 @@ class EscInterrupt:
     def __exit__(self, *exc: object) -> None:
         if not self.enabled or self._thread is None:
             return
-        with self._lock:
-            self._armed = False  # после этого прерываний не будет
-        self._stop.set()
         try:
-            self._thread.join(timeout=1)
+            with self._lock:
+                self._armed = False  # после этого прерываний не будет
         finally:
-            self._thread = None
+            # Esc в самом конце хода: его SIGINT может прервать ожидание блокировки,
+            # но поток чтения всё равно останавливается, а терминал — восстанавливается.
+            self._shutdown()
+
+    def _shutdown(self) -> None:
+        self._armed = False
+        self._stop.set()
+        thread, self._thread = self._thread, None
+        try:
+            if thread is not None:
+                thread.join(timeout=1)
+        finally:
             self._restore_mode()
             self._saved_mode = None
 

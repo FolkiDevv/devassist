@@ -12,6 +12,7 @@
 последний, ``-r [ID]`` — выбранный (без ID — селектор чатов).
 
 Коды возврата: 0 — успех, 1 — ошибка конфигурации/внутренняя, 2 — ошибка LLM,
+3 — ход остановлен ограничителем (лимит шагов, серия ошибок, зацикливание),
 130 — прервано пользователем (Ctrl+C).
 """
 
@@ -42,6 +43,7 @@ from devassist.ui.console import Console
 EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_LLM_ERROR = 2
+EXIT_STOPPED = 3
 EXIT_INTERRUPTED = 130
 
 
@@ -122,9 +124,14 @@ def run_oneshot(agent: Agent, ui: Console, prompt: str, chats: ChatRecorder | No
         ui.stop_live()
         ui.system("\n(прервано)")
         return EXIT_INTERRUPTED
+    except Exception as e:  # как в REPL: сообщение вместо traceback
+        ui.stop_live()
+        ui.error(f"внутренняя ошибка: {type(e).__name__}: {e}")
+        return EXIT_ERROR
     finally:
         autosave(chats, agent, ui)
-    return EXIT_OK
+    stats = agent.last_turn
+    return EXIT_STOPPED if stats is not None and stats.stop_reason else EXIT_OK
 
 
 def run_test_context(
@@ -228,7 +235,7 @@ def main(argv: list[str] | None = None) -> int:
             # Модель чата, если модель не задана явно через -m.
             resume_chat(agent, chats, saved, keep_model=args.model is not None)
         if args.prompt:
-            ensure_context_window(agent, ui)
+            ensure_context_window(agent, ui, interactive=False)
             return run_oneshot(agent, ui, args.prompt, chats)
         resumed = saved.info if saved is not None else None
         return run_repl(agent, ui, default_commands(), chats=chats, resumed=resumed)

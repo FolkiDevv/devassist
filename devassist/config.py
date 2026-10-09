@@ -190,6 +190,9 @@ class Config:
     compact_threshold: float = 0.8
     # Сохранять чаты в .devassist/chats/ (продолжение — /resume, --continue).
     save_chats: bool = True
+    # Предлагать замер окна незамеренной модели (пробы оплачиваются); False — только
+    # по --test-context.
+    auto_measure: bool = True
 
     @classmethod
     def load(
@@ -243,6 +246,7 @@ class Config:
             )
             / 100,
             save_chats=save_chats and _env_bool(env, "DEVASSIST_SAVE_CHATS", True),
+            auto_measure=_env_bool(env, "DEVASSIST_AUTO_MEASURE", True),
         )
 
     @property

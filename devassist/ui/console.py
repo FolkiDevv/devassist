@@ -237,6 +237,10 @@ class Console(AgentEvents):
     def no_color(self) -> bool:
         return self._no_color
 
+    def interactive(self) -> bool:
+        """Можно ли спросить пользователя: ввод идёт с терминала (не pipe/файл)."""
+        return _stdin_is_terminal()
+
     # ----------------------------- базовое ----------------------------- #
     def print(self, *args, **kwargs) -> None:
         self._c.print(*args, **kwargs)

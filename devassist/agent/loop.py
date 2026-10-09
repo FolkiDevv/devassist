@@ -120,6 +120,7 @@ class Agent:
         self._billed_tokens = 0  # потрачено за сессию (reset() не сбрасывает)
         # Оценка контекста после сжатия — пока модель не сообщит настоящий размер.
         self._compacted_tokens = 0
+        self._last_turn: TurnStats | None = None
 
     # ------------------------------------------------------------------ #
     @property
@@ -183,6 +184,11 @@ class Agent:
         return budget_for_window(self.context_window or DEFAULT_CONTEXT_WINDOW)
 
     @property
+    def last_turn(self) -> TurnStats | None:
+        """Итоги последнего хода (None — ход прерван исключением или ещё не было)."""
+        return self._last_turn
+
+    @property
     def billed_tokens(self) -> int:
         """Токены, оплаченные за сессию (сумма по всем обращениям, включая прерванные ходы)."""
         return self._billed_tokens
@@ -220,6 +226,7 @@ class Agent:
         При любом прерывании (Ctrl+C, ошибка LLM) история приводится в
         согласованное состояние, исключение пробрасывается дальше.
         """
+        self._last_turn = None
         try:
             return self._run_turn(user_input)
         except BaseException:
@@ -282,6 +289,7 @@ class Agent:
                 break
 
         stats.duration_s = time.monotonic() - started
+        self._last_turn = stats
         self._events.on_turn_end(stats)
         return final_text
 
