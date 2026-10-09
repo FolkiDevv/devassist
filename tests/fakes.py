@@ -67,8 +67,10 @@ def tool_turn(name: str, args: dict, usage: Usage | None = None) -> AssistantTur
 class RecordingEvents(AgentEvents):
     """UI-двойник: запоминает события, на подтверждение отвечает ``confirm_answer``."""
 
-    def __init__(self, confirm_answer: bool = True):
+    def __init__(self, confirm_answer: bool = True, answers: list | None = None):
         self.confirm_answer = confirm_answer
+        self.answers = answers  # ответы на ask_user (None — отказ)
+        self.questions: list = []
         self.events: list[tuple[str, Any]] = []
         self.confirms: list[tuple[ToolCallInfo, Display | None, bool]] = []
         self.results: list[tuple[ToolCallInfo, ToolResult, bool]] = []
@@ -103,6 +105,10 @@ class RecordingEvents(AgentEvents):
     def on_tool_result(self, call, result, *, previewed):
         self.events.append(("tool_result", call))
         self.results.append((call, result, previewed))
+
+    def ask_user(self, questions):
+        self.questions.append(list(questions))
+        return self.answers
 
     def on_notice(self, text, *, level="info"):
         self.notices.append((level, text))

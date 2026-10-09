@@ -25,6 +25,7 @@ from devassist.errors import ToolError
 from devassist.llm.types import ToolSpec
 from devassist.project.workspace import Workspace
 from devassist.security import RiskLevel
+from devassist.tools.questions import AskUser
 
 __all__ = [
     "Display",
@@ -44,10 +45,12 @@ class ToolContext:
     """Контекст выполнения, доступный инструменту.
 
     Намеренно не содержит Config: инструментам не нужны (и не должны быть
-    доступны) реквизиты API.
+    доступны) реквизиты API. ``ask_user`` — способ задать вопрос пользователю
+    (None — спросить некого).
     """
 
     workspace: Workspace
+    ask_user: AskUser | None = None
 
     @property
     def root(self) -> Path:
@@ -82,15 +85,20 @@ class ToolResult:
         return f"ОШИБКА: {self.content}"
 
 
-def _normalize_property(prop: dict[str, Any]) -> dict[str, Any]:
+def _normalize_property(prop: dict[str, Any], defs: dict[str, Any] | None = None) -> dict[str, Any]:
     """Приводит описание свойства к формату, который принимает GigaChat.
 
     GigaChat не понимает union-типы (``anyOf``/``oneOf``), которые pydantic
     генерирует для ``Optional[...]``. Сворачиваем их в одиночный ``type``,
     отбрасывая ветку ``null`` (необязательность отражается отсутствием в
-    ``required``). Также убираем служебные ключи (title/default).
+    ``required``). Также убираем служебные ключи (title/default). Ссылки на
+    вложенные модели (``$ref`` в ``$defs``) подставляются на место.
     """
+    defs = defs or {}
     prop = dict(prop)
+    ref = prop.pop("$ref", None)
+    if ref:
+        prop = {**defs[ref.rsplit("/", 1)[-1]], **prop}  # описание поля важнее описания модели
     prop.pop("title", None)
     prop.pop("default", None)
 
@@ -101,11 +109,15 @@ def _normalize_property(prop: dict[str, Any]) -> dict[str, Any]:
         merged = {k: v for k, v in prop.items()}
         merged.update(chosen)
         merged.pop("title", None)
-        prop = merged
+        prop = _normalize_property(merged, defs) if "$ref" in merged else merged
 
-    # Рекурсивно нормализуем элементы массива
+    # Рекурсивно нормализуем элементы массива и свойства вложенных объектов
     if prop.get("type") == "array" and isinstance(prop.get("items"), dict):
-        prop["items"] = _normalize_property(prop["items"])
+        prop["items"] = _normalize_property(prop["items"], defs)
+    if prop.get("type") == "object" and isinstance(prop.get("properties"), dict):
+        prop["properties"] = {
+            k: _normalize_property(v, defs) for k, v in prop["properties"].items()
+        }
     return prop
 
 
@@ -113,9 +125,9 @@ def _clean_schema(model: type[BaseModel]) -> dict[str, Any]:
     """JSON-schema параметров в формате function calling GigaChat."""
     schema = model.model_json_schema()
     schema.pop("title", None)
-    schema.pop("$defs", None)
+    defs = schema.pop("$defs", None) or {}
     props = schema.get("properties", {})
-    schema["properties"] = {k: _normalize_property(v) for k, v in props.items()}
+    schema["properties"] = {k: _normalize_property(v, defs) for k, v in props.items()}
     schema.setdefault("type", "object")
     return schema
 
@@ -196,6 +208,7 @@ class ToolRegistry:
 def build_default_registry() -> ToolRegistry:
     """Собирает реестр со всеми штатными инструментами."""
     # Импорт здесь, чтобы избежать циклов.
+    from devassist.tools.ask_user import AskUserTool
     from devassist.tools.fs import (
         EditFileTool,
         FindFilesTool,
@@ -217,6 +230,7 @@ def build_default_registry() -> ToolRegistry:
         SearchContentTool(),
         RunShellTool(),
         GitTool(),
+        AskUserTool(),
     ):
         reg.register(tool)
     return reg

@@ -332,3 +332,37 @@ def test_session_counters(tmp_path):
     assert agent.context_tokens == 220 and agent.billed_tokens == 330
     assert events.stats[-1].duration_s >= 0
     assert agent.config.context_budget_tokens > 0
+
+
+def test_ask_user_reaches_ui_and_model(tmp_path):
+    from devassist.tools.questions import Answer
+
+    question = {
+        "question": "Какой формат?",
+        "options": [{"label": "JSON"}, {"label": "YAML", "description": "читаемее"}],
+    }
+    provider = ScriptedProvider(
+        [tool_turn("ask_user", {"questions": [question]}), text_turn("Сделаю YAML")]
+    )
+    events = RecordingEvents(answers=[Answer(("YAML",))])
+    agent = _agent(provider, tmp_path, events=events, auto_approve=False)
+    assert agent.run_turn("сохрани конфиг") == "Сделаю YAML"
+    assert events.questions[0][0].options[1].description == "читаемее"
+    assert events.confirms == []  # вопрос — не изменяющая операция
+    sent = provider.requests[-1]["messages"][-1]
+    assert sent.role == "function" and "Какой формат? → YAML" in sent.content
+    kinds = _kinds(events)
+    assert kinds[kinds.index("tool_start") + 1] == "tool_end"
+
+
+def test_ask_user_without_ui_tells_model(tmp_path):
+    from devassist.agent.events import AgentEvents
+
+    question = {"question": "Да?", "options": [{"label": "да"}, {"label": "нет"}]}
+    provider = ScriptedProvider(
+        [tool_turn("ask_user", {"questions": [question]}), text_turn("решу сам")]
+    )
+    cfg = Config(access_key="x", project_root=tmp_path, stream=False)
+    agent = Agent(provider, build_default_registry(), cfg, AgentEvents())
+    assert agent.run_turn("x") == "решу сам"
+    assert "Нельзя задать вопрос" in provider.requests[-1]["messages"][-1].content

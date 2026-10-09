@@ -43,3 +43,16 @@ def test_array_field_schema():
     args_schema = git.spec().parameters["properties"]["args"]
     assert args_schema["type"] == "array"
     assert args_schema["items"]["type"] == "string"
+
+
+def test_nested_models_are_inlined():
+    schema = build_default_registry().get("ask_user").spec().parameters
+    assert "$ref" not in str(schema) and "$defs" not in str(schema)
+    question = schema["properties"]["questions"]["items"]
+    assert question["type"] == "object" and question["required"] == ["question", "options"]
+    option = question["properties"]["options"]["items"]
+    assert option["properties"]["label"] == {
+        "description": "Вариант ответа, коротко (1–5 слов).",
+        "type": "string",
+    }
+    assert "title" not in str(schema)

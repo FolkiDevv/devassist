@@ -13,10 +13,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
 
 from devassist.tools.base import Display, ToolResult
+from devassist.tools.questions import Answer, Question, QuestionsUnavailable
 
 NoticeLevel = Literal["info", "warn", "error"]
 
@@ -89,6 +91,14 @@ class AgentEvents:
 
     def on_tool_result(self, call: ToolCallInfo, result: ToolResult, *, previewed: bool) -> None:
         """Результат инструмента. ``previewed`` — превью уже показано при подтверждении."""
+
+    def ask_user(self, questions: Sequence[Question]) -> list[Answer] | None:
+        """Задать вопросы (инструмент ask_user). None — пользователь отказался отвечать.
+
+        Интерфейс без поддержки вопросов сообщает, что спросить некого, — модель
+        получит ошибку и решит сама, а не примет выдуманный ответ.
+        """
+        raise QuestionsUnavailable()
 
     # --- служебное ---
     def on_notice(self, text: str, *, level: NoticeLevel = "info") -> None:

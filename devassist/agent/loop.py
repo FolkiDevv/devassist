@@ -47,7 +47,7 @@ class Agent:
         # `is None`, а не `or`: пустой Conversation ложен (__len__ == 0).
         self._events = AgentEvents() if events is None else events
         self._workspace = Workspace(config.project_root) if workspace is None else workspace
-        self._ctx = ToolContext(workspace=self._workspace)
+        self._ctx = ToolContext(workspace=self._workspace, ask_user=self._events.ask_user)
         self._conversation = Conversation() if conversation is None else conversation
         self._model = config.model
         self._system_prompt: str | None = None  # строится лениво, сбрасывается в reset()
