@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from devassist.project.files import build_file_tree
+from devassist.project.files import TREE_TRUNCATED, build_file_tree
 from devassist.project.instructions import load_instructions
 from devassist.project.workspace import Workspace
 
@@ -20,6 +20,9 @@ SYSTEM_PROMPT = """\
 - Прежде чем редактировать файл, ОБЯЗАТЕЛЬНО прочитай его (read_file) в этом же \
 диалоге, чтобы скопировать old_string дословно — точные отступы, пробелы и \
 переносы строк.
+- Навигация по коду: где определён класс/функцию — find_symbol, структура файла или \
+каталога — file_outline; затем читай read_file только нужный диапазон строк. \
+Использования и произвольный текст ищи через search_content.
 - Делай минимальные точечные изменения через edit_file; перезаписывай файл целиком \
 (write_file) только когда это оправдано.
 - ОДИН вызов инструмента за один ответ. Вызвал — дождись результата (наблюдения) — \
@@ -56,6 +59,11 @@ def build_project_context(workspace: Workspace) -> str:
     tree = build_file_tree(root)
     if tree:
         parts.append(f"\nСтруктура проекта:\n{tree}")
+        if tree.endswith(TREE_TRUNCATED):
+            parts.append(
+                "(Проект крупный, дерево неполное: обзор каталога — file_outline, "
+                "поиск файлов — find_files, определений — find_symbol.)"
+            )
     return "\n".join(parts)
 
 

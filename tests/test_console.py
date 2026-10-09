@@ -131,6 +131,28 @@ def test_single_live_area():
     ui.stop_live()
 
 
+def test_progress_live_label_updates_and_stops_on_interrupt():
+    ui, buf = _live_console()
+    counter = {"n": 0}
+    with (
+        pytest.raises(KeyboardInterrupt),
+        ui.progress("индексирую", lambda: f"{counter['n']} файлов"),
+    ):
+        assert ui._live is not None
+        counter["n"] = 42
+        ui._live._live.refresh()
+        raise KeyboardInterrupt
+    assert ui._live is None
+    assert "индексирую: 42 файлов" in _plain(buf)
+
+
+def test_progress_without_terminal_prints_title_once():
+    ui, buf = _console()
+    with ui.progress("индексирую", lambda: "1 файл"):
+        assert ui._live is None
+    assert buf.getvalue() == "индексирую…\n"
+
+
 def test_no_live_area_without_terminal():
     ui, buf = _console()
     ui.on_stream_start()

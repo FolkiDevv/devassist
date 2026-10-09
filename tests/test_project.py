@@ -115,3 +115,12 @@ def test_system_prompt_contains_project_context(tmp_path):
     assert str(tmp_path.resolve()) in prompt
     assert "важная заметка" in prompt
     assert "Структура проекта" in prompt and "main.py" in prompt
+
+
+def test_system_prompt_points_large_projects_to_index_tools(tmp_path):
+    _make(tmp_path, "small.py")
+    assert "find_symbol" in build_system_prompt(Workspace(tmp_path))  # в правилах работы
+    assert "дерево неполное" not in build_system_prompt(Workspace(tmp_path))
+    for i in range(250):
+        _make(tmp_path, f"pkg/m{i:03}.py")
+    assert "дерево неполное" in build_system_prompt(Workspace(tmp_path))
