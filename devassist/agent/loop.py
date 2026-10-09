@@ -19,7 +19,7 @@ from pydantic import BaseModel
 from devassist.agent.context_window import estimate_tokens, fit_history
 from devassist.agent.conversation import Conversation
 from devassist.agent.events import AgentEvents, ToolCallInfo, TurnStats
-from devassist.agent.guard import LoopGuard
+from devassist.agent.guard import CallCheck, LoopGuard, ToolOutcome
 from devassist.agent.prompts import build_system_prompt
 from devassist.config import Config
 from devassist.llm.base import LLMProvider
@@ -27,6 +27,22 @@ from devassist.llm.types import AssistantTurn, Message, ToolSpec
 from devassist.project.workspace import Workspace
 from devassist.security import RiskLevel
 from devassist.tools.base import Tool, ToolContext, ToolError, ToolRegistry, ToolResult
+
+REJECTED_NOTE = (
+    "Пользователь ОТКЛОНИЛ выполнение этой операции. "
+    "Не повторяй её; предложи альтернативу или уточни план."
+)
+REJECTED_AGAIN_NOTE = (
+    "Пользователь уже ОТКЛОНИЛ эту операцию в этом ходе, повторно она не предлагается. "
+    "Не повторяй её; предложи альтернативу или уточни план."
+)
+LOOP_STOP_NOTE = (
+    "Не выполнено: повтор того же вызова без изменений. Ход остановлен из-за зацикливания."
+)
+
+
+def _with_note(content: str, note: str | None) -> str:
+    return f"{content}\n\n{note}" if note else content
 
 
 class Agent:
@@ -112,7 +128,11 @@ class Agent:
     def _run_turn(self, user_input: str) -> str:
         self._conversation.add_user(user_input)
         specs = self._registry.specs()
-        guard = LoopGuard(max_steps=self._cfg.max_steps, max_failures=self._cfg.max_tool_failures)
+        guard = LoopGuard(
+            max_steps=self._cfg.max_steps,
+            max_failures=self._cfg.max_tool_failures,
+            max_repeats=self._cfg.max_tool_repeats,
+        )
         stats = TurnStats()
         started = time.monotonic()
         final_text = ""
@@ -134,10 +154,23 @@ class Agent:
                     break
 
                 # --- модель просит инструмент ---
-                assert msg.function_call is not None
-                stats.tool_calls += 1
-                ok = self._execute_tool_call(msg)
-                stop = guard.after_tool(msg.function_call, ok)
+                call = msg.function_call
+                assert call is not None
+                check = guard.before_tool(call)
+                if check.stop is not None:
+                    # Вызов не выполняется; история остаётся согласованной.
+                    self._conversation.repair(LOOP_STOP_NOTE)
+                    stop = check.stop
+                else:
+                    if check.warning:
+                        self._events.on_notice(
+                            f"Модель {check.repeats}-й раз повторяет вызов {call.name} "
+                            "без изменений — предупреждена; следующий повтор остановит ход.",
+                            level="warn",
+                        )
+                    stats.tool_calls += 1
+                    outcome = self._execute_tool_call(msg, check)
+                    stop = guard.after_tool(call, outcome)
             if stop is not None:
                 final_text = stop.message
                 stats.stop_reason = stop.kind
@@ -187,16 +220,22 @@ class Agent:
         return turn
 
     # ------------------------------------------------------------------ #
-    def _execute_tool_call(self, msg: Message) -> bool:
-        """Выполняет запрошенный моделью инструмент. Возвращает True при успехе."""
+    def _execute_tool_call(self, msg: Message, check: CallCheck) -> ToolOutcome:
+        """Выполняет запрошенный моделью инструмент.
+
+        ``check.warning`` (предупреждение ограничителя) дописывается к результату,
+        который получит модель.
+        """
         assert msg.function_call is not None
         name = msg.function_call.name
         tool = self._registry.get(name)
+        note = check.warning
 
         if tool is None:
             return self._fail(
                 ToolCallInfo(name, "(неизвестный инструмент)"),
                 f"инструмент '{name}' не существует.",
+                note=note,
             )
 
         # 1) Валидация параметров
@@ -204,7 +243,9 @@ class Agent:
             params = tool.parse(msg.function_call.arguments)
         except Exception as e:  # ошибка схемы — возвращаем модели
             return self._fail(
-                ToolCallInfo(name, "(неверные аргументы)"), f"валидация аргументов: {e}"
+                ToolCallInfo(name, "(неверные аргументы)"),
+                f"валидация аргументов: {e}",
+                note=note,
             )
 
         call = ToolCallInfo(name, self._describe(tool, params))
@@ -212,27 +253,31 @@ class Agent:
 
         # 2) Подтверждение изменяющих/опасных операций
         previewed = False
+        risk = RiskLevel.SAFE
         try:
             risk = tool.risk(params, self._ctx)
             if risk >= RiskLevel.WRITE and not self._cfg.auto_approve:
+                if check.rejected_before:
+                    # Тот же вызов уже отклонён в этом ходе — не переспрашиваем.
+                    self._fail(
+                        call,
+                        "уже отклонено пользователем",
+                        model_text=REJECTED_AGAIN_NOTE,
+                        note=note,
+                    )
+                    return ToolOutcome(ok=False, rejected=True)
                 # Превью заодно проверяет выполнимость: если оно падает, операция
                 # не запускается и подтверждение не запрашивается.
                 preview = tool.preview(params, self._ctx)
                 dangerous = risk >= RiskLevel.DANGEROUS
                 if not self._events.confirm(call, preview, dangerous=dangerous):
-                    return self._fail(
-                        call,
-                        "отклонено пользователем",
-                        model_text=(
-                            "Пользователь ОТКЛОНИЛ выполнение этой операции. "
-                            "Не повторяй её; предложи альтернативу или уточни план."
-                        ),
-                    )
+                    self._fail(call, "отклонено пользователем", model_text=REJECTED_NOTE, note=note)
+                    return ToolOutcome(ok=False, rejected=True)
                 previewed = preview is not None
         except ToolError as e:
-            return self._fail(call, str(e))
+            return self._fail(call, str(e), note=note)
         except Exception as e:  # неожиданная ошибка — не роняем агента
-            return self._fail(call, f"внутренняя ошибка при подготовке: {e}")
+            return self._fail(call, f"внутренняя ошибка при подготовке: {e}", note=note)
 
         # 3) Выполнение
         result: ToolResult | None = None
@@ -247,19 +292,27 @@ class Agent:
         finally:
             self._events.on_tool_end(call)
         if result is None:
-            return self._fail(call, error or "инструмент не вернул результат")
+            return self._fail(call, error or "инструмент не вернул результат", note=note)
 
         self._events.on_tool_result(call, result, previewed=previewed)
-        self._conversation.add_function_result(name, result.as_function_content())
-        return result.ok
+        self._conversation.add_function_result(name, _with_note(result.as_function_content(), note))
+        return ToolOutcome(ok=result.ok, changed=result.ok and risk >= RiskLevel.WRITE)
 
-    def _fail(self, call: ToolCallInfo, error: str, *, model_text: str | None = None) -> bool:
+    def _fail(
+        self,
+        call: ToolCallInfo,
+        error: str,
+        *,
+        model_text: str | None = None,
+        note: str | None = None,
+    ) -> ToolOutcome:
         """Неудачный вызов: показать пользователю и сообщить модели."""
         summary = error.splitlines()[0] if error else "ошибка"
         result = ToolResult(content=error, ok=False, summary=summary)
         self._events.on_tool_result(call, result, previewed=False)
-        self._conversation.add_function_result(call.name, model_text or f"ОШИБКА: {error}")
-        return False
+        content = model_text or f"ОШИБКА: {error}"
+        self._conversation.add_function_result(call.name, _with_note(content, note))
+        return ToolOutcome(ok=False)
 
     @staticmethod
     def _describe(tool: Tool, params: BaseModel) -> str:
