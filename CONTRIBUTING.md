@@ -9,14 +9,20 @@
 git clone <repo-url> devassist
 cd devassist
 
-python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
-make dev        # установка пакета в editable + dev-зависимости
+make dev        # = uv sync: .venv + пакет (editable) + dev-группа
 cp .env.example .env   # и впишите GIGACHAT_ACCESS_KEY
 
 make test       # быстрые офлайн-тесты
 ```
 
-Если `make` недоступен, эквиваленты команд см. в `Makefile`.
+Если `make` недоступен, эквиваленты команд см. в `Makefile` (все через `uv run`).
+
+## Зависимости
+
+- Менеджер — [uv](https://docs.astral.sh/uv/). Runtime-зависимости — в
+  `[project.dependencies]`, инструменты разработчика — в `[dependency-groups] dev`.
+- Добавление: `uv add <пакет>` / `uv add --dev <пакет>`; `uv.lock` коммитится вместе
+  с `pyproject.toml`. `make check` проверяет, что лок актуален (`uv lock --check`).
 
 ## Рабочий процесс
 
@@ -39,7 +45,7 @@ make test       # быстрые офлайн-тесты
 - Новый функционал сопровождается тестами; правки багов — регрессионным тестом.
 - Офлайн-тесты не должны ходить в сеть. Сетевые тесты помечайте маркером `live`
   (см. `pyproject.toml`), они пропускаются без `GIGACHAT_ACCESS_KEY`.
-- Запуск: `pytest -m "not live"` (быстро) / `pytest -m live` (живые).
+- Запуск: `make test` (офлайн, быстро) / `uv run pytest -m live` (живые).
 
 ## Безопасность и секреты
 

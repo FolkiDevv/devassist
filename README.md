@@ -72,13 +72,27 @@ GigaChat использует **legacy-формат `functions`** (не `tools`)
 
 ## Установка
 
-Требуется Python ≥ 3.10.
+Требуется Python ≥ 3.10 и [uv](https://docs.astral.sh/uv/). Зависимости описаны в
+`pyproject.toml`, точные версии зафиксированы в `uv.lock`.
 
 ```bash
-pip install -e .
-# или только зависимости:
-pip install httpx pydantic rich prompt_toolkit pytest
+uv sync                 # .venv + пакет + dev-группа (pytest, ruff)
+uv run devassist        # запуск из окружения проекта
+
+# установить CLI глобально, чтобы запускать devassist в любых проектах:
+uv tool install --editable .
 ```
+
+**Внутренний контур / зеркало PyPI.** Адрес зеркала в репозиторий не зашит —
+задайте его переменной окружения, корпоративный CA — через системное хранилище:
+
+```bash
+export UV_DEFAULT_INDEX=https://<зеркало>/simple
+export UV_SYSTEM_CERTS=1        # в старых версиях uv: UV_NATIVE_TLS=1
+# или явно: export SSL_CERT_FILE=/path/to/ca-bundle.pem
+```
+
+Если uv недоступен, работает и обычный `pip install -e .` (без лок-файла).
 
 ## Конфигурация (учётные данные)
 
@@ -160,7 +174,7 @@ devassist --list-models
 Все тесты запускаются одной командой:
 
 ```bash
-pytest
+uv run pytest      # или: make test-all
 ```
 
 - **Юнит-тесты инструментов** (без сети) — быстрые, выполняются всегда: на каждый
@@ -175,8 +189,8 @@ Live-тесты автоматически **пропускаются**, есл�
 `GIGACHAT_ACCESS_KEY`). Запуск только офлайн- или только live-тестов:
 
 ```bash
-pytest -m "not live"   # быстрые офлайн-тесты
-pytest -m live         # только живые (нужен ключ; медленнее)
+uv run pytest -m "not live"   # быстрые офлайн-тесты (make test)
+uv run pytest -m live         # только живые (нужен ключ; медленнее)
 ```
 
 ## Модель безопасности
