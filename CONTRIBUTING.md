@@ -88,6 +88,16 @@ make test       # быстрые офлайн-тесты
   `None` в контексте или `QuestionsUnavailable` — спросить некого.
 - Внешние процессы запускайте только через `tools/process.run_process`.
 - Зарегистрируйте инструмент в `build_default_registry()`.
+- Нужны знания о структуре кода — открывайте `ProjectIndex(ctx.workspace)` и
+  обновляйте его (`refresh()`, для одного файла/каталога — `refresh(path)`) перед
+  запросом, как `tools/index.py`; ошибки `INDEX_ERRORS` превращайте в `ToolError`.
+
+## Индекс проекта
+
+- Новый язык — расширения в `EXTENSIONS` и правила в `_RULES`
+  (`project/symbols.py`) плюс пример в `tests/test_symbols.py`.
+- Меняя схему базы (`project/index.py`), увеличьте `SCHEMA_VERSION` — старый индекс
+  будет пересоздан автоматически.
 
 ## Добавление LLM-провайдера
 
