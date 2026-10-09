@@ -74,3 +74,12 @@ def test_main_without_credentials(tmp_path, monkeypatch, capsys):
         monkeypatch.delenv(name, raising=False)
     assert main(["-C", str(tmp_path), "-p", "x", "--no-color"]) == 1
     assert "реквизиты" in capsys.readouterr().out
+
+
+def test_save_chats_flag_and_env(tmp_path):
+    def load(env, **kw):
+        return Config.load(project_root=tmp_path, environ=env, cwd=tmp_path, **kw).save_chats
+
+    assert load({}) is True
+    assert load({"DEVASSIST_SAVE_CHATS": "0"}) is False
+    assert load({"DEVASSIST_SAVE_CHATS": "1"}, save_chats=False) is False  # --no-save сильнее

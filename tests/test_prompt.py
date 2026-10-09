@@ -29,7 +29,7 @@ def _complete(text: str) -> list[tuple[str, str]]:
 
 def test_completes_commands_with_descriptions():
     assert _complete("/mo") == [("/model", "сменить модель")]
-    assert {name for name, _ in _complete("/")} == {"/help", "/model", "/clear", "/exit"}
+    assert {name for name, _ in _complete("/")} == {"/help", "/model", "/clear", "/resume", "/exit"}
     assert _complete("/q") == [("/quit", "выход")]  # по алиасу
     assert _complete("/MO") == [("/model", "сменить модель")]
 

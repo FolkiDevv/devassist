@@ -5,11 +5,14 @@
   * Ctrl+C или Esc во время ответа — прервать текущий ход агента;
   * Esc Esc на приглашении — очистить ввод;
   * Ctrl+D (EOF) или /exit — выход.
+
+Диалог сохраняется после каждого хода — и прерванного тоже (см. :func:`autosave`).
 """
 
 from __future__ import annotations
 
 from devassist import __version__
+from devassist.agent.chat_store import ChatInfo, ChatRecorder
 from devassist.agent.loop import Agent
 from devassist.cli.commands import CommandContext, CommandRegistry, is_repl_command
 from devassist.cli.interrupt import EscInterrupt
@@ -29,6 +32,15 @@ def status_of(agent: Agent) -> StatusInfo:
     )
 
 
+def autosave(chats: ChatRecorder | None, agent: Agent, ui: Console) -> None:
+    """Сохранить чат после хода. Ход к этому моменту уже согласован (``repair``)."""
+    if chats is None:
+        return
+    warning = chats.save(agent.conversation, model=agent.model)
+    if warning:
+        ui.warn(warning)
+
+
 def esc_interrupt_for(ui: Console, interrupt: EscInterrupt | None = None) -> EscInterrupt:
     """Прерывание ходов клавишей Esc (если stdin — терминал) + подсказка в индикаторе."""
     interrupt = EscInterrupt() if interrupt is None else interrupt
@@ -44,9 +56,15 @@ def run_repl(
     *,
     read_input: InputReader | None = None,
     interrupt: EscInterrupt | None = None,
+    chats: ChatRecorder | None = None,
+    resumed: ChatInfo | None = None,
 ) -> int:
     """``interrupt`` подменяется в тестах; по умолчанию Esc слушается только вместе с
-    настоящей строкой ввода (``read_input is None``)."""
+    настоящей строкой ввода (``read_input is None``).
+
+    ``chats`` — куда сохранять диалог (None — не сохранять); ``resumed`` — чат,
+    продолженный при запуске (``--continue``/``--resume``): после баннера показывается
+    его последний обмен."""
     if interrupt is None:
         interrupt = EscInterrupt(enabled=None if read_input is None else False)
     esc = esc_interrupt_for(ui, interrupt)
@@ -63,7 +81,9 @@ def run_repl(
         hints=[(cmd.name, cmd.summary) for cmd in commands],
         auto_approve=agent.config.auto_approve,
     )
-    ctx = CommandContext(agent=agent, ui=ui, commands=commands)
+    if resumed is not None:
+        ui.chat_resumed(resumed, agent.conversation.messages)
+    ctx = CommandContext(agent=agent, ui=ui, commands=commands, chats=chats)
     typeahead = ""  # набранное во время хода — в следующую строку ввода
 
     while True:
@@ -99,4 +119,5 @@ def run_repl(
         except Exception as e:  # ошибка внутри хода не должна закрывать REPL
             ui.stop_live()
             ui.error(f"внутренняя ошибка: {type(e).__name__}: {e}")
+        autosave(chats, agent, ui)
         typeahead = esc.take_typeahead()
