@@ -32,9 +32,10 @@ def _registry_with(tool) -> ToolRegistry:
 
 
 def test_loop_stops_after_repeated_failures(tmp_path):
-    # модель упорно вызывает read_file на несуществующем файле
-    bad = tool_turn("read_file", {"path": "nope.txt"})
-    provider = ScriptedProvider([bad] * 20)
+    # модель упорно вызывает read_file на несуществующих файлах (разных — иначе
+    # первым сработает детектор повторов)
+    bad = [tool_turn("read_file", {"path": f"nope{i}.txt"}) for i in range(20)]
+    provider = ScriptedProvider(bad)
     events = RecordingEvents()
     agent = _agent(provider, tmp_path, events=events, max_tool_failures=4)
     final = agent.run_turn("сделай что-нибудь")
@@ -43,6 +44,86 @@ def test_loop_stops_after_repeated_failures(tmp_path):
     assert provider.calls == 4
     assert events.stats[-1].stop_reason == "tool_failures"
     assert events.notices and events.notices[-1][0] == "error"
+
+
+def _function_results(agent) -> list[str]:
+    return [m.content for m in agent.conversation.messages if m.role == "function"]
+
+
+def test_loop_stops_on_repeated_identical_calls(tmp_path):
+    (tmp_path / "f.txt").write_text("hello", encoding="utf-8")
+    provider = ScriptedProvider([tool_turn("read_file", {"path": "f.txt"})] * 10)
+    events = RecordingEvents()
+    agent = _agent(provider, tmp_path, events=events)
+    final = agent.run_turn("прочитай")
+    assert "зациклился" in final
+    assert provider.calls == 4
+    assert events.stats[-1].stop_reason == "tool_repeats"
+    assert events.stats[-1].tool_calls == 3  # 4-й вызов не выполнялся
+    assert [level for level, _ in events.notices] == ["warn", "error"]
+    results = _function_results(agent)
+    assert len(results) == 4
+    assert ["ВНИМАНИЕ" in r for r in results] == [False, False, True, False]
+    assert "hello" in results[2]  # предупреждение дописано к результату
+    assert "зацикливания" in results[3]
+    assert agent.conversation.pending_call() is None
+    _assert_well_formed(agent.conversation.messages)
+
+
+def test_loop_stops_on_repeated_identical_changes(tmp_path):
+    # изменяющая операция без изменений между повторами (как pytest без правок)
+    tool = FakeTool()
+    provider = ScriptedProvider([tool_turn("fake_write", {})] * 10)
+    events = RecordingEvents()
+    _agent(provider, tmp_path, events=events, registry=_registry_with(tool)).run_turn("x")
+    assert tool.runs == 3
+    assert events.stats[-1].stop_reason == "tool_repeats"
+
+
+def test_change_between_repeats_is_not_a_loop(tmp_path):
+    (tmp_path / "f.txt").write_text("hello", encoding="utf-8")
+    read = tool_turn("read_file", {"path": "f.txt"})
+    write = tool_turn("write_file", {"path": "g.txt", "content": "x"})
+    provider = ScriptedProvider([read, read, read, write, read, read, text_turn("ок")])
+    events = RecordingEvents()
+    agent = _agent(provider, tmp_path, events=events)
+    assert agent.run_turn("x") == "ок"
+    assert events.stats[-1].stop_reason is None
+    assert sum("ВНИМАНИЕ" in r for r in _function_results(agent)) == 1  # только 3-е чтение
+
+
+def test_repeated_rejected_call_is_not_asked_again(tmp_path):
+    tool = FakeTool()
+    call = tool_turn("fake_write", {})
+    provider = ScriptedProvider([call, call, text_turn("ок"), call, text_turn("ок")])
+    events = RecordingEvents(confirm_answer=False)
+    agent = _agent(
+        provider, tmp_path, events=events, registry=_registry_with(tool), auto_approve=False
+    )
+    assert agent.run_turn("x") == "ок"
+    assert len(events.confirms) == 1 and tool.runs == 0
+    assert "уже ОТКЛОНИЛ" in _function_results(agent)[-1]
+    # в следующем ходе пользователя спрашивают снова
+    agent.run_turn("всё же сделай")
+    assert len(events.confirms) == 2
+
+
+def test_rejections_do_not_count_as_failures(tmp_path):
+    tool = FakeTool()
+    calls = [tool_turn("fake_write", {"path": p}) for p in "abc"]
+    provider = ScriptedProvider([*calls, text_turn("ок")])
+    events = RecordingEvents(confirm_answer=False)
+    agent = _agent(
+        provider,
+        tmp_path,
+        events=events,
+        registry=_registry_with(tool),
+        auto_approve=False,
+        max_tool_failures=2,
+    )
+    assert agent.run_turn("x") == "ок"
+    assert len(events.confirms) == 3
+    assert events.stats[-1].stop_reason is None
 
 
 def test_loop_completes_on_text(tmp_path):
