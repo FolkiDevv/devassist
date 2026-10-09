@@ -13,10 +13,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
 
 from devassist.tools.base import Display, ToolResult
+from devassist.tools.questions import Answer, Question, QuestionsUnavailable
 
 NoticeLevel = Literal["info", "warn", "error"]
 
@@ -42,6 +44,8 @@ class TurnStats:
     context_tokens: int = 0
     # Почему ход прерван ограничителем (None — модель завершила ход сама).
     stop_reason: str | None = None
+    # Длительность хода, секунды.
+    duration_s: float = 0.0
 
     @property
     def billed_tokens(self) -> int:
@@ -53,13 +57,17 @@ class AgentEvents:
 
     # --- ответ модели ---
     def on_stream_start(self) -> None:
-        """Запрос к модели отправлен (потоковый режим); ждём первый токен."""
+        """Запрос к модели отправлен; ждём ответ.
+
+        Вызывается в обоих режимах: в потоковом дальше приходят ``on_stream_delta``,
+        в непотоковом после ``on_stream_end`` приходит ``on_assistant_text``.
+        """
 
     def on_stream_delta(self, text: str) -> None:
-        """Очередной кусок текста модели."""
+        """Очередной кусок текста модели (потоковый режим)."""
 
     def on_stream_end(self) -> None:
-        """Потоковый ответ закончен (успешно или с ошибкой)."""
+        """Ответ модели получен или запрос прерван (вызывается всегда)."""
 
     def on_assistant_text(self, text: str) -> None:
         """Ответ модели целиком (непотоковый режим)."""
@@ -72,8 +80,25 @@ class AgentEvents:
         """Спросить пользователя, выполнять ли изменяющую/опасную операцию."""
         return False
 
+    def on_tool_start(self, call: ToolCallInfo) -> None:
+        """Инструмент запущен (после подтверждения, если оно требовалось)."""
+
+    def on_tool_end(self, call: ToolCallInfo) -> None:
+        """Выполнение закончилось — успешно, с ошибкой или прервано.
+
+        Парный к ``on_tool_start``, вызывается всегда и раньше ``on_tool_result``.
+        """
+
     def on_tool_result(self, call: ToolCallInfo, result: ToolResult, *, previewed: bool) -> None:
         """Результат инструмента. ``previewed`` — превью уже показано при подтверждении."""
+
+    def ask_user(self, questions: Sequence[Question]) -> list[Answer] | None:
+        """Задать вопросы (инструмент ask_user). None — пользователь отказался отвечать.
+
+        Интерфейс без поддержки вопросов сообщает, что спросить некого, — модель
+        получит ошибку и решит сама, а не примет выдуманный ответ.
+        """
+        raise QuestionsUnavailable()
 
     # --- служебное ---
     def on_notice(self, text: str, *, level: NoticeLevel = "info") -> None:

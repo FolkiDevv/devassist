@@ -1,7 +1,7 @@
 """Слеш-команды REPL (/help, /model, ...).
 
 Команды регистрируются в :class:`CommandRegistry`; из него же строятся справка,
-подсказки в баннере и (в будущем) автодополнение ввода. Новая команда
+подсказки в баннере и автодополнение ввода (:mod:`devassist.cli.prompt`). Новая команда
 (``/compact``, ``/resume``, ``/index``) — это один :class:`SlashCommand`.
 """
 
@@ -12,6 +12,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
 from devassist.agent.loop import Agent
+from devassist.cli.prompt import KEY_HELP
 from devassist.ui.console import Console
 
 
@@ -82,11 +83,11 @@ def is_repl_command(line: str) -> bool:
 
 # ------------------------------- команды ------------------------------- #
 def _help(ctx: CommandContext, _arg: str) -> bool:
-    lines = []
+    rows = []
     for cmd in ctx.commands:
         alias = f" (также {', '.join(cmd.aliases)})" if cmd.aliases else ""
-        lines.append(f"{cmd.usage or cmd.name} — {cmd.summary}{alias}")
-    ctx.ui.info("\n".join(lines))
+        rows.append((cmd.usage or cmd.name, f"{cmd.summary}{alias}"))
+    ctx.ui.help(rows, KEY_HELP)
     return True
 
 

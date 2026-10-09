@@ -1,0 +1,146 @@
+"""Esc во время хода: разбор клавиш, прерывание через настоящий псевдотерминал."""
+
+from __future__ import annotations
+
+import os
+import sys
+import time
+
+import pytest
+
+from devassist.cli.interrupt import EscInterrupt, KeyParser
+
+
+def _parser(pending: bool = False):
+    hits: list[int] = []
+    return KeyParser(lambda: hits.append(1), lambda: pending), hits
+
+
+def test_lone_escape_interrupts():
+    parser, hits = _parser()
+    parser.feed(b"\x1b")
+    assert hits == [1]
+
+
+@pytest.mark.parametrize("keys", [b"\x1b[A", b"\x1b[1;5C", b"\x1bOP", b"\x1bx", b"\x1b[200~"])
+def test_escape_sequences_are_not_escape(keys):
+    parser, hits = _parser()
+    parser.feed(keys)
+    assert hits == [] and parser.take_text() == ""
+
+
+def test_sequence_split_across_reads():
+    parser, hits = _parser(pending=True)  # после ESC сразу пришли ещё байты
+    parser.feed(b"\x1b")
+    parser.feed(b"[Bok")
+    assert hits == [] and parser.take_text() == "ok"
+
+
+def test_double_escape_still_interrupts():
+    parser, hits = _parser()
+    parser.feed(b"\x1b\x1b")
+    assert hits == [1]
+
+
+def test_typeahead_text():
+    parser, _ = _parser()
+    text = "следующий вопрос".encode()
+    parser.feed(text[:5])  # разрыв посреди UTF-8 символа
+    parser.feed(text[5:] + b"X\x7f\x01\n")
+    assert parser.take_text() == "следующий вопрос"
+    assert parser.take_text() == ""
+
+
+# ----------------------------- псевдотерминал ----------------------------- #
+pty_only = pytest.mark.skipif(sys.platform == "win32", reason="нужен pty")
+
+
+@pytest.fixture
+def pty_pair():
+    import pty
+
+    master, slave = pty.openpty()
+    yield master, slave
+    os.close(master)
+    os.close(slave)
+
+
+def _echo_on(fd: int) -> bool:
+    import termios
+
+    return bool(termios.tcgetattr(fd)[3] & termios.ECHO)
+
+
+@pty_only
+def test_escape_interrupts_main_thread_and_restores_terminal(pty_pair):
+    import termios
+
+    master, slave = pty_pair
+    before = termios.tcgetattr(slave)
+    esc = EscInterrupt(fd=slave, enabled=True)
+    with pytest.raises(KeyboardInterrupt), esc:
+        assert not _echo_on(slave)  # cbreak, без эха
+        os.write(master, b"\x1b")
+        time.sleep(3)  # блокирующий вызов прерывается
+        pytest.fail("Esc не прервал ожидание")
+    assert termios.tcgetattr(slave) == before
+
+
+@pytest.mark.parametrize("keys", [b"\x1b[A", b"abc\n"])
+@pty_only
+def test_other_keys_do_not_interrupt(pty_pair, keys):
+    master, slave = pty_pair
+    with EscInterrupt(fd=slave, enabled=True):
+        os.write(master, keys)
+        time.sleep(0.3)
+
+
+@pty_only
+def test_typeahead_and_pause(pty_pair):
+    master, slave = pty_pair
+    esc = EscInterrupt(fd=slave, enabled=True)
+    with esc:
+        os.write(master, "дальше\n".encode())
+        time.sleep(0.3)
+        with esc.paused():
+            assert _echo_on(slave)  # для вопроса пользователю терминал обычный
+        assert not _echo_on(slave)
+    assert esc.take_typeahead() == "дальше"
+    assert _echo_on(slave)
+
+
+def test_disabled_without_terminal(tmp_path):
+    with open(tmp_path / "f", "w") as f:
+        esc = EscInterrupt(fd=f.fileno())
+        assert esc.enabled is False
+        with esc, esc.paused():
+            pass
+        assert esc.take_typeahead() == ""
+
+
+@pytest.mark.parametrize(
+    ("keys", "text"),
+    [
+        (b"\x1b1hello", "hello"),  # Alt+1
+        (b"\x1bxhello", "hello"),  # Alt+x
+        ("\x1bжhello".encode(), "hello"),  # Alt+многобайтная буква
+        (b"\x1b[1;5Cok", "ok"),  # Ctrl+стрелка с параметрами
+        (b"\x1bOPok", "ok"),  # F1
+        (b"\x1b[200~paste\x1b[201~", "paste"),  # bracketed paste
+    ],
+)
+def test_text_after_sequences_is_kept(keys, text):
+    parser, hits = _parser()
+    parser.feed(keys)
+    assert hits == [] and parser.take_text() == text
+
+
+@pty_only
+def test_input_typed_before_enter_is_kept(pty_pair):
+    master, slave = pty_pair
+    os.write(master, "уже набрано".encode())  # до перехода в cbreak
+    time.sleep(0.1)
+    esc = EscInterrupt(fd=slave, enabled=True)
+    with esc:
+        time.sleep(0.3)
+    assert esc.take_typeahead() == "уже набрано"

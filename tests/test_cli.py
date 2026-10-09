@@ -178,3 +178,91 @@ def test_version_flag(capsys):
         app.main(["--version"])
     assert exc.value.code == 0
     assert "devassist" in capsys.readouterr().out
+
+
+def test_repl_status_and_auto_approve_banner(cli_env, capsys):
+    from devassist.cli.repl import status_of
+
+    agent, ui, commands, _, _ = cli_env  # cli_env собран с auto_approve=True
+    status = status_of(agent)
+    assert status.model == agent.model and status.auto_approve is True
+    assert status.context_budget == agent.config.context_budget_tokens
+    assert run_repl(agent, ui, commands, read_input=_reader("/exit")) == 0
+    assert "авто-подтверждение" in _out(capsys)
+
+
+def test_repl_prefills_typeahead_and_uses_esc(cli_env, capsys):
+    import contextlib
+
+    agent, ui, commands, _, provider = cli_env
+
+    class FakeEsc:
+        enabled = True
+        entered = 0
+
+        def __enter__(self):
+            self.entered += 1
+            return self
+
+        def __exit__(self, *exc):
+            return None
+
+        def paused(self):
+            return contextlib.nullcontext()
+
+        def take_typeahead(self):
+            return "набрано во время хода"
+
+    calls = []
+    answers = ["привет", "/exit"]
+
+    def read(**kwargs):
+        calls.append(kwargs)
+        return answers.pop(0)
+
+    esc = FakeEsc()
+    assert run_repl(agent, ui, commands, read_input=read, interrupt=esc) == 0
+    assert esc.entered == 1  # ход — внутри перехвата Esc, команды — нет
+    assert calls == [{}, {"default": "набрано во время хода"}]
+    assert ui._interrupt_hint == "Esc — прервать"
+
+
+def test_ctrl_c_discards_prefilled_typeahead(cli_env):
+    import contextlib
+
+    agent, ui, commands, _, _ = cli_env
+
+    class FakeEsc:
+        enabled = True
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return None
+
+        def paused(self):
+            return contextlib.nullcontext()
+
+        def take_typeahead(self):
+            return "набрано"
+
+    calls = []
+    answers = ["привет", KeyboardInterrupt(), "/exit"]
+
+    def read(**kwargs):
+        calls.append(kwargs)
+        item = answers.pop(0)
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    run_repl(agent, ui, commands, read_input=read, interrupt=FakeEsc())
+    assert calls == [{}, {"default": "набрано"}, {}]
+
+
+def test_plain_reader_keeps_typeahead(monkeypatch):
+    from devassist.cli import prompt
+
+    monkeypatch.setattr("builtins.input", lambda p: " и ещё")
+    assert prompt._read_plain("набрано") == "набрано и ещё"
