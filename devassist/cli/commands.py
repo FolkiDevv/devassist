@@ -2,7 +2,7 @@
 
 Команды регистрируются в :class:`CommandRegistry`; из него же строятся справка,
 подсказки в баннере и автодополнение ввода (:mod:`devassist.cli.prompt`). Новая команда
-(``/compact``, ``/resume``) — это один :class:`SlashCommand`.
+(``/compact``) — это один :class:`SlashCommand`.
 """
 
 from __future__ import annotations
@@ -12,6 +12,7 @@ from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 
+from devassist.agent.chat_store import ChatRecorder, ChatStoreError, SavedChat
 from devassist.agent.loop import Agent
 from devassist.cli.indexing import describe_index, run_indexing
 from devassist.cli.prompt import KEY_HELP
@@ -24,6 +25,7 @@ class CommandContext:
     agent: Agent
     ui: Console
     commands: CommandRegistry
+    chats: ChatRecorder | None = None  # None — чаты не сохраняются (тесты)
     # Прерывание долгих команд клавишей Esc (как хода агента); None — только Ctrl+C.
     interrupt: AbstractContextManager[object] | None = None
 
@@ -107,7 +109,43 @@ def _model(ctx: CommandContext, arg: str) -> bool:
 
 def _clear(ctx: CommandContext, _arg: str) -> bool:
     ctx.agent.reset()
-    ctx.ui.info("история очищена")
+    if ctx.chats is not None:
+        ctx.chats.start_new()  # прежний чат остаётся сохранённым — его вернёт /resume
+    ctx.ui.info("история очищена, начат новый чат")
+    return True
+
+
+RESUME_LIMIT = 100  # сколько последних чатов показывает селектор
+
+
+def resume_chat(agent: Agent, chats: ChatRecorder, saved: SavedChat) -> None:
+    """Продолжить сохранённый чат: дальнейшие ходы дописываются в него же."""
+    agent.reset(saved.conversation)
+    chats.switch_to(saved.info)
+
+
+def _resume(ctx: CommandContext, arg: str) -> bool:
+    if ctx.chats is None:
+        ctx.ui.warn("сохранённые чаты недоступны")
+        return True
+    store = ctx.chats.store
+    try:
+        if arg:
+            info = store.find(arg)
+        else:
+            recent = store.recent(limit=RESUME_LIMIT)
+            if not recent:
+                ctx.ui.info("сохранённых чатов пока нет")
+                return True
+            info = ctx.ui.pick_chat(recent, ctx.chats.chat_id)
+            if info is None:
+                return True
+        saved = store.load(info.id)
+    except ChatStoreError as e:
+        ctx.ui.error(str(e))
+        return True
+    resume_chat(ctx.agent, ctx.chats, saved)
+    ctx.ui.chat_resumed(saved.info, saved.conversation.messages)
     return True
 
 
@@ -131,7 +169,16 @@ def default_commands() -> CommandRegistry:
     registry = CommandRegistry()
     registry.register(SlashCommand("/help", "справка", _help))
     registry.register(SlashCommand("/model", "сменить модель", _model, usage="/model [имя]"))
-    registry.register(SlashCommand("/clear", "очистить историю", _clear))
+    registry.register(SlashCommand("/clear", "новый чат", _clear))
+    registry.register(
+        SlashCommand(
+            "/resume",
+            "открыть сохранённый чат",
+            _resume,
+            usage="/resume [id]",
+            aliases=("/chats",),
+        )
+    )
     registry.register(
         SlashCommand("/index", "обновить индекс проекта", _index, usage="/index [rebuild]")
     )

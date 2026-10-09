@@ -37,7 +37,8 @@ def _writable_path(ctx: ToolContext, path: str) -> Path:
     """
     p = resolve_in_root(ctx.root, path)
     data_dir = ctx.workspace.data_dir.resolve()  # .devassist может быть симлинком
-    if p == data_dir or data_dir in p.parents:
+    # is_data_path — ещё и без учёта регистра: на macOS/Windows .DEVASSIST — та же папка.
+    if p == data_dir or data_dir in p.parents or ctx.workspace.is_data_path(p):
         raise ToolError(
             f"Служебная папка {DATA_DIR_NAME}/ (индекс, история, чаты агента) "
             f"недоступна для записи: {path}"

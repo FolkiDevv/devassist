@@ -5,6 +5,9 @@
   * одноразовый запрос: ``devassist -p "сделай X"``;
   * диагностика: ``devassist --list-models``.
 
+Чаты сохраняются в ``.devassist/chats/`` (``--no-save`` — нет); ``-c`` продолжает
+последний, ``-r [ID]`` — выбранный (без ID — селектор чатов).
+
 Коды возврата: 0 — успех, 1 — ошибка конфигурации/внутренняя, 2 — ошибка LLM,
 130 — прервано пользователем (Ctrl+C).
 """
@@ -15,9 +18,10 @@ import argparse
 from pathlib import Path
 
 from devassist import __version__
+from devassist.agent.chat_store import ChatRecorder, ChatStore, ChatStoreError, SavedChat
 from devassist.agent.loop import Agent
-from devassist.cli.commands import default_commands
-from devassist.cli.repl import esc_interrupt_for, run_repl
+from devassist.cli.commands import RESUME_LIMIT, default_commands, resume_chat
+from devassist.cli.repl import autosave, esc_interrupt_for, run_repl
 from devassist.config import Config, ConfigError
 from devassist.llm.base import LLMError, LLMProvider
 from devassist.llm.gigachat import GigaChatProvider
@@ -44,6 +48,27 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Авто-подтверждение всех операций (используйте осознанно)",
     )
+    chat = p.add_mutually_exclusive_group()
+    chat.add_argument(
+        "-c",
+        "--continue",
+        dest="continue_chat",
+        action="store_true",
+        help="Продолжить последний сохранённый чат",
+    )
+    chat.add_argument(
+        "-r",
+        "--resume",
+        nargs="?",
+        const="",
+        metavar="ID",
+        help="Продолжить сохранённый чат по id (без id — выбрать из списка)",
+    )
+    p.add_argument(
+        "--no-save",
+        action="store_true",
+        help="Не сохранять чат в .devassist/chats/",
+    )
     p.add_argument("--no-color", action="store_true", help="Отключить цвет")
     p.add_argument(
         "--no-stream",
@@ -59,7 +84,7 @@ def _make_provider(config: Config) -> LLMProvider:
     return GigaChatProvider(config)
 
 
-def run_oneshot(agent: Agent, ui: Console, prompt: str) -> int:
+def run_oneshot(agent: Agent, ui: Console, prompt: str, chats: ChatRecorder | None = None) -> int:
     esc = esc_interrupt_for(ui)
     try:
         with esc:
@@ -72,7 +97,28 @@ def run_oneshot(agent: Agent, ui: Console, prompt: str) -> int:
         ui.stop_live()
         ui.system("\n(прервано)")
         return EXIT_INTERRUPTED
+    finally:
+        autosave(chats, agent, ui)
     return EXIT_OK
+
+
+def _chat_to_resume(args: argparse.Namespace, store: ChatStore, ui: Console) -> SavedChat | None:
+    """Чат для ``--continue``/``--resume``; None — начать новый. Ошибка — ChatStoreError."""
+    if args.continue_chat:
+        saved = store.latest()
+        if saved is None:
+            ui.info("сохранённых чатов нет — начат новый чат")
+        return saved
+    if args.resume is None:
+        return None
+    if args.resume:
+        return store.load(store.find(args.resume).id)
+    recent = store.recent(limit=RESUME_LIMIT)
+    if not recent:
+        ui.info("сохранённых чатов нет — начат новый чат")
+        return None
+    info = ui.pick_chat(recent)
+    return None if info is None else store.load(info.id)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -88,6 +134,7 @@ def main(argv: list[str] | None = None) -> int:
             model=args.model,
             auto_approve=args.yes,
             stream=not args.no_stream,
+            save_chats=not args.no_save,
         )
         config.require_credentials()
     except ConfigError as e:
@@ -114,8 +161,18 @@ def main(argv: list[str] | None = None) -> int:
             return EXIT_OK
 
         agent = Agent(provider, build_default_registry(), config, ui)
+        store = ChatStore(agent.workspace)
+        chats = ChatRecorder(store, enabled=config.save_chats)
+        try:
+            saved = _chat_to_resume(args, store, ui)
+        except ChatStoreError as e:
+            ui.error(str(e))
+            return EXIT_ERROR
+        if saved is not None:
+            resume_chat(agent, chats, saved)
         if args.prompt:
-            return run_oneshot(agent, ui, args.prompt)
-        return run_repl(agent, ui, default_commands())
+            return run_oneshot(agent, ui, args.prompt, chats)
+        resumed = saved.info if saved is not None else None
+        return run_repl(agent, ui, default_commands(), chats=chats, resumed=resumed)
     finally:
         provider.close()

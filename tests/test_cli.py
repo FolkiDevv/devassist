@@ -6,6 +6,7 @@ import pytest
 from fakes import ScriptedProvider, text_turn, tool_turn
 
 import devassist.cli.app as app
+from devassist.agent.chat_store import ChatRecorder, ChatStore
 from devassist.agent.loop import Agent
 from devassist.cli.commands import (
     CommandContext,
@@ -15,6 +16,7 @@ from devassist.cli.commands import (
 )
 from devassist.cli.repl import run_repl
 from devassist.config import Config
+from devassist.project.workspace import Workspace
 from devassist.tools.base import build_default_registry
 from devassist.ui.console import Console
 
@@ -134,7 +136,12 @@ def test_repl_survives_errors_in_turn(cli_env, capsys, monkeypatch):
 def oneshot(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("GIGACHAT_ACCESS_KEY", "dummy")
-    for name in ("GIGACHAT_TIMEOUT", "DEVASSIST_TEMPERATURE", "DEVASSIST_CONTEXT_TOKENS"):
+    for name in (
+        "GIGACHAT_TIMEOUT",
+        "DEVASSIST_TEMPERATURE",
+        "DEVASSIST_CONTEXT_TOKENS",
+        "DEVASSIST_SAVE_CHATS",
+    ):
         monkeypatch.delenv(name, raising=False)
 
     def use(provider):
@@ -154,7 +161,9 @@ def test_oneshot_end_to_end(tmp_path, oneshot, capsys):
     out = capsys.readouterr().out
     assert "В файле приветствие." in out and "read_file" in out
     assert "привет из файла" in provider.requests[-1]["messages"][-1].content
-    assert not (tmp_path / ".devassist").exists()  # одноразовый запуск ничего не пишет
+    # чат сохранён — его можно продолжить через -c
+    (saved,) = ChatStore(Workspace(tmp_path)).recent()
+    assert saved.title == "что в hello.txt?" and saved.requests == 1
 
 
 def test_oneshot_ctrl_c_exit_code(tmp_path, oneshot):
@@ -270,6 +279,185 @@ def test_plain_reader_keeps_typeahead(monkeypatch):
 
     monkeypatch.setattr("builtins.input", lambda p: " и ещё")
     assert prompt._read_plain("набрано") == "набрано и ещё"
+
+
+# ---------------------------- сохранение чатов ---------------------------- #
+def _main(tmp_path, *args: str) -> int:
+    return app.main(["-C", str(tmp_path), "--no-color", "--no-stream", *args])
+
+
+def _store(tmp_path) -> ChatStore:
+    return ChatStore(Workspace(tmp_path))
+
+
+def _history(provider) -> list[tuple[str, str]]:
+    return [(m.role, m.content) for m in provider.requests[-1]["messages"][1:]]
+
+
+def test_oneshot_no_save(tmp_path, oneshot, monkeypatch):
+    oneshot(ScriptedProvider([text_turn("ok")]))
+    assert _main(tmp_path, "-p", "x", "--no-save") == 0
+    monkeypatch.setenv("DEVASSIST_SAVE_CHATS", "0")
+    assert _main(tmp_path, "-p", "x") == 0
+    assert not (tmp_path / ".devassist").exists()
+
+
+def test_oneshot_continue_appends_to_latest_chat(tmp_path, oneshot):
+    oneshot(ScriptedProvider([text_turn("первый ответ")]))
+    assert _main(tmp_path, "-p", "первый") == 0
+    provider = ScriptedProvider([text_turn("второй ответ")])
+    oneshot(provider)
+    assert _main(tmp_path, "-c", "-p", "второй") == 0
+    assert _history(provider) == [
+        ("user", "первый"),
+        ("assistant", "первый ответ"),
+        ("user", "второй"),
+    ]
+    (chat,) = _store(tmp_path).recent()
+    assert chat.title == "первый" and chat.requests == 2 and chat.preview == "второй ответ"
+
+
+def test_continue_without_chats_starts_new(tmp_path, oneshot, capsys):
+    oneshot(ScriptedProvider([text_turn("ok")]))
+    assert _main(tmp_path, "-c", "-p", "x") == 0
+    assert "сохранённых чатов нет" in capsys.readouterr().out
+
+
+def test_resume_by_id_and_unknown_id(tmp_path, oneshot, capsys):
+    oneshot(ScriptedProvider([text_turn("a")]))
+    _main(tmp_path, "-p", "первый")
+    (chat,) = _store(tmp_path).recent()
+    provider = ScriptedProvider([text_turn("b")])
+    oneshot(provider)
+    assert _main(tmp_path, "--resume", chat.id[:15], "-p", "дальше") == 0
+    assert _history(provider)[0] == ("user", "первый")
+    assert _main(tmp_path, "-r", "1999", "-p", "x") == 1
+    assert "не найден" in capsys.readouterr().out
+
+
+def test_resume_without_id_opens_picker(tmp_path, oneshot, monkeypatch):
+    oneshot(ScriptedProvider([text_turn("a"), text_turn("b")]))
+    _main(tmp_path, "-p", "первый")
+    _main(tmp_path, "--no-save", "-p", "мимо")  # не сохраняется — в списке один чат
+    shown = []
+
+    def pick(self, chats, current_id=""):
+        shown.append(chats)
+        return chats[0]
+
+    monkeypatch.setattr(Console, "pick_chat", pick)
+    provider = ScriptedProvider([text_turn("c")])
+    oneshot(provider)
+    assert _main(tmp_path, "-r", "-p", "дальше") == 0
+    assert [c.title for c in shown[0]] == ["первый"]
+    assert _history(provider)[0] == ("user", "первый")
+    # отмена выбора — новый чат
+    monkeypatch.setattr(Console, "pick_chat", lambda self, chats, current_id="": None)
+    provider = ScriptedProvider([text_turn("d")])
+    oneshot(provider)
+    assert _main(tmp_path, "-r", "-p", "новый") == 0
+    assert _history(provider) == [("user", "новый")]
+    assert len(_store(tmp_path).recent()) == 2
+
+
+def test_continue_and_resume_are_exclusive(tmp_path, oneshot):
+    with pytest.raises(SystemExit):
+        _main(tmp_path, "-c", "-r", "x")
+
+
+def test_interrupted_oneshot_is_saved_consistently(tmp_path, oneshot):
+    oneshot(ScriptedProvider([tool_turn("read_file", {"path": "a.txt"}), KeyboardInterrupt()]))
+    assert _main(tmp_path, "-p", "прочитай") == 130
+    store = _store(tmp_path)
+    (chat,) = store.recent()
+    conversation = store.load(chat.id).conversation
+    assert conversation.pending_call() is None
+    assert [m.role for m in conversation.messages] == ["user", "assistant", "function"]
+
+
+@pytest.fixture
+def repl_env(cli_env):
+    agent, ui, commands, ctx, provider = cli_env
+    ctx.chats = ChatRecorder(ChatStore(agent.workspace))
+    return agent, ui, commands, ctx, provider
+
+
+def test_repl_autosaves_after_each_turn(repl_env):
+    agent, ui, commands, ctx, provider = repl_env
+    provider._turns = [text_turn("ответ 1"), KeyboardInterrupt(), text_turn("ответ 3")]
+    read = _reader("первый", "второй", "третий", "/exit")
+    assert run_repl(agent, ui, commands, read_input=read, chats=ctx.chats) == 0
+    (chat,) = ctx.chats.store.recent()
+    assert chat.id == ctx.chats.chat_id and chat.requests == 3 and chat.preview == "ответ 3"
+
+
+def test_repl_save_error_warns_once(repl_env, capsys, monkeypatch):
+    agent, ui, commands, ctx, provider = repl_env
+
+    def boom(*a, **kw):
+        raise OSError("диск только для чтения")
+
+    monkeypatch.setattr(ctx.chats.store, "save", boom)
+    read = _reader("раз", "два", "/exit")
+    assert run_repl(agent, ui, commands, read_input=read, chats=ctx.chats) == 0
+    assert _out(capsys).count("диск только для чтения") == 1
+
+
+def test_clear_starts_new_chat_and_resume_returns(repl_env, capsys):
+    agent, _, commands, ctx, provider = repl_env
+    provider._turns = [text_turn("старый ответ"), text_turn("новый ответ")]
+    agent.run_turn("старый вопрос")
+    ctx.chats.save(agent.conversation)
+    old_id = ctx.chats.chat_id
+    commands.dispatch("/clear", ctx)
+    assert ctx.chats.chat_id != old_id and len(agent.conversation) == 0
+
+    commands.dispatch(f"/resume {old_id}", ctx)
+    assert ctx.chats.chat_id == old_id
+    out = _out(capsys)
+    assert "продолжаем чат «старый вопрос»" in out and "старый ответ" in out
+    agent.run_turn("ещё")
+    assert _history(provider)[0] == ("user", "старый вопрос")
+
+
+def test_resume_picker_and_errors(repl_env, capsys, monkeypatch):
+    agent, ui, commands, ctx, _ = repl_env
+    commands.dispatch("/resume", ctx)
+    assert "сохранённых чатов пока нет" in _out(capsys)
+
+    agent.conversation.add_user("сохранённый")
+    ctx.chats.save(agent.conversation)
+    saved_id = ctx.chats.chat_id
+    commands.dispatch("/clear", ctx)
+    calls = []
+
+    def pick(chats, current_id=""):
+        calls.append((chats, current_id))
+        return None  # отмена — ничего не меняется
+
+    monkeypatch.setattr(ui, "pick_chat", pick)
+    commands.dispatch("/chats", ctx)  # алиас
+    assert [c.id for c in calls[0][0]] == [saved_id] and calls[0][1] == ctx.chats.chat_id
+    assert len(agent.conversation) == 0
+
+    monkeypatch.setattr(ui, "pick_chat", lambda chats, current_id="": chats[0])
+    commands.dispatch("/resume", ctx)
+    assert agent.conversation.messages[0].content == "сохранённый"
+
+    commands.dispatch("/resume nope", ctx)
+    assert "не найден" in _out(capsys)
+    ctx.chats = None
+    commands.dispatch("/resume", ctx)
+    assert "недоступны" in _out(capsys)
+
+
+def test_repl_shows_resumed_chat_after_banner(repl_env, capsys):
+    agent, ui, commands, ctx, _ = repl_env
+    agent.conversation.add_user("прошлый вопрос")
+    info = ctx.chats.store.save("20260101-000000-abcd", agent.conversation)
+    run_repl(agent, ui, commands, read_input=_reader("/exit"), chats=ctx.chats, resumed=info)
+    out = _out(capsys)
+    assert out.index("devassist") < out.index("продолжаем чат «прошлый вопрос»")
 
 
 # ------------------------------ индекс проекта ------------------------------ #

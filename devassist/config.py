@@ -152,6 +152,8 @@ class Config:
     # Бюджет контекста (оценка в токенах), в который укладывается история при
     # отправке модели. Старые сообщения сверх бюджета отбрасываются.
     context_budget_tokens: int = 60_000
+    # Сохранять чаты в .devassist/chats/ (продолжение — /resume, --continue).
+    save_chats: bool = True
 
     @classmethod
     def load(
@@ -161,6 +163,7 @@ class Config:
         model: str | None = None,
         auto_approve: bool = False,
         stream: bool = True,
+        save_chats: bool = True,
         environ: Mapping[str, str] | None = None,
         cwd: Path | None = None,
     ) -> Config:
@@ -196,6 +199,7 @@ class Config:
             stream=stream,
             temperature=_env_float(env, "DEVASSIST_TEMPERATURE", 0.2, lo=0.0, hi=2.0),
             context_budget_tokens=_env_int(env, "DEVASSIST_CONTEXT_TOKENS", 60_000, minimum=4_000),
+            save_chats=save_chats and _env_bool(env, "DEVASSIST_SAVE_CHATS", True),
         )
 
     @property
