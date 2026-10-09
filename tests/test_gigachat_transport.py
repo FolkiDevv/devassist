@@ -295,3 +295,34 @@ def test_list_models_keeps_only_chat_models():
     p = _provider(handler)
     assert p.list_models() == ["GigaChat-2-Max", "Qwen-72B"]
     p.close()
+
+
+def test_measure_prompt_token_errors_are_not_oversize():
+    """Таймаут при получении токена — не «запрос не помещается»: проба не отправлялась."""
+
+    def auth_timeout(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == AUTH_URL:
+            raise httpx.ReadTimeout("auth timeout", request=request)
+        return _chat_reply(10)
+
+    p = _provider(auth_timeout)
+    with pytest.raises(GigaChatError) as e:
+        p.measure_prompt("x")
+    assert not isinstance(e.value, PromptTooLong)
+    p.close()
+
+    auth_calls = []
+
+    def refresh_timeout(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == AUTH_URL:
+            auth_calls.append(1)
+            if len(auth_calls) > 1:
+                raise httpx.ReadTimeout("auth timeout", request=request)
+            return _auth_response()
+        return httpx.Response(401)
+
+    p = _provider(refresh_timeout)
+    with pytest.raises(GigaChatError) as e:
+        p.measure_prompt("x")
+    assert not isinstance(e.value, PromptTooLong)
+    p.close()

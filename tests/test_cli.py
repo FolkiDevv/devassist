@@ -581,6 +581,19 @@ def test_test_context_errors(tmp_path, oneshot, capsys, _isolated_home):
     assert _models_json(_isolated_home) == {}
 
 
+def test_test_context_reports_failed_save(tmp_path, oneshot, capsys, monkeypatch):
+    from devassist.llm.model_windows import ModelWindows
+
+    def readonly(self, result, *, base_url=""):
+        raise OSError("только для чтения")
+
+    monkeypatch.setattr(ModelWindows, "record", readonly)
+    oneshot(WindowProvider(32_768))
+    assert _main(tmp_path, "--test-context", "M") == 1
+    out = capsys.readouterr().out
+    assert "не сохранён" in out and "записано в" not in out
+
+
 def test_oneshot_measures_unknown_window_once(tmp_path, oneshot, capsys, monkeypatch):
     provider = WindowProvider(8_192, [text_turn("ok")])
     oneshot(provider)

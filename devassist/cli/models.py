@@ -83,15 +83,13 @@ def describe_result(result: ProbeResult) -> str:
 
 def measure_context_window(
     provider: LLMProvider,
-    windows: ModelWindows,
     model: str,
     ui: Console,
     *,
-    base_url: str = "",
     interrupt: AbstractContextManager[object] | None = None,
     verbose: bool = False,
 ) -> ProbeResult | None:
-    """Замер окна ``model`` с индикатором; результат сохраняется в ``windows``.
+    """Замер окна ``model`` с индикатором (сохраняет :func:`save_window`).
 
     None — замер не удался (предупреждение выведено). ``KeyboardInterrupt``
     пробрасывается. ``verbose`` — печатать каждую пробу.
@@ -115,11 +113,17 @@ def measure_context_window(
     except LLMError as e:
         ui.warn(f"не удалось замерить окно {model}: {e}")
         return None
+    return result
+
+
+def save_window(windows: ModelWindows, result: ProbeResult, ui: Console, *, base_url: str) -> bool:
+    """Запоминает замер; False — файл записать не удалось (в памяти замер остаётся)."""
     try:
         windows.record(result, base_url=base_url)
     except OSError as e:
         ui.warn(f"замер окна не сохранён в {windows.path}: {e}")
-    return result
+        return False
+    return True
 
 
 def ensure_context_window(
@@ -141,14 +145,7 @@ def ensure_context_window(
     fallback = format_tokens(DEFAULT_CONTEXT_WINDOW)
     ui.info(f"окно контекста модели {model} не замерено — замеряю (несколько запросов)")
     try:
-        result = measure_context_window(
-            agent.provider,
-            agent.windows,
-            model,
-            ui,
-            base_url=agent.config.base_url,
-            interrupt=interrupt,
-        )
+        result = measure_context_window(agent.provider, model, ui, interrupt=interrupt)
     except KeyboardInterrupt:
         ui.warn(f"замер окна прерван — пока считаем окно {fallback}")
         return
@@ -156,3 +153,4 @@ def ensure_context_window(
         ui.system(f"пока считаем окно {model} равным {fallback}")
         return
     ui.system(describe_result(result))
+    save_window(agent.windows, result, ui, base_url=agent.config.base_url)

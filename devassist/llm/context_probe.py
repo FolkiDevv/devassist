@@ -64,7 +64,11 @@ class ProbeResult:
 
 
 class _Filler:
-    """Детерминированный разнообразный текст: русский, английский, код, числа."""
+    """Детерминированный разнообразный текст: русский, английский, код, числа.
+
+    Числа фиксированной ширины: строки одинаково токенизируются в начале и в конце
+    текста, и соотношение символов и токенов не плывёт с размером пробы.
+    """
 
     def __init__(self) -> None:
         self._parts: list[str] = []
@@ -74,10 +78,10 @@ class _Filler:
     def text(self, chars: int) -> str:
         if len(self._text) < chars:
             while self._size < chars:
-                n = len(self._parts)
+                n = len(self._parts) % 1000
                 line = (
-                    f"{n}. Замер окна контекста: def step_{n}(x): return x * {n % 97} + "
-                    f"{n % 13}  # the quick brown fox jumps over the lazy dog {n}\n"
+                    f"{n:03d}. Замер окна контекста: def step_{n:03d}(x): return x * "
+                    f"{n % 97:02d} + {n % 13:02d}  # the quick brown fox jumps over the lazy dog\n"
                 )
                 self._parts.append(line)
                 self._size += len(line)
@@ -164,8 +168,11 @@ def probe_context_window(
     if lo == 0:
         raise LLMError(f"модель отклонила даже запрос ~{CALIBRATION_TOKENS} токенов")
 
-    if attempt(cap):
-        return ProbeResult(model, min(lo, cap), None, True, probes, billed)
+    # Цель — оценка: калибровка на маленьком запросе может заметно промахнуться.
+    # Прошедший запрос меньше потолка перепроверяется с уточнённым соотношением.
+    while attempt(cap):
+        if lo >= cap - _tolerance(cap) or probes >= MAX_PROBES:
+            return ProbeResult(model, min(lo, cap), None, True, probes, billed)
 
     while upper() - lo > _tolerance(lo) and probes < MAX_PROBES:
         attempt(_next_target(lo, upper(), hints, tried, passed))

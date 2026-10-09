@@ -328,25 +328,40 @@ class GigaChatProvider(LLMProvider):
 
         return self._parse_response(self._json(resp))
 
-    def _post_chat(self, payload: dict[str, Any], *, attempts: int | None = None) -> httpx.Response:
-        """POST на chat/completions; при протухшем токене (401) — обновить и повторить раз."""
+    def _post_chat(
+        self,
+        payload: dict[str, Any],
+        send: Callable[[Callable[[], httpx.Response]], httpx.Response] | None = None,
+    ) -> httpx.Response:
+        """POST на chat/completions; при протухшем токене (401) — обновить и повторить раз.
+
+        ``send`` — как отправлять сам запрос (по умолчанию ``_request_with_retry``);
+        получение токена идёт мимо него, его ошибки — обычные ``GigaChatError``.
+        """
         url = f"{self._cfg.base_url}/chat/completions"
         headers = {"Content-Type": "application/json", **self._auth_headers()}
+        send = send or self._request_with_retry
 
-        resp = self._request_with_retry(
-            lambda: self._client.post(url, json=payload, headers=headers), attempts=attempts
-        )
+        resp = send(lambda: self._client.post(url, json=payload, headers=headers))
         if resp.status_code == 401 and not self._mtls:
             # токен протух — обновляем принудительно и повторяем один раз
             headers.update(self._auth_headers(force=True))
-            resp = self._request_with_retry(
-                lambda: self._client.post(url, json=payload, headers=headers), attempts=attempts
-            )
+            resp = send(lambda: self._client.post(url, json=payload, headers=headers))
         return resp
 
     # ------------------------------------------------------------------ #
     # Замер окна контекста
     # ------------------------------------------------------------------ #
+    def _send_probe(self, do_request: Callable[[], httpx.Response]) -> httpx.Response:
+        """Отправка пробы. Огромный запрос может упереться в таймаут шлюза: долгие
+        повторы бессмысленны — обрыв уже отправляемого запроса и есть «не помещается»."""
+        try:
+            return self._request_with_retry(do_request, attempts=_PROBE_ATTEMPTS)
+        except GigaChatError as e:
+            if isinstance(e.__cause__, _OVERSIZE_EXC):
+                raise PromptTooLong(None, str(e)) from e
+            raise
+
     def measure_prompt(self, text: str, *, model: str | None = None) -> int:
         payload = {
             "model": model or self._cfg.model,
@@ -354,14 +369,7 @@ class GigaChatProvider(LLMProvider):
             "max_tokens": 1,
             "temperature": 0,
         }
-        try:
-            # Огромный запрос может упереться в таймаут шлюза: долгие повторы
-            # здесь бессмысленны — это и есть ответ «не помещается».
-            resp = self._post_chat(payload, attempts=_PROBE_ATTEMPTS)
-        except GigaChatError as e:
-            if isinstance(e.__cause__, _OVERSIZE_EXC):
-                raise PromptTooLong(None, str(e)) from e
-            raise
+        resp = self._post_chat(payload, self._send_probe)
         status = resp.status_code
         if status >= 500 or (status >= 400 and status not in _NOT_SIZE_STATUS):
             raise PromptTooLong(status, resp.text)

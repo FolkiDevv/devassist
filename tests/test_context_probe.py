@@ -52,6 +52,22 @@ def test_window_above_cap_is_capped():
     assert MAX_CONTEXT_WINDOW * 0.98 <= result.window <= MAX_CONTEXT_WINDOW
 
 
+def test_capped_rechecks_undershoot_after_calibration():
+    """Калибровка на маленьком запросе промахивается (большие служебные токены):
+    прошедший «потолок» с заметным недобором перепроверяется с новым соотношением."""
+    steps = []
+    result = probe_context_window(
+        WindowProvider(1_000_000, overhead=300), "M", on_step=steps.append
+    )
+    assert steps[1].ok and steps[1].prompt_tokens < MAX_CONTEXT_WINDOW * 0.9
+    assert result.capped and result.window >= MAX_CONTEXT_WINDOW * 0.98
+
+
+def test_capped_recheck_rejected_continues_search():
+    result = probe_context_window(WindowProvider(250_000, overhead=300), "M")
+    assert not result.capped and 245_000 <= result.window <= 250_000
+
+
 def test_rejections_without_status_count_as_too_large():
     result = probe_context_window(WindowProvider(32_768, status=None), "M")
     assert 32_000 <= result.window <= 32_768

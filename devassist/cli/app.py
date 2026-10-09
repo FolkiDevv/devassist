@@ -24,7 +24,12 @@ from devassist import __version__
 from devassist.agent.chat_store import ChatRecorder, ChatStore, ChatStoreError, SavedChat
 from devassist.agent.loop import Agent
 from devassist.cli.commands import RESUME_LIMIT, default_commands, resume_chat
-from devassist.cli.models import describe_result, ensure_context_window, measure_context_window
+from devassist.cli.models import (
+    describe_result,
+    ensure_context_window,
+    measure_context_window,
+    save_window,
+)
 from devassist.cli.repl import autosave, esc_interrupt_for, run_repl
 from devassist.config import Config, ConfigError
 from devassist.llm.base import LLMError, LLMProvider
@@ -124,15 +129,15 @@ def run_test_context(
         return EXIT_ERROR
     ui.info(f"замер окна контекста {model}: пробные запросы с ответом в 1 токен")
     try:
-        result = measure_context_window(
-            provider, windows, model, ui, base_url=base_url, verbose=True
-        )
+        result = measure_context_window(provider, model, ui, verbose=True)
     except KeyboardInterrupt:
         ui.system("\n(замер прерван)")
         return EXIT_INTERRUPTED
     if result is None:
         return EXIT_LLM_ERROR
     ui.success(describe_result(result))
+    if not save_window(windows, result, ui, base_url=base_url):
+        return EXIT_ERROR
     ui.system(f"записано в {windows.path}")
     return EXIT_OK
 
