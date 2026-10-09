@@ -39,11 +39,13 @@ from rich.table import Table
 from rich.text import Text
 from rich.theme import Theme
 
+from devassist.agent.chat_store import ChatInfo
 from devassist.agent.events import AgentEvents, NoticeLevel, ToolCallInfo, TurnStats
+from devassist.llm.types import Message
 from devassist.tools.ask_user import format_answer
 from devassist.tools.base import Display, ToolResult
 from devassist.tools.questions import Answer, Question, QuestionsUnavailable
-from devassist.ui.format import SKIPPED_MARK, clip_lines, format_tokens, plural
+from devassist.ui.format import SKIPPED_MARK, clip_lines, format_tokens, format_when, plural
 from devassist.ui.markdown import Markdown
 from devassist.ui.markdown_stream import MarkdownStream
 from devassist.ui.theme import (
@@ -58,6 +60,7 @@ from devassist.ui.theme import (
     MARKDOWN_STYLES,
     MUTED,
     OK,
+    USER,
     WARN,
 )
 
@@ -550,6 +553,80 @@ class Console(AgentEvents):
             except (EOFError, KeyboardInterrupt):
                 self._c.print()
                 return None
+
+    # ---------------------------- сохранённые чаты ---------------------------- #
+    def pick_chat(self, chats: Sequence[ChatInfo], current_id: str = "") -> ChatInfo | None:
+        """Выбор чата: меню со стрелками и поиском, без терминала — номер. None — отмена."""
+        self.stop_live()
+        if not chats:
+            return None
+        if self._live_ok and _stdin_is_terminal():
+            try:
+                from devassist.ui.chat_picker import pick_chat
+
+                return pick_chat(chats, current_id, no_color=self._no_color)
+            except (KeyboardInterrupt, EOFError):
+                return None
+        return self._pick_chat_plain(chats, current_id)
+
+    def _pick_chat_plain(self, chats: Sequence[ChatInfo], current_id: str) -> ChatInfo | None:
+        table = Table.grid(padding=(0, 2))
+        table.add_column(style=ACCENT, justify="right", no_wrap=True)
+        table.add_column(style=MUTED, no_wrap=True)
+        table.add_column()
+        for k, chat in enumerate(chats, 1):
+            n = chat.requests
+            meta = (
+                f"{format_when(chat.updated_at)} · {n} {plural(n, 'запрос', 'запроса', 'запросов')}"
+            )
+            title = Text(sanitize(chat.title))
+            if chat.id == current_id:
+                title.append(" (текущий)", style=MUTED)
+            table.add_row(f"{k}.", meta, title)
+        self._c.print(Text(f"Чаты проекта · {len(chats)}", style=f"bold {BRAND}"))
+        self._c.print(table)
+        while True:
+            try:
+                raw = self._c.input(Text("  номер чата (Enter — отмена): ", style=MUTED))
+            except (EOFError, KeyboardInterrupt):
+                self._c.print()
+                return None
+            raw = raw.strip()
+            if not raw:
+                return None
+            if raw.isdecimal() and 1 <= int(raw) <= len(chats):
+                return chats[int(raw) - 1]
+            self.warn(f"введите номер от 1 до {len(chats)}")
+
+    def chat_resumed(self, info: ChatInfo, messages: Sequence[Message]) -> None:
+        """Сообщение о продолжении чата и последний обмен репликами."""
+        n = info.requests
+        line = Text("↺ продолжаем чат ", style=MUTED)
+        line.append(f"«{sanitize(info.title)}»", style=f"bold {ACCENT}")
+        line.append(
+            f" · {n} {plural(n, 'запрос', 'запроса', 'запросов')} · {format_when(info.updated_at)}",
+            style=MUTED,
+        )
+        self._c.print(line)
+        request = next(
+            (m.content for m in reversed(messages) if m.role == "user" and m.content.strip()),
+            "",
+        )
+        answer = next(
+            (
+                m.content
+                for m in reversed(messages)
+                if m.role == "assistant" and m.function_call is None and m.content.strip()
+            ),
+            "",
+        )
+        if request:
+            shown = clip_lines(request, head=3, tail=2, max_chars=600)
+            self._c.print(Text("› ", style=f"bold {USER}").append(sanitize(shown), style=USER))
+        if answer:
+            self._assistant_label()
+            self._c.print(Markdown(sanitize(answer)))
+        self._c.print()
 
 
 def _stdin_is_terminal() -> bool:

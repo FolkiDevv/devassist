@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 SKIPPED_MARK = "…"
 
 
@@ -49,3 +51,25 @@ def clip_lines(
         tail_chars = max_chars - 1 - head_chars
         result = result[:head_chars] + "…" + result[len(result) - tail_chars :]
     return result
+
+
+def format_when(when: datetime, now: datetime | None = None) -> str:
+    """Когда это было: «только что», «5 мин назад», «сегодня 14:30», «вчера 09:05», «03.10»."""
+    # Наивное время считается местным: aware и naive нельзя вычитать друг из друга.
+    now = datetime.now().astimezone() if now is None else now
+    if now.tzinfo is None:
+        now = now.astimezone()
+    when = when.astimezone(now.tzinfo)
+    seconds = (now - when).total_seconds()
+    if 0 <= seconds < 60:
+        return "только что"
+    if 0 <= seconds < 3600:
+        return f"{int(seconds // 60)} мин назад"
+    days = (now.date() - when.date()).days
+    if days == 0:
+        return f"сегодня {when:%H:%M}"
+    if days == 1:
+        return f"вчера {when:%H:%M}"
+    if when.year == now.year:
+        return f"{when:%d.%m %H:%M}"
+    return f"{when:%d.%m.%Y}"
