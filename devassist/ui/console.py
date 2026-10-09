@@ -33,7 +33,6 @@ from rich.console import ConsoleOptions, Group, RenderResult
 from rich.live import Live
 from rich.panel import Panel
 from rich.segment import Segment, SegmentLines
-from rich.spinner import Spinner
 from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
@@ -48,6 +47,8 @@ from devassist.tools.questions import Answer, Question, QuestionsUnavailable
 from devassist.ui.format import SKIPPED_MARK, clip_lines, format_tokens, format_when, plural
 from devassist.ui.markdown import Markdown
 from devassist.ui.markdown_stream import MarkdownStream
+from devassist.ui.spinner import INTERVAL as SPINNER_INTERVAL
+from devassist.ui.spinner import rocket_frame
 from devassist.ui.theme import (
     ACCENT,
     BRAND,
@@ -69,7 +70,7 @@ from devassist.ui.theme import (
 # подменить заголовок окна и т.п. Оставляем только \n и \t.
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 _SKIPPED_RE = re.compile(rf"^{SKIPPED_MARK} пропущено .*$", re.MULTILINE)
-_REFRESH_PER_SECOND = 12
+_REFRESH_PER_SECOND = 2 / SPINNER_INTERVAL  # два обновления на кадр — ровный шаг ракеты
 
 
 def sanitize(text: str) -> str:
@@ -95,23 +96,21 @@ class _LiveView:
         self._tail = tail
         self._hint = hint
         self._started = time.monotonic()
-        self._spinner = Spinner("dots12", style=BRAND)
 
     def __rich_console__(self, console: RichConsole, options: ConsoleOptions) -> RenderResult:
-        elapsed = int(time.monotonic() - self._started)
-        self._spinner.update(
-            text=Text.assemble(
-                (f" {self._label() if callable(self._label) else self._label}… ", MUTED),
-                (f"{elapsed} с", MUTED),
-                (f"  ·  {self._hint}", MUTED),
-            )
+        elapsed = time.monotonic() - self._started
+        indicator = Text.assemble(
+            rocket_frame(elapsed),
+            (f"  {self._label() if callable(self._label) else self._label}… ", MUTED),
+            (f"{int(elapsed)} с", MUTED),
+            (f"  ·  {self._hint}", MUTED),
         )
         lines = self._tail() if self._tail else []
         if lines:
             room = max(console.size.height - 3, 1)  # индикатор + отступ + запас
             yield SegmentLines(lines[-room:], new_lines=True)
             yield Text("")
-        yield self._spinner
+        yield indicator
 
 
 class _LiveArea:
