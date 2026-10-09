@@ -190,3 +190,31 @@ def test_find_symbols_qualified_kind_glob_and_limit(index):
     assert index.find_symbols("100%_")[1] == 0  # спецсимволы LIKE экранируются
     with pytest.raises(ValueError):
         index.find_symbols("  ")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="регистр путей")
+def test_subtree_is_case_sensitive(index, project):
+    _make(project, "Src/upper.py", "def upper(): pass\n")
+    _make(project, "src/lower.py", "def lower(): pass\n")
+    index.refresh()
+    index.refresh(project / "src")
+    assert "Src/upper.py" in _paths(index)  # соседний каталог в другом регистре не тронут
+    assert [e.path for e in index.files_under("src")] == ["src/lower.py"]
+
+
+def test_unreadable_file_is_retried_when_unchanged(index, project, monkeypatch):
+    real = index_mod.Path.read_bytes
+    broken = {"app/agent.py"}
+
+    def read_bytes(self):
+        if self.relative_to(project.resolve()).as_posix() in broken:
+            raise PermissionError("нет доступа")
+        return real(self)
+
+    monkeypatch.setattr(index_mod.Path, "read_bytes", read_bytes)
+    index.refresh()
+    assert index.file_entry("app/agent.py").status == "error"
+    broken.clear()  # права починили, файл не менялся
+    assert index.refresh().updated == 1
+    assert index.file_entry("app/agent.py").status == "indexed"
+    assert index.refresh().changed == 0

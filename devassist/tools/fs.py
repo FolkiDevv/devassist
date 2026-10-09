@@ -36,7 +36,7 @@ def _writable_path(ctx: ToolContext, path: str) -> Path:
     Проверка срабатывает и в превью, то есть до вопроса о подтверждении.
     """
     p = resolve_in_root(ctx.root, path)
-    data_dir = ctx.workspace.data_dir
+    data_dir = ctx.workspace.data_dir.resolve()  # .devassist может быть симлинком
     if p == data_dir or data_dir in p.parents:
         raise ToolError(
             f"Служебная папка {DATA_DIR_NAME}/ (индекс, история, чаты агента) "

@@ -133,7 +133,8 @@ def _under(prefix: str) -> tuple[str, list[str]]:
     """SQL-условие «путь равен ``prefix`` или лежит под ним» (пустой — весь проект)."""
     if not prefix:
         return "1", []
-    return "(path = ? OR path LIKE ? ESCAPE '\\')", [prefix, _escape_like(prefix) + "/%"]
+    # не LIKE: он не различает регистр ASCII, а `Src/` и `src/` — разные каталоги
+    return "(path = ? OR substr(path, 1, ?) = ?)", [prefix, len(prefix) + 1, prefix + "/"]
 
 
 def _count_lines(text: str) -> int:
@@ -274,10 +275,11 @@ class ProjectIndex:
         full = base == self.root
         prefix = self._rel(base)
         cond, args = _under(prefix)
+        # файлы с ошибкой чтения перечитываются, даже если не менялись (права могли починить)
         known = {
-            path: (size, mtime)
-            for path, size, mtime in db.execute(
-                f"SELECT path, size, mtime_ns FROM files WHERE {cond}", args
+            path: (size, mtime) if status != STATUS_ERROR else None
+            for path, size, mtime, status in db.execute(
+                f"SELECT path, size, mtime_ns, status FROM files WHERE {cond}", args
             )
         }
         scanned = added = updated = pending = 0
@@ -304,7 +306,7 @@ class ProjectIndex:
                 if old == (st.st_size, st.st_mtime_ns):
                     continue
                 self._index_file(rel, path, st)
-                if old is None:
+                if rel not in known:
                     added += 1
                 else:
                     updated += 1

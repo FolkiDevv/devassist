@@ -159,3 +159,12 @@ def test_walk_files_accepts_unresolved_base(tmp_path):
     _make(tmp_path, "pkg/b.gen")
     base = tmp_path / "pkg" / ".." / "pkg"  # не раскрытый путь внутри корня
     assert _rels(tmp_path, base) == ["pkg/a.py"]
+
+
+def test_malformed_pattern_does_not_break_traversal(tmp_path):
+    """Битый класс символов ([z-a]) не роняет разбор и обход."""
+    _make(tmp_path, ".gitignore", "[z-a]\n*.log\n")
+    _make(tmp_path, "a.py")
+    _make(tmp_path, "b.log")
+    assert _rels(tmp_path) == [".gitignore", "a.py"]
+    assert not _ignored("[z-a]", "a.py")  # правило просто ничего не исключает

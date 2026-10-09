@@ -257,3 +257,47 @@ def test_unknown_language_has_no_symbols():
 def test_symbols_limit_per_file():
     src = "\n".join(f"def f{i}(): pass" for i in range(MAX_SYMBOLS_PER_FILE + 50))
     assert len(extract_symbols(src, "python")) == MAX_SYMBOLS_PER_FILE
+
+
+def test_markdown_commonmark_headings_and_fences():
+    text = (
+        " # С отступом\n"
+        "# C#\n"
+        "#хештег не заголовок\n"
+        "~~~~\n"
+        "```\n"
+        "# внутри блока\n"
+        "~~~~\n"
+        "# После блока\n"
+        "```python\n"
+        "# комментарий\n"
+        "``` не закрывает\n"
+        "```\n"
+        "## Конец ##\n"
+    )
+    names = [s.name for s in extract_symbols(text, "markdown")]
+    assert names == ["С отступом", "C#", "После блока", "Конец"]
+
+
+def test_python_methods_under_class_level_if_and_try():
+    src = textwrap.dedent(
+        """\
+        class C:
+            if True:
+                def run(self):
+                    pass
+            try:
+                def fast(self):
+                    pass
+            except ImportError:
+                def slow(self):
+                    pass
+        """
+    )
+    got = [(s.kind, s.qualname, s.depth) for s in extract_symbols(src, "python")]
+    assert got == [
+        ("class", "C", 0),
+        ("method", "C.run", 1),
+        ("method", "C.fast", 1),
+        ("method", "C.slow", 1),
+    ]

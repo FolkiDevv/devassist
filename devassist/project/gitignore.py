@@ -26,7 +26,8 @@ _MAX_RULES_BYTES = 1_000_000  # больше — явно не файл прав
 def compile_glob(pattern: str) -> re.Pattern[str]:
     """glob → regex: ``**`` — любое число каталогов, ``*``/``?`` — в пределах сегмента.
 
-    ``\\x`` — символ ``x`` буквально (как в ``.gitignore``).
+    ``\\x`` — символ ``x`` буквально (как в ``.gitignore``). Шаблон, который не
+    компилируется (``[z-a]``), сравнивается как обычная строка.
     """
     out: list[str] = []
     i, n = 0, len(pattern)
@@ -67,7 +68,10 @@ def compile_glob(pattern: str) -> re.Pattern[str]:
         else:
             out.append(re.escape(c))
         i += 1
-    return re.compile("".join(out) + r"\Z")
+    try:
+        return re.compile("".join(out) + r"\Z")
+    except re.error:
+        return re.compile(re.escape(pattern) + r"\Z")
 
 
 @dataclass(frozen=True)

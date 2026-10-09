@@ -306,3 +306,17 @@ def test_data_dir_is_not_writable(ctx, path):
 def test_similar_names_outside_data_dir_are_writable(ctx):
     w = WriteFileTool()
     assert w.run(w.parse({"path": ".devassist.md", "content": "ok"}), ctx).ok
+
+
+def test_data_dir_symlink_target_is_not_writable(ctx):
+    """.devassist — симлинк на каталог проекта: запись по любому из путей запрещена."""
+    import os
+
+    if os.name == "nt":
+        pytest.skip("симлинки")
+    (ctx.root / "agent-data").mkdir()
+    (ctx.root / ".devassist").symlink_to(ctx.root / "agent-data", target_is_directory=True)
+    w = WriteFileTool()
+    for path in (".devassist/index.sqlite3", "agent-data/index.sqlite3"):
+        with pytest.raises(ToolError, match="Служебная папка"):
+            w.preview(w.parse({"path": path, "content": "x"}), ctx)

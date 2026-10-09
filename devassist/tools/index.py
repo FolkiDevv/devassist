@@ -18,6 +18,7 @@ from devassist.project.index import (
     INDEX_ERRORS,
     MAX_INDEX_FILE_BYTES,
     STATUS_BINARY,
+    STATUS_ERROR,
     STATUS_LARGE,
     FileEntry,
     ProjectIndex,
@@ -175,6 +176,8 @@ class FileOutlineTool(Tool):
             )
         if entry.status == STATUS_BINARY:
             raise ToolError(f"Бинарный файл: {shown}")
+        if entry.status == STATUS_ERROR:
+            raise ToolError(f"Не удалось разобрать файл: {shown}. Используйте read_file.")
         symbols = index.outline(rel)
         header = _entry_line(entry, rel)
         if not symbols:

@@ -140,8 +140,8 @@ def _python_symbols(text: str) -> list[Symbol]:
                 kind = "class"
             elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 kind = "method" if in_class else "function"
-            elif isinstance(node, (ast.If, ast.Try)) and not in_class and depth == 0:
-                # определения под `if TYPE_CHECKING:` / `try: import ...` — тоже модульные
+            elif isinstance(node, (ast.If, ast.Try)):
+                # определения под `if TYPE_CHECKING:` / `try: import ...` — того же уровня
                 for block in (node.body, node.orelse, getattr(node, "finalbody", [])):
                     visit(block, parent, depth, in_class)
                 for handler in getattr(node, "handlers", []):
@@ -183,19 +183,25 @@ def _python_symbols(text: str) -> list[Symbol]:
 
 
 # -------------------------------- Markdown -------------------------------- #
-_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*#*\s*$")
-_FENCE_RE = re.compile(r"^\s*(```|~~~)")
+# CommonMark: до 3 пробелов отступа; закрывающие '#' — только после пробела ("# C#").
+_HEADING_RE = re.compile(r"^ {0,3}(#{1,6})[ \t]+(.+?)(?:[ \t]+#+)?[ \t]*$")
+_FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 
 
 def _markdown_symbols(text: str) -> list[Symbol]:
     out: list[Symbol] = []
     stack: list[tuple[int, str]] = []  # (уровень, заголовок)
-    in_fence = False
+    fence = ""  # открывающая ограда блока кода ("```", "~~~~"…), пусто — вне блока
     for i, line in enumerate(text.splitlines(), start=1):
-        if _FENCE_RE.match(line):
-            in_fence = not in_fence
+        m = _FENCE_RE.match(line)
+        if fence:
+            # закрывает только ограда того же символа, не короче, без текста после
+            if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence):
+                if not line[m.end() :].strip():
+                    fence = ""
             continue
-        if in_fence:
+        if m:
+            fence = m.group(1)
             continue
         m = _HEADING_RE.match(line)
         if not m:

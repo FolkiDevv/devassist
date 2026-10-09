@@ -145,3 +145,14 @@ def test_broken_index_becomes_tool_error(ctx, monkeypatch):
     monkeypatch.setattr(tools_index.ProjectIndex, "open", boom)
     with pytest.raises(ToolError, match="Индекс проекта недоступен"):
         _find(ctx, query="Agent")
+
+
+def test_file_outline_reports_parse_errors(ctx, monkeypatch):
+    from devassist.project import index as index_mod
+
+    def boom(text, language):
+        raise RuntimeError("сбой разбора")
+
+    monkeypatch.setattr(index_mod, "extract_symbols", boom)
+    with pytest.raises(ToolError, match="Не удалось разобрать"):
+        _outline(ctx, "app/agent.py")
