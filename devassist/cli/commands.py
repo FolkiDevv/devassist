@@ -153,11 +153,11 @@ def default_commands() -> CommandRegistry:
     registry = CommandRegistry()
     registry.register(SlashCommand("/help", "справка", _help))
     registry.register(SlashCommand("/model", "сменить модель", _model, usage="/model [имя]"))
-    registry.register(SlashCommand("/clear", "новый чат (история очищается)", _clear))
+    registry.register(SlashCommand("/clear", "новый чат", _clear))
     registry.register(
         SlashCommand(
             "/resume",
-            "продолжить сохранённый чат",
+            "открыть сохранённый чат",
             _resume,
             usage="/resume [id]",
             aliases=("/chats",),
