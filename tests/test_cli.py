@@ -457,7 +457,7 @@ def test_repl_shows_resumed_chat_after_banner(repl_env, capsys):
     info = ctx.chats.store.save("20260101-000000-abcd", agent.conversation)
     run_repl(agent, ui, commands, read_input=_reader("/exit"), chats=ctx.chats, resumed=info)
     out = _out(capsys)
-    assert out.index("devassist") < out.index("продолжаем чат «прошлый вопрос»")
+    assert out.index("модель") < out.index("продолжаем чат «прошлый вопрос»")
 
 
 # ------------------------------ индекс проекта ------------------------------ #

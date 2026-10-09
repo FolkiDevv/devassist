@@ -303,3 +303,14 @@ def test_questions_pause_esc_interrupt(monkeypatch):
     ui.set_interrupt_keys("Esc — прервать", guard)
     ui.ask_user([_DB])
     assert entered == [True]
+
+
+def test_banner_shows_rocket_title_and_meta():
+    ui, buf = _console()
+    ui.banner(
+        version="9.9.9", model="GigaChat-Max", root="/work/proj", hints=[("/help", "справка")]
+    )
+    out = _plain(buf)
+    assert "▟█▙" in out and "╺┳┓" in out  # ракета и крупное название
+    assert "v9.9.9" in out and "GigaChat-Max" in out and "/work/proj" in out
+    assert "/help справка" in out

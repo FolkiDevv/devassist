@@ -33,7 +33,6 @@ from rich.console import ConsoleOptions, Group, RenderResult
 from rich.live import Live
 from rich.panel import Panel
 from rich.segment import Segment, SegmentLines
-from rich.spinner import Spinner
 from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Text
@@ -45,9 +44,12 @@ from devassist.llm.types import Message
 from devassist.tools.ask_user import format_answer
 from devassist.tools.base import Display, ToolResult
 from devassist.tools.questions import Answer, Question, QuestionsUnavailable
+from devassist.ui import banner as banner_art
 from devassist.ui.format import SKIPPED_MARK, clip_lines, format_tokens, format_when, plural
 from devassist.ui.markdown import Markdown
 from devassist.ui.markdown_stream import MarkdownStream
+from devassist.ui.spinner import INTERVAL as SPINNER_INTERVAL
+from devassist.ui.spinner import rocket_frame
 from devassist.ui.theme import (
     ACCENT,
     BRAND,
@@ -69,7 +71,7 @@ from devassist.ui.theme import (
 # подменить заголовок окна и т.п. Оставляем только \n и \t.
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 _SKIPPED_RE = re.compile(rf"^{SKIPPED_MARK} пропущено .*$", re.MULTILINE)
-_REFRESH_PER_SECOND = 12
+_REFRESH_PER_SECOND = 2 / SPINNER_INTERVAL  # два обновления на кадр — ровный шаг ракеты
 
 
 def sanitize(text: str) -> str:
@@ -95,23 +97,21 @@ class _LiveView:
         self._tail = tail
         self._hint = hint
         self._started = time.monotonic()
-        self._spinner = Spinner("dots", style=BRAND)
 
     def __rich_console__(self, console: RichConsole, options: ConsoleOptions) -> RenderResult:
-        elapsed = int(time.monotonic() - self._started)
-        self._spinner.update(
-            text=Text.assemble(
-                (f" {self._label() if callable(self._label) else self._label}… ", MUTED),
-                (f"{elapsed} с", MUTED),
-                (f"  ·  {self._hint}", MUTED),
-            )
+        elapsed = time.monotonic() - self._started
+        indicator = Text.assemble(
+            rocket_frame(elapsed),
+            (f"  {self._label() if callable(self._label) else self._label}… ", MUTED),
+            (f"{int(elapsed)} с", MUTED),
+            (f"  ·  {self._hint}", MUTED),
         )
         lines = self._tail() if self._tail else []
         if lines:
             room = max(console.size.height - 3, 1)  # индикатор + отступ + запас
             yield SegmentLines(lines[-room:], new_lines=True)
             yield Text("")
-        yield self._spinner
+        yield indicator
 
 
 class _LiveArea:
@@ -285,21 +285,17 @@ class Console(AgentEvents):
         auto_approve: bool = False,
     ) -> None:
         """Приветственная панель; ``hints`` — пары (команда, краткое описание)."""
-        logo = Text()
-        logo.append(f"{ICON_BRAND} ", style=f"bold {BRAND}")
-        logo.append("dev", style=f"bold {BRAND}")
-        logo.append("assist", style="bold")
-        logo.append(f"  v{version}", style=MUTED)
-
-        subtitle = Text("AI-ассистент разработчика · работает на GigaChat", style=MUTED)
-
-        meta = Table.grid(padding=(0, 1))
-        meta.add_column(style=MUTED, justify="right")
-        meta.add_column()
-        meta.add_row("модель", Text(model, style=f"bold {ACCENT}"))
-        meta.add_row("проект", Text(root))
-
-        body = Group(logo, subtitle, Text(""), meta)
+        info = Group(
+            banner_art.title(),
+            Text(f"v{version}", style=MUTED),
+            Text(""),
+            Text.assemble(("модель ", MUTED), (model, f"bold {ACCENT}")),
+            Text.assemble(("проект ", MUTED), root),
+        )
+        body = Table.grid(padding=(0, 3))
+        body.add_column(vertical="middle", no_wrap=True)
+        body.add_column(vertical="middle")
+        body.add_row(banner_art.rocket(), info)
         self._c.print(Panel(body, box=ROUNDED, border_style=BRAND, padding=(1, 2), expand=False))
         hint = Text("  ", style=MUTED)
         for i, (cmd, desc) in enumerate(hints):
