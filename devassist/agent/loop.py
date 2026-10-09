@@ -16,13 +16,20 @@ import time
 
 from pydantic import BaseModel
 
-from devassist.agent.context_window import estimate_tokens, fit_history
+from devassist.agent.context_window import (
+    DEFAULT_CONTEXT_WINDOW,
+    budget_for_window,
+    estimate_specs_tokens,
+    estimate_tokens,
+    fit_history,
+)
 from devassist.agent.conversation import Conversation
 from devassist.agent.events import AgentEvents, ToolCallInfo, TurnStats
 from devassist.agent.guard import CallCheck, LoopGuard, ToolOutcome
 from devassist.agent.prompts import build_system_prompt
 from devassist.config import Config
 from devassist.llm.base import LLMProvider
+from devassist.llm.model_windows import ModelWindows
 from devassist.llm.types import AssistantTurn, Message, ToolSpec
 from devassist.project.workspace import Workspace
 from devassist.security import RiskLevel
@@ -55,8 +62,13 @@ class Agent:
         *,
         workspace: Workspace | None = None,
         conversation: Conversation | None = None,
+        windows: ModelWindows | None = None,
     ):
-        """Конструктор не обращается к файловой системе и сети."""
+        """Конструктор не обращается к файловой системе и сети.
+
+        ``windows`` — замеренные окна моделей (по умолчанию пусто: окно
+        :data:`~devassist.agent.context_window.DEFAULT_CONTEXT_WINDOW`).
+        """
         self._provider = provider
         self._registry = registry
         self._cfg = config
@@ -66,6 +78,7 @@ class Agent:
         self._ctx = ToolContext(workspace=self._workspace, ask_user=self._events.ask_user)
         self._conversation = Conversation() if conversation is None else conversation
         self._model = config.model
+        self._windows = ModelWindows() if windows is None else windows
         self._system_prompt: str | None = None  # строится лениво, сбрасывается в reset()
         self._billed_tokens = 0  # потрачено за сессию (reset() не сбрасывает)
 
@@ -91,6 +104,26 @@ class Agent:
         """Размер контекста по последнему обращению к модели (0 — диалог пуст)."""
         usage = self._conversation.last_usage
         return usage.prompt_tokens + usage.completion_tokens if usage else 0
+
+    @property
+    def provider(self) -> LLMProvider:
+        return self._provider
+
+    @property
+    def windows(self) -> ModelWindows:
+        return self._windows
+
+    @property
+    def context_window(self) -> int | None:
+        """Замеренное окно текущей модели (None — не замерено)."""
+        return self._windows.get(self._model)
+
+    @property
+    def context_budget(self) -> int:
+        """Бюджет запроса (оценка в токенах): явный из конфига или от окна модели."""
+        if self._cfg.context_budget_tokens is not None:
+            return self._cfg.context_budget_tokens
+        return budget_for_window(self.context_window or DEFAULT_CONTEXT_WINDOW)
 
     @property
     def billed_tokens(self) -> int:
@@ -187,18 +220,20 @@ class Agent:
             self._system_prompt = build_system_prompt(self._workspace)
         return self._system_prompt
 
-    def _build_request(self) -> list[Message]:
+    def _build_request(self, specs: list[ToolSpec]) -> list[Message]:
         """Сообщения для модели: системный промпт + история в пределах бюджета.
 
         Единственная точка сборки запроса — сюда встраивается сжатие контекста.
         """
         system = Message(role="system", content=self.system_prompt())
-        budget = max(self._cfg.context_budget_tokens - estimate_tokens([system]), 1_000)
+        # Схемы инструментов уходят в каждом запросе и занимают то же окно.
+        used = estimate_tokens([system]) + estimate_specs_tokens(specs)
+        budget = max(self.context_budget - used, 1_000)
         return [system, *fit_history(self._conversation.messages, budget)]
 
     def _next_turn(self, specs: list[ToolSpec]) -> AssistantTurn:
         """Один проход модели с выводом текста (потоковым или цельным)."""
-        messages = self._build_request()
+        messages = self._build_request(specs)
         self._events.on_stream_start()
         try:
             if self._cfg.stream:

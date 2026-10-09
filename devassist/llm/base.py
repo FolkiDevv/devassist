@@ -20,8 +20,25 @@ class LLMError(RuntimeError):
     """
 
 
+class PromptTooLong(LLMError):
+    """Запрос отклонён из-за размера (замер окна контекста, :meth:`LLMProvider.measure_prompt`).
+
+    ``status`` — HTTP-статус ответа (None — таймаут/обрыв), ``detail`` — тело ответа:
+    в нём сервер нередко называет свой лимит.
+    """
+
+    def __init__(self, status: int | None, detail: str):
+        self.status = status
+        self.detail = detail
+        code = status if status is not None else "нет ответа"
+        super().__init__(f"запрос слишком велик ({code}): {detail[:300]}")
+
+
 class LLMProvider(ABC):
     """Минимальный контракт провайдера для агентного цикла."""
+
+    # Умеет ли провайдер :meth:`measure_prompt` (замер окна контекста).
+    supports_measure: bool = False
 
     @property
     @abstractmethod
@@ -32,8 +49,17 @@ class LLMProvider(ABC):
         """Освобождает ресурсы (соединения). По умолчанию ничего не делает."""
 
     def list_models(self) -> list[str]:
-        """Доступные модели (для диагностики). По умолчанию — только текущая."""
+        """Доступные чат-модели (для выбора и диагностики). По умолчанию — только текущая."""
         return [self.model]
+
+    def measure_prompt(self, text: str, *, model: str | None = None) -> int:
+        """Отправляет ``text`` одним сообщением с минимальным ответом; возвращает
+        ``prompt_tokens`` по данным API — точный размер запроса для этой модели.
+
+        Запрос, не уместившийся в окно, — :class:`PromptTooLong`; прочие ошибки —
+        :class:`LLMError`. Провайдер с поддержкой замера выставляет ``supports_measure``.
+        """
+        raise NotImplementedError
 
     @abstractmethod
     def complete(

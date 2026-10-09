@@ -25,7 +25,7 @@ from typing import Any
 import httpx
 
 from devassist.config import Config
-from devassist.llm.base import LLMError, LLMProvider
+from devassist.llm.base import LLMError, LLMProvider, PromptTooLong
 from devassist.llm.types import AssistantTurn, FunctionCall, Message, ToolSpec, Usage
 
 
@@ -51,8 +51,24 @@ _RETRYABLE_EXC = (
 # HTTP-статусы, которые имеет смысл повторить (лимит/временная недоступность).
 _RETRY_STATUS = {429, 500, 502, 503, 504}
 
+# Замер окна: 4xx с этими статусами — не про размер запроса (авторизация, нет
+# модели, лимит частоты); остальные 4xx и 5xx считаются «запрос не помещается».
+_NOT_SIZE_STATUS = {401, 403, 404, 429}
+_PROBE_ATTEMPTS = 2
+# Обрыв или таймаут уже отправляемого запроса — для огромного запроса это тоже
+# «не помещается»; ошибки установки соединения к размеру отношения не имеют.
+_OVERSIZE_EXC = (
+    httpx.ReadTimeout,
+    httpx.WriteTimeout,
+    httpx.RemoteProtocolError,
+    httpx.ReadError,
+    httpx.WriteError,
+)
+
 
 class GigaChatProvider(LLMProvider):
+    supports_measure = True
+
     def __init__(self, config: Config, *, transport: httpx.BaseTransport | None = None):
         """``transport`` — подмена HTTP-транспорта (``httpx.MockTransport`` в тестах)."""
         config.require_credentials()
@@ -85,7 +101,9 @@ class GigaChatProvider(LLMProvider):
     # ------------------------------------------------------------------ #
     # Сетевой слой с повторами
     # ------------------------------------------------------------------ #
-    def _request_with_retry(self, do_request: Callable[[], httpx.Response]) -> httpx.Response:
+    def _request_with_retry(
+        self, do_request: Callable[[], httpx.Response], *, attempts: int | None = None
+    ) -> httpx.Response:
         """Выполняет HTTP-запрос, повторяя транзиентные сбои.
 
         Повторяем (с экспоненциальной задержкой):
@@ -93,30 +111,31 @@ class GigaChatProvider(LLMProvider):
           * 429 Too Many Requests и 5xx — временная недоступность/лимит.
         Прочие HTTP-ответы (включая 4xx) возвращаем как есть — их разбирает
         вызывающая сторона. Неповторяемые ошибки транспорта → GigaChatError.
+        ``attempts`` — число попыток вместо ``_max_retries``.
         """
+        attempts = attempts or self._max_retries
         delay = 1.0
         last_exc: Exception | None = None
-        for attempt in range(self._max_retries):
+        for attempt in range(attempts):
             try:
                 resp = do_request()
             except _RETRYABLE_EXC as e:
                 last_exc = e
-                if attempt < self._max_retries - 1:
+                if attempt < attempts - 1:
                     time.sleep(delay)
                     delay = min(delay * 2, 8.0)
                 continue
             except httpx.HTTPError as e:
                 raise GigaChatError(f"Ошибка соединения с GigaChat: {e}") from e
 
-            if resp.status_code in _RETRY_STATUS and attempt < self._max_retries - 1:
+            if resp.status_code in _RETRY_STATUS and attempt < attempts - 1:
                 time.sleep(self._retry_after(resp, delay))
                 delay = min(delay * 2, 8.0)
                 continue
             return resp
 
         raise GigaChatError(
-            f"Сетевая ошибка при обращении к GigaChat (после "
-            f"{self._max_retries} попыток): {last_exc}"
+            f"Сетевая ошибка при обращении к GigaChat (после {attempts} попыток): {last_exc}"
         ) from last_exc
 
     @staticmethod
@@ -301,25 +320,65 @@ class GigaChatProvider(LLMProvider):
         temperature: float = 0.2,
     ) -> AssistantTurn:
         payload = self._payload(messages, tools, model=model, temperature=temperature)
-        url = f"{self._cfg.base_url}/chat/completions"
-        headers = {"Content-Type": "application/json", **self._auth_headers()}
-
-        resp = self._request_with_retry(
-            lambda: self._client.post(url, json=payload, headers=headers)
-        )
-        if resp.status_code == 401 and not self._mtls:
-            # токен протух — обновляем принудительно и повторяем один раз
-            headers.update(self._auth_headers(force=True))
-            resp = self._request_with_retry(
-                lambda: self._client.post(url, json=payload, headers=headers)
-            )
-
+        resp = self._post_chat(payload)
         try:
             resp.raise_for_status()
         except httpx.HTTPStatusError as e:
             raise GigaChatError(f"GigaChat вернул {resp.status_code}: {resp.text}") from e
 
         return self._parse_response(self._json(resp))
+
+    def _post_chat(
+        self,
+        payload: dict[str, Any],
+        send: Callable[[Callable[[], httpx.Response]], httpx.Response] | None = None,
+    ) -> httpx.Response:
+        """POST на chat/completions; при протухшем токене (401) — обновить и повторить раз.
+
+        ``send`` — как отправлять сам запрос (по умолчанию ``_request_with_retry``);
+        получение токена идёт мимо него, его ошибки — обычные ``GigaChatError``.
+        """
+        url = f"{self._cfg.base_url}/chat/completions"
+        headers = {"Content-Type": "application/json", **self._auth_headers()}
+        send = send or self._request_with_retry
+
+        resp = send(lambda: self._client.post(url, json=payload, headers=headers))
+        if resp.status_code == 401 and not self._mtls:
+            # токен протух — обновляем принудительно и повторяем один раз
+            headers.update(self._auth_headers(force=True))
+            resp = send(lambda: self._client.post(url, json=payload, headers=headers))
+        return resp
+
+    # ------------------------------------------------------------------ #
+    # Замер окна контекста
+    # ------------------------------------------------------------------ #
+    def _send_probe(self, do_request: Callable[[], httpx.Response]) -> httpx.Response:
+        """Отправка пробы. Огромный запрос может упереться в таймаут шлюза: долгие
+        повторы бессмысленны — обрыв уже отправляемого запроса и есть «не помещается»."""
+        try:
+            return self._request_with_retry(do_request, attempts=_PROBE_ATTEMPTS)
+        except GigaChatError as e:
+            if isinstance(e.__cause__, _OVERSIZE_EXC):
+                raise PromptTooLong(None, str(e)) from e
+            raise
+
+    def measure_prompt(self, text: str, *, model: str | None = None) -> int:
+        payload = {
+            "model": model or self._cfg.model,
+            "messages": [{"role": "user", "content": text}],
+            "max_tokens": 1,
+            "temperature": 0,
+        }
+        resp = self._post_chat(payload, self._send_probe)
+        status = resp.status_code
+        if status >= 500 or (status >= 400 and status not in _NOT_SIZE_STATUS):
+            raise PromptTooLong(status, resp.text)
+        if status >= 400:
+            raise GigaChatError(f"GigaChat вернул {status}: {resp.text}")
+        usage = Usage.from_raw(self._json(resp).get("usage"))
+        if usage.prompt_tokens <= 0:
+            raise GigaChatError("GigaChat не вернул usage.prompt_tokens — замер невозможен")
+        return usage.prompt_tokens
 
     # ------------------------------------------------------------------ #
     # Потоковый вызов (SSE)
@@ -442,7 +501,7 @@ class GigaChatProvider(LLMProvider):
         )
 
     def list_models(self) -> list[str]:
-        """Список доступных моделей (для диагностики/выбора)."""
+        """Чат-модели (``type == "chat"``): эмбеддеры и прочие в выборе не нужны."""
         resp = self._request_with_retry(
             lambda: self._client.get(
                 f"{self._cfg.base_url}/models",
@@ -454,4 +513,6 @@ class GigaChatProvider(LLMProvider):
                 f"Не удалось получить список моделей ({resp.status_code}): {resp.text}"
             )
         models = self._json(resp).get("data") or []
-        return [m["id"] for m in models if isinstance(m, dict) and "id" in m]
+        return [
+            m["id"] for m in models if isinstance(m, dict) and "id" in m and m.get("type") == "chat"
+        ]

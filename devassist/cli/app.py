@@ -3,7 +3,10 @@
 Режимы:
   * интерактивный REPL (по умолчанию);
   * одноразовый запрос: ``devassist -p "сделай X"``;
-  * диагностика: ``devassist --list-models``.
+  * диагностика: ``devassist --list-models`` (чат-модели);
+  * замер окна контекста: ``devassist --test-context МОДЕЛЬ`` — результат
+    сохраняется в ``~/.devassist/models.json``. Окно незамеренной модели
+    замеряется и автоматически — при запуске и смене модели.
 
 Чаты сохраняются в ``.devassist/chats/`` (``--no-save`` — нет); ``-c`` продолжает
 последний, ``-r [ID]`` — выбранный (без ID — селектор чатов).
@@ -21,10 +24,17 @@ from devassist import __version__
 from devassist.agent.chat_store import ChatRecorder, ChatStore, ChatStoreError, SavedChat
 from devassist.agent.loop import Agent
 from devassist.cli.commands import RESUME_LIMIT, default_commands, resume_chat
+from devassist.cli.models import (
+    describe_result,
+    ensure_context_window,
+    measure_context_window,
+    save_window,
+)
 from devassist.cli.repl import autosave, esc_interrupt_for, run_repl
 from devassist.config import Config, ConfigError
 from devassist.llm.base import LLMError, LLMProvider
 from devassist.llm.gigachat import GigaChatProvider
+from devassist.llm.model_windows import ModelWindows
 from devassist.tools.base import build_default_registry
 from devassist.ui.console import Console
 
@@ -75,7 +85,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Отключить потоковый вывод (ответ печатается целиком в конце)",
     )
-    p.add_argument("--list-models", action="store_true", help="Показать доступные модели и выйти")
+    p.add_argument(
+        "--list-models", action="store_true", help="Показать доступные чат-модели и выйти"
+    )
+    p.add_argument(
+        "--test-context",
+        metavar="MODEL",
+        help="Замерить окно контекста модели (пробные запросы), сохранить "
+        "в ~/.devassist/models.json и выйти",
+    )
     p.add_argument("--version", action="version", version=f"devassist {__version__}")
     return p
 
@@ -99,6 +117,28 @@ def run_oneshot(agent: Agent, ui: Console, prompt: str, chats: ChatRecorder | No
         return EXIT_INTERRUPTED
     finally:
         autosave(chats, agent, ui)
+    return EXIT_OK
+
+
+def run_test_context(
+    provider: LLMProvider, windows: ModelWindows, model: str, ui: Console, *, base_url: str
+) -> int:
+    """``--test-context``: принудительный замер окна ``model`` с выводом каждой пробы."""
+    if not provider.supports_measure:
+        ui.error("провайдер не поддерживает замер окна контекста")
+        return EXIT_ERROR
+    ui.info(f"замер окна контекста {model}: пробные запросы с ответом в 1 токен")
+    try:
+        result = measure_context_window(provider, model, ui, verbose=True)
+    except KeyboardInterrupt:
+        ui.system("\n(замер прерван)")
+        return EXIT_INTERRUPTED
+    if result is None:
+        return EXIT_LLM_ERROR
+    ui.success(describe_result(result))
+    if not save_window(windows, result, ui, base_url=base_url):
+        return EXIT_ERROR
+    ui.system(f"записано в {windows.path}")
     return EXIT_OK
 
 
@@ -160,7 +200,15 @@ def main(argv: list[str] | None = None) -> int:
             ui.info("Доступные модели:\n" + "\n".join(f"  • {m}" for m in models))
             return EXIT_OK
 
-        agent = Agent(provider, build_default_registry(), config, ui)
+        windows, warning = ModelWindows.load()
+        if warning:
+            ui.warn(warning)
+        if args.test_context:
+            return run_test_context(
+                provider, windows, args.test_context.strip(), ui, base_url=config.base_url
+            )
+
+        agent = Agent(provider, build_default_registry(), config, ui, windows=windows)
         store = ChatStore(agent.workspace)
         chats = ChatRecorder(store, enabled=config.save_chats)
         try:
@@ -169,8 +217,10 @@ def main(argv: list[str] | None = None) -> int:
             ui.error(str(e))
             return EXIT_ERROR
         if saved is not None:
-            resume_chat(agent, chats, saved)
+            # Модель чата, если модель не задана явно через -m.
+            resume_chat(agent, chats, saved, keep_model=args.model is not None)
         if args.prompt:
+            ensure_context_window(agent, ui)
             return run_oneshot(agent, ui, args.prompt, chats)
         resumed = saved.info if saved is not None else None
         return run_repl(agent, ui, default_commands(), chats=chats, resumed=resumed)

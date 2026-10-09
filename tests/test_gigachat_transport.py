@@ -14,7 +14,7 @@ import pytest
 
 from devassist.config import Config
 from devassist.llm import gigachat
-from devassist.llm.base import LLMError
+from devassist.llm.base import LLMError, PromptTooLong
 from devassist.llm.gigachat import GigaChatError, GigaChatProvider
 from devassist.llm.types import Message, Usage
 
@@ -179,3 +179,150 @@ def test_usage_from_raw_is_tolerant():
     assert Usage.from_raw("garbage") == Usage()  # type: ignore[arg-type]
     u = Usage.from_raw({"prompt_tokens": "5", "completion_tokens": None, "total_tokens": "x"})
     assert (u.prompt_tokens, u.completion_tokens, u.total_tokens) == (5, 0, 0)
+
+
+# ------------------------------ замер окна ------------------------------ #
+def _chat_reply(prompt_tokens: int) -> httpx.Response:
+    return httpx.Response(
+        200,
+        json={
+            "choices": [{"message": {"role": "assistant", "content": "."}}],
+            "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": 1},
+        },
+    )
+
+
+def test_measure_prompt_sends_one_token_request():
+    bodies = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == AUTH_URL:
+            return _auth_response()
+        bodies.append(json.loads(request.content))
+        return _chat_reply(1234)
+
+    p = _provider(handler)
+    assert p.supports_measure
+    assert p.measure_prompt("текст", model="M-probe") == 1234
+    (body,) = bodies
+    assert body["max_tokens"] == 1 and body["model"] == "M-probe"
+    assert body["messages"] == [{"role": "user", "content": "текст"}]
+    assert "functions" not in body
+    p.close()
+
+
+@pytest.mark.parametrize("status", [400, 413, 422, 500, 503])
+def test_measure_prompt_oversize_statuses(status):
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == AUTH_URL:
+            return _auth_response()
+        return httpx.Response(status, text="maximum context length is 32768 tokens")
+
+    p = _provider(handler)
+    with pytest.raises(PromptTooLong) as e:
+        p.measure_prompt("x" * 10)
+    assert e.value.status == status and "32768" in e.value.detail
+    p.close()
+
+
+def test_measure_prompt_timeout_is_oversize_but_other_errors_are_not():
+    def timeout(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == AUTH_URL:
+            return _auth_response()
+        raise httpx.ReadTimeout("timeout", request=request)
+
+    p = _provider(timeout)
+    with pytest.raises(PromptTooLong) as e:
+        p.measure_prompt("x")
+    assert e.value.status is None
+    p.close()
+
+    def missing(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == AUTH_URL:
+            return _auth_response()
+        return httpx.Response(404, text="model not found")
+
+    p = _provider(missing)
+    with pytest.raises(GigaChatError) as e:
+        p.measure_prompt("x")
+    assert not isinstance(e.value, PromptTooLong)
+    p.close()
+
+    def no_usage(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == AUTH_URL:
+            return _auth_response()
+        return httpx.Response(200, json={"choices": []})
+
+    p = _provider(no_usage)
+    with pytest.raises(GigaChatError, match="usage"):
+        p.measure_prompt("x")
+    p.close()
+
+
+def test_measure_prompt_refreshes_expired_token():
+    auth_calls = []
+    statuses = iter([401, 200])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == AUTH_URL:
+            auth_calls.append(1)
+            return _auth_response()
+        return _chat_reply(10) if next(statuses) == 200 else httpx.Response(401)
+
+    p = _provider(handler)
+    assert p.measure_prompt("x") == 10
+    assert len(auth_calls) == 2
+    p.close()
+
+
+def test_list_models_keeps_only_chat_models():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == AUTH_URL:
+            return _auth_response()
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {"id": "GigaChat-2-Max", "type": "chat"},
+                    {"id": "Embeddings", "type": "embedder"},
+                    {"id": "untyped"},
+                    {"id": "Qwen-72B", "type": "chat"},
+                    "мусор",
+                ]
+            },
+        )
+
+    p = _provider(handler)
+    assert p.list_models() == ["GigaChat-2-Max", "Qwen-72B"]
+    p.close()
+
+
+def test_measure_prompt_token_errors_are_not_oversize():
+    """Таймаут при получении токена — не «запрос не помещается»: проба не отправлялась."""
+
+    def auth_timeout(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == AUTH_URL:
+            raise httpx.ReadTimeout("auth timeout", request=request)
+        return _chat_reply(10)
+
+    p = _provider(auth_timeout)
+    with pytest.raises(GigaChatError) as e:
+        p.measure_prompt("x")
+    assert not isinstance(e.value, PromptTooLong)
+    p.close()
+
+    auth_calls = []
+
+    def refresh_timeout(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == AUTH_URL:
+            auth_calls.append(1)
+            if len(auth_calls) > 1:
+                raise httpx.ReadTimeout("auth timeout", request=request)
+            return _auth_response()
+        return httpx.Response(401)
+
+    p = _provider(refresh_timeout)
+    with pytest.raises(GigaChatError) as e:
+        p.measure_prompt("x")
+    assert not isinstance(e.value, PromptTooLong)
+    p.close()

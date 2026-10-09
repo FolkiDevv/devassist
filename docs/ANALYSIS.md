@@ -99,7 +99,7 @@ devassist/
     symbols.py         извлечение определений: ast для Python, регэкспы       (фича 3)
     index.py           ProjectIndex: SQLite в .devassist/index, инкрементальный (фича 3)
     instructions.py    файлы инструкций проекта (DEVASSIST.md, DEVASSIST.local.md → +AGENTS.md)
-  llm/                 LLMProvider/LLMError, Usage, GigaChat (model= на вызов, транспорт для тестов)
+  llm/                 LLMProvider/LLMError, Usage, GigaChat (model= на вызов, транспорт для тестов); замер окна контекста (context_probe) и ~/.devassist/models.json (model_windows)
   tools/               Tool (describe, Display), реестр, process.py (безопасный запуск процессов)
   agent/               ядро без UI
     events.py          AgentEvents — протокол событий для UI (no-op база, confirm → False)
@@ -125,7 +125,7 @@ tools.base`; `agent → llm, tools, project`; `tools → project, security, erro
 | 2. Остановка при зацикливании | `LoopGuard.after_tool(call, ok)` получает каждый вызов, `StopReason.kind`, `AgentEvents.on_notice` | **Реализовано** (см. раздел 6) |
 | 3. Индекс проекта | `project/files.walk_files` + единые правила игнорирования, `Workspace.index_dir`/`ensure_data_dir()`, реестр команд для `/index`, `build_system_prompt(workspace)` | **Реализовано** (см. раздел 6) |
 | 4. Сохранение чатов | `Conversation.to_dict/from_dict` (версионированный формат), `Workspace.chats_dir`, `Agent(conversation=...)`, `AgentEvents.on_turn_end` | **Реализовано** (см. раздел 6) |
-| 5. Сжатие контекста | `Usage`, `Conversation.last_usage`, `estimate_tokens`, `Config.context_budget_tokens`, единственная точка сборки запроса `Agent._build_request()` | `Agent.compact()` + промпт суммаризации, автозапуск по порогу, `/compact` |
+| 5. Сжатие контекста | `Usage`, `Conversation.last_usage`, `estimate_tokens`, `Agent.context_budget` (от замеренного окна модели, `ModelWindows`), единственная точка сборки запроса `Agent._build_request()` | `Agent.compact()` + промпт суммаризации, автозапуск по порогу, `/compact` |
 | 6. AGENTS.md | `INSTRUCTION_FILES` + `load_instructions()` | Добавить имя в список; определить приоритет и вложенные `AGENTS.md` в подкаталогах |
 
 ## 5. Порядок выполнения реорганизации (выполнено)
