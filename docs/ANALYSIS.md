@@ -77,8 +77,10 @@ cli.py ──► Agent (agent/loop.py) ──► LLMProvider (llm/gigachat.py)
 - Флаг `-y` авто-подтверждает и DANGEROUS-команды (`rm -rf`, `git reset --hard`).
 - ~~Отказ пользователя считается «неудачным вызовом» и приближает остановку по серии
   ошибок~~ — решено в фиче 2: отказ нейтрален, повтор отклонённого не переспрашивается.
-- `.devassist/` закрыта для `write_file`/`edit_file` (с фичей 4), но `run_shell`
-  по-прежнему может писать туда (как и в любой файл проекта) — после подтверждения.
+- ~~`.devassist/` доступна на запись `write_file`/`edit_file` — закрыть, когда там
+  появятся индекс и чаты (п.3–4).~~ Закрыто вместе с индексом (п.3) и чатами (п.4):
+  отказ ещё в превью. `run_shell` по-прежнему может писать туда (как и в любой файл
+  проекта) — после подтверждения.
 - `read_file .env` разрешён (поиск `.env` теперь пропускает, явное чтение — нет).
 - Проверка классификатором shell-команд — эвристика (regex); все команды и так
   требуют подтверждения, но классификация не является защитой.
@@ -93,6 +95,9 @@ devassist/
   project/             знание о проекте (без LLM и UI)
     workspace.py       Workspace: корень, .devassist/ (лениво, с .gitignore "*"), chats_dir, index_dir
     files.py           единые правила игнорирования, обходчик с прунингом, glob-матчер, дерево
+    gitignore.py       правила .gitignore: разбор, стек по каталогам          (фича 3)
+    symbols.py         извлечение определений: ast для Python, регэкспы       (фича 3)
+    index.py           ProjectIndex: SQLite в .devassist/index, инкрементальный (фича 3)
     instructions.py    файлы инструкций проекта (DEVASSIST.md, DEVASSIST.local.md → +AGENTS.md)
   llm/                 LLMProvider/LLMError, Usage, GigaChat (model= на вызов, транспорт для тестов)
   tools/               Tool (describe, Display), реестр, process.py (безопасный запуск процессов)
@@ -118,7 +123,7 @@ tools.base`; `agent → llm, tools, project`; `tools → project, security, erro
 |---|---|---|
 | 1. CLI-интерфейс | `AgentEvents.on_stream_delta` (живой Markdown через `rich.live`), `TurnStats`/`Usage` (статус-строка: контекст/токены), `CommandRegistry` (имена и описания для автодополнения prompt_toolkit), `run_repl(read_input=...)`, `ui/theme.py` | **Реализовано** (см. раздел 6) |
 | 2. Остановка при зацикливании | `LoopGuard.after_tool(call, ok)` получает каждый вызов, `StopReason.kind`, `AgentEvents.on_notice` | **Реализовано** (см. раздел 6) |
-| 3. Индекс проекта | `project/files.walk_files` + единые правила игнорирования, `Workspace.index_dir`/`ensure_data_dir()`, реестр команд для `/index`, `build_system_prompt(workspace)` | Учёт `.gitignore` в `files.py`; `project/index.py` (файлы, символы, инкрементальное обновление); инструмент поиска по индексу |
+| 3. Индекс проекта | `project/files.walk_files` + единые правила игнорирования, `Workspace.index_dir`/`ensure_data_dir()`, реестр команд для `/index`, `build_system_prompt(workspace)` | **Реализовано** (см. раздел 6) |
 | 4. Сохранение чатов | `Conversation.to_dict/from_dict` (версионированный формат), `Workspace.chats_dir`, `Agent(conversation=...)`, `AgentEvents.on_turn_end` | **Реализовано** (см. раздел 6) |
 | 5. Сжатие контекста | `Usage`, `Conversation.last_usage`, `estimate_tokens`, `Config.context_budget_tokens`, единственная точка сборки запроса `Agent._build_request()` | `Agent.compact()` + промпт суммаризации, автозапуск по порогу, `/compact` |
 | 6. AGENTS.md | `INSTRUCTION_FILES` + `load_instructions()` | Добавить имя в список; определить приоритет и вложенные `AGENTS.md` в подкаталогах |
@@ -202,6 +207,44 @@ tools.base`; `agent → llm, tools, project`; `tools → project, security, erro
   вызовы); чередование разных изменяющих команд (`run_shell A`, `run_shell B`, …)
   повтором не считается — его ограничивает `max_steps`.
 
+### Фича 3. Индекс проекта (выполнено)
+
+- **`.gitignore`** — `project/gitignore.py`: правило → regex (тот же glob-компилятор,
+  что у `glob_match`), `IgnoreStack` — правила по каталогам сверху вниз, решает
+  последнее совпадение. `walk_files` отсекает исключённые каталоги до спуска и
+  применяет правила каталогов выше `base`; то же решение для одного пути —
+  `is_excluded`. Действует на `find_files`, `search_content`, дерево в промпте и индекс.
+- **Символы** — `project/symbols.py`: чистые функции без SQLite. Python — `ast`
+  (классы, функции, методы, константы модуля, определения под `if`/`try`; вложенные
+  функции — шум, не индексируются), при `SyntaxError` — регэкспы; Markdown —
+  заголовки с иерархией; остальные языки — построчные регэкспы (диапазон строк
+  неизвестен, вложенность — только у методов Go).
+- **Индекс** — `project/index.py`, SQLite в `.devassist/index/index.sqlite3`
+  (stdlib, без загрузки в память; WAL). Таблицы `files` (размер, `mtime_ns`, язык,
+  строки, статус: indexed/large/binary/error) и `symbols`. Обновление сравнивает
+  `(size, mtime_ns)`; фиксация пачками по 200 файлов, поэтому прерывание теряет
+  только текущую пачку. `meta.complete` выставляется в конце полного обхода —
+  по нему CLI решает, строить ли индекс при запуске. Несовместимая версия схемы или
+  повреждённая база пересоздаются. Поиск: `LIKE` по `name_lower` с ранжированием
+  точное > префикс > вхождение, `Класс.метод`, обобщённые виды (`function` включает
+  методы), glob-фильтр.
+- **Инструменты** — `tools/index.py`: `find_symbol`, `file_outline` (SAFE). Индекс
+  открывается из `ToolContext.workspace` и обновляется перед запросом (оглавление —
+  только своего файла/каталога), поэтому ядро (`agent/loop.py`) и `ToolContext` не
+  менялись. Ошибки SQLite/ФС → `ToolError`.
+- **CLI** — `cli/indexing.py`: `ensure_index` после баннера REPL, до первого ввода;
+  построение — внутри того же `EscInterrupt`, что и ход агента (Esc → SIGINT →
+  `KeyboardInterrupt`), индикатор — `Console.progress`; набранное во время
+  построения подставляется в строку ввода. Ошибка индекса не мешает работе REPL.
+  `/index [rebuild]`. Одноразовый режим индекс заранее не строит (база
+  создаётся, только когда агент обратится к индексу).
+- **Безопасность** — `write_file`/`edit_file` не пишут в `.devassist/` (п. 2.3).
+- Ограничения: `.gitignore` выше корня проекта и глобальный `core.excludesFile` не
+  читаются; индекс знает определения, но не использования (для них —
+  `search_content`); полный обход файлов перед каждым `find_symbol` на очень больших
+  репозиториях стоит заметного времени (статы без чтения содержимого); первичное
+  построение — порядка 1 000 файлов/с на типичном Python-коде.
+
 ### Фича 4. Сохранение чатов (выполнено)
 
 - **Хранилище** — `agent/chat_store.py` (ядро, без UI). Файл на чат:
@@ -232,9 +275,9 @@ tools.base`; `agent → llm, tools, project`; `tools → project, security, erro
   учёта регистра), у выбранного — preview, id, модель; текущий чат помечен. Без
   терминала — таблица и ввод номера (`Console.pick_chat`). После выбора
   `Console.chat_resumed` печатает последний запрос и ответ.
-- **Безопасность** — `write_file`/`edit_file` отказывают в путях внутри
-  `.devassist/` (`Workspace.is_data_path`, без учёта регистра) ещё в превью, до
-  подтверждения.
+- **Безопасность** — запрет записи в `.devassist/` общий с фичей 3
+  (`tools/fs._writable_path`); добавлена проверка без учёта регистра
+  (`Workspace.is_data_path`: на macOS/Windows `.DEVASSIST` — та же папка).
 - Известные ограничения: один чат, продолженный в двух окнах одновременно, —
   «последний записавший побеждает»; старые чаты не удаляются автоматически;
   `recent()` читает файлы целиком (для сотен чатов достаточно — при росте можно

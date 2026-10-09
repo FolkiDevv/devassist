@@ -250,25 +250,24 @@ def test_sandbox_escape_blocked(ctx):
         r.run(r.parse({"path": "/etc/passwd"}), ctx)
 
 
-@pytest.mark.parametrize(
-    "path", [".devassist/chats/x.json", ".devassist", "./.devassist/history", ".DEVASSIST/a"]
-)
-def test_data_dir_is_not_writable(ctx, path):
+def test_data_dir_check_ignores_case(ctx):
+    """На macOS/Windows .DEVASSIST — та же папка: запрет не обходится регистром."""
     chats = ctx.root / ".devassist" / "chats"
     chats.mkdir(parents=True)
     (chats / "x.json").write_text("{}", encoding="utf-8")
     w, e = WriteFileTool(), EditFileTool()
-    with pytest.raises(SandboxError, match="служебную папку"):
-        w.preview(w.parse({"path": path, "content": "x"}), ctx)
-    with pytest.raises(SandboxError, match="служебную папку"):
-        w.run(w.parse({"path": path, "content": "x"}), ctx)
-    with pytest.raises(SandboxError, match="служебную папку"):
-        e.run(e.parse({"path": path, "old_string": "{}", "new_string": "[]"}), ctx)
+    for path in (".DEVASSIST/chats/x.json", ".DevAssist/a"):
+        with pytest.raises(ToolError, match="Служебная папка"):
+            w.run(w.parse({"path": path, "content": "x"}), ctx)
+    with pytest.raises(ToolError, match="Служебная папка"):
+        e.run(
+            e.parse({"path": ".devassist/chats/x.json", "old_string": "{}", "new_string": "[]"}),
+            ctx,
+        )
     assert (chats / "x.json").read_text(encoding="utf-8") == "{}"
-    # чтение по-прежнему разрешено, а похожие имена — обычные файлы
+    # чтение по-прежнему разрешено, вложенная папка с тем же именем — обычная
     r = ReadFileTool()
     assert r.run(r.parse({"path": ".devassist/chats/x.json"}), ctx).ok
-    assert w.run(w.parse({"path": ".devassist-notes.md", "content": "x"}), ctx).ok
     assert w.run(w.parse({"path": "docs/.devassist/a.md", "content": "x"}), ctx).ok
 
 
@@ -290,7 +289,7 @@ def test_data_dir_write_rejected_before_confirmation(tmp_path):
     Agent(provider, build_default_registry(), cfg, events).run_turn("испорти чат")
     assert events.confirms == []
     assert not (tmp_path / ".devassist").exists()
-    assert "служебную папку" in provider.requests[-1]["messages"][-1].content
+    assert "Служебная папка" in provider.requests[-1]["messages"][-1].content
 
 
 def test_find_files_rejects_escape_patterns(ctx):
@@ -328,3 +327,38 @@ def test_list_dir_shows_hidden(ctx):
     lister = ListDirTool()
     out = lister.run(lister.parse({}), ctx).content
     assert ".github/" in out and ".gitignore" in out
+
+
+@pytest.mark.parametrize("path", [".devassist/index/index.sqlite3", ".devassist", "./.devassist/x"])
+def test_data_dir_is_not_writable(ctx, path):
+    """Индекс, история и чаты агента — не для правки моделью (отказ ещё в превью)."""
+    (ctx.root / ".devassist" / "index").mkdir(parents=True)
+    (ctx.root / ".devassist" / "x").write_text("old", encoding="utf-8")
+    w, e = WriteFileTool(), EditFileTool()
+    write = w.parse({"path": path, "content": "new"})
+    edit = e.parse({"path": path, "old_string": "old", "new_string": "new"})
+    for tool, params in ((w, write), (e, edit)):
+        with pytest.raises(ToolError, match="Служебная папка"):
+            tool.preview(params, ctx)
+        with pytest.raises(ToolError, match="Служебная папка"):
+            tool.run(params, ctx)
+    assert (ctx.root / ".devassist" / "x").read_text(encoding="utf-8") == "old"
+
+
+def test_similar_names_outside_data_dir_are_writable(ctx):
+    w = WriteFileTool()
+    assert w.run(w.parse({"path": ".devassist.md", "content": "ok"}), ctx).ok
+
+
+def test_data_dir_symlink_target_is_not_writable(ctx):
+    """.devassist — симлинк на каталог проекта: запись по любому из путей запрещена."""
+    import os
+
+    if os.name == "nt":
+        pytest.skip("симлинки")
+    (ctx.root / "agent-data").mkdir()
+    (ctx.root / ".devassist").symlink_to(ctx.root / "agent-data", target_is_directory=True)
+    w = WriteFileTool()
+    for path in (".devassist/index.sqlite3", "agent-data/index.sqlite3"):
+        with pytest.raises(ToolError, match="Служебная папка"):
+            w.preview(w.parse({"path": path, "content": "x"}), ctx)

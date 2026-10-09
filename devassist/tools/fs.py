@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 
 from devassist.project.files import glob_match, walk_files
 from devassist.project.workspace import DATA_DIR_NAME
-from devassist.security import RiskLevel, SandboxError, resolve_in_root
+from devassist.security import RiskLevel, resolve_in_root
 from devassist.tools.base import Display, Tool, ToolContext, ToolError, ToolResult
 
 # Жёсткий предел размера читаемого файла (дальше — только search_content).
@@ -27,6 +27,23 @@ def _rel(ctx: ToolContext, path: Path) -> str:
         return str(path.relative_to(ctx.root))
     except ValueError:
         return str(path)
+
+
+def _writable_path(ctx: ToolContext, path: str) -> Path:
+    """Путь для записи: внутри корня и не в служебной папке ``.devassist/``.
+
+    Там лежат индекс, история ввода и чаты агента — модель не должна их править.
+    Проверка срабатывает и в превью, то есть до вопроса о подтверждении.
+    """
+    p = resolve_in_root(ctx.root, path)
+    data_dir = ctx.workspace.data_dir.resolve()  # .devassist может быть симлинком
+    # is_data_path — ещё и без учёта регистра: на macOS/Windows .DEVASSIST — та же папка.
+    if p == data_dir or data_dir in p.parents or ctx.workspace.is_data_path(p):
+        raise ToolError(
+            f"Служебная папка {DATA_DIR_NAME}/ (индекс, история, чаты агента) "
+            f"недоступна для записи: {path}"
+        )
+    return p
 
 
 def make_diff(old: str, new: str, path: str) -> str:
@@ -238,17 +255,6 @@ class ReadFileTool(Tool):
 # --------------------------------------------------------------------------- #
 # write_file
 # --------------------------------------------------------------------------- #
-def _writable(ctx: ToolContext, path: str) -> Path:
-    """Путь для записи: внутри корня и не в служебной ``.devassist/`` (чаты, история)."""
-    p = resolve_in_root(ctx.root, path)
-    if ctx.workspace.is_data_path(p):
-        raise SandboxError(
-            f"Путь '{path}' ведёт в служебную папку {DATA_DIR_NAME}/ (данные devassist). "
-            "Запись туда запрещена."
-        )
-    return p
-
-
 class WriteFileParams(BaseModel):
     path: str = Field(description="Путь к файлу относительно корня проекта")
     content: str = Field(description="Полное новое содержимое файла")
@@ -266,7 +272,7 @@ class WriteFileTool(Tool):
         return RiskLevel.WRITE
 
     def _old_content(self, ctx: ToolContext, params: WriteFileParams) -> str:
-        p = _writable(ctx, params.path)
+        p = _writable_path(ctx, params.path)
         if p.is_file():
             try:
                 return p.read_text(encoding="utf-8")
@@ -281,7 +287,7 @@ class WriteFileTool(Tool):
         return Display(diff, kind="diff", title=params.path)
 
     def run(self, params: WriteFileParams, ctx: ToolContext) -> ToolResult:
-        p = _writable(ctx, params.path)
+        p = _writable_path(ctx, params.path)
         if p.is_dir():
             raise ToolError(f"Это директория: {params.path}")
         existed = p.is_file()
@@ -326,7 +332,7 @@ class EditFileTool(Tool):
         return RiskLevel.WRITE
 
     def _compute(self, params: EditFileParams, ctx: ToolContext):
-        p = _writable(ctx, params.path)
+        p = _writable_path(ctx, params.path)
         if not p.is_file():
             raise ToolError(f"Файл не найден: {params.path}")
         try:
@@ -452,7 +458,7 @@ class FindFilesTool(Tool):
     description = (
         "Ищет файлы по glob-шаблону (рекурсивно, внутри проекта). Шаблон без '/' "
         "сравнивается с именем файла, с '/' — с путём от корня ('**' — любые каталоги). "
-        "Игнорирует служебные директории (.git, node_modules и т.п.)."
+        "Игнорирует служебные директории (.git, node_modules и т.п.) и файлы из .gitignore."
     )
     Params = FindFilesParams
 

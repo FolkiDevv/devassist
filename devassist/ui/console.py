@@ -23,7 +23,7 @@ import re
 import sys
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import AbstractContextManager
 from typing import IO
 
@@ -86,7 +86,7 @@ class _LiveView:
 
     def __init__(
         self,
-        label: str,
+        label: str | Callable[[], str],
         tail: Callable[[], list[list[Segment]]] | None = None,
         *,
         hint: str = "Ctrl+C — прервать",
@@ -101,7 +101,7 @@ class _LiveView:
         elapsed = int(time.monotonic() - self._started)
         self._spinner.update(
             text=Text.assemble(
-                (f" {self._label}… ", MUTED),
+                (f" {self._label() if callable(self._label) else self._label}… ", MUTED),
                 (f"{elapsed} с", MUTED),
                 (f"  ·  {self._hint}", MUTED),
             )
@@ -252,6 +252,27 @@ class Console(AgentEvents):
         live, self._live = self._live, None
         if live is not None:
             live.stop()
+
+    @contextlib.contextmanager
+    def progress(self, title: str, detail: Callable[[], str] | None = None) -> Iterator[None]:
+        """Индикатор долгой операции вне хода агента (например, построения индекса).
+
+        ``detail`` перечитывается при каждой отрисовке («1234 файлов»). Вне
+        терминала печатается одна строка с ``title``.
+        """
+        if not self._live_ok:
+            self.system(f"{title}…")
+            yield
+            return
+
+        def label() -> str:
+            return f"{title}: {detail()}" if detail is not None else title
+
+        self._start_live(_LiveView(label, hint=self._interrupt_hint))
+        try:
+            yield
+        finally:
+            self.stop_live()
 
     # ------------------------------ баннер ------------------------------ #
     def banner(

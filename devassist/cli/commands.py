@@ -2,18 +2,21 @@
 
 Команды регистрируются в :class:`CommandRegistry`; из него же строятся справка,
 подсказки в баннере и автодополнение ввода (:mod:`devassist.cli.prompt`). Новая команда
-(``/compact``, ``/index``) — это один :class:`SlashCommand`.
+(``/compact``) — это один :class:`SlashCommand`.
 """
 
 from __future__ import annotations
 
 import re
 from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
 
 from devassist.agent.chat_store import ChatRecorder, ChatStoreError, SavedChat
 from devassist.agent.loop import Agent
+from devassist.cli.indexing import describe_index, run_indexing
 from devassist.cli.prompt import KEY_HELP
+from devassist.project.index import ProjectIndex
 from devassist.ui.console import Console
 
 
@@ -23,6 +26,8 @@ class CommandContext:
     ui: Console
     commands: CommandRegistry
     chats: ChatRecorder | None = None  # None — чаты не сохраняются (тесты)
+    # Прерывание долгих команд клавишей Esc (как хода агента); None — только Ctrl+C.
+    interrupt: AbstractContextManager[object] | None = None
 
 
 # Обработчик получает контекст и аргумент (текст после имени команды).
@@ -144,6 +149,17 @@ def _resume(ctx: CommandContext, arg: str) -> bool:
     return True
 
 
+def _index(ctx: CommandContext, arg: str) -> bool:
+    if arg not in ("", "rebuild"):
+        ctx.ui.error("использование: /index [rebuild]")
+        return True
+    index = ProjectIndex(ctx.agent.workspace)
+    result = run_indexing(index, ctx.ui, ctx.interrupt, rebuild=arg == "rebuild")
+    if result is not None:
+        ctx.ui.info(describe_index(*result))
+    return True
+
+
 def _exit(ctx: CommandContext, _arg: str) -> bool:
     ctx.ui.system("до встречи!")
     return False
@@ -162,6 +178,9 @@ def default_commands() -> CommandRegistry:
             usage="/resume [id]",
             aliases=("/chats",),
         )
+    )
+    registry.register(
+        SlashCommand("/index", "обновить индекс проекта", _index, usage="/index [rebuild]")
     )
     registry.register(SlashCommand("/exit", "выход", _exit, aliases=("/quit", "/q")))
     return registry

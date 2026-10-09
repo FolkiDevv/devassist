@@ -219,8 +219,10 @@ def test_repl_prefills_typeahead_and_uses_esc(cli_env, capsys):
         def paused(self):
             return contextlib.nullcontext()
 
+        typeahead = ["", "набрано во время хода"]  # после построения индекса, после хода
+
         def take_typeahead(self):
-            return "набрано во время хода"
+            return self.typeahead.pop(0) if self.typeahead else ""
 
     calls = []
     answers = ["привет", "/exit"]
@@ -231,7 +233,7 @@ def test_repl_prefills_typeahead_and_uses_esc(cli_env, capsys):
 
     esc = FakeEsc()
     assert run_repl(agent, ui, commands, read_input=read, interrupt=esc) == 0
-    assert esc.entered == 1  # ход — внутри перехвата Esc, команды — нет
+    assert esc.entered == 2  # построение индекса и ход — внутри перехвата Esc, /exit — нет
     assert calls == [{}, {"default": "набрано во время хода"}]
     assert ui._interrupt_hint == "Esc — прервать"
 
@@ -253,8 +255,10 @@ def test_ctrl_c_discards_prefilled_typeahead(cli_env):
         def paused(self):
             return contextlib.nullcontext()
 
+        typeahead = ["", "набрано"]
+
         def take_typeahead(self):
-            return "набрано"
+            return self.typeahead.pop(0) if self.typeahead else ""
 
     calls = []
     answers = ["привет", KeyboardInterrupt(), "/exit"]
@@ -454,3 +458,91 @@ def test_repl_shows_resumed_chat_after_banner(repl_env, capsys):
     run_repl(agent, ui, commands, read_input=_reader("/exit"), chats=ctx.chats, resumed=info)
     out = _out(capsys)
     assert out.index("devassist") < out.index("продолжаем чат «прошлый вопрос»")
+
+
+# ------------------------------ индекс проекта ------------------------------ #
+def _index_complete(agent) -> bool:
+    from devassist.project.index import ProjectIndex
+
+    with ProjectIndex(agent.workspace) as ix:
+        return ix.is_complete()
+
+
+def test_repl_builds_index_before_first_input(cli_env, capsys):
+    agent, ui, commands, _, _ = cli_env
+    (agent.workspace.root / "mod.py").write_text("def f():\n    pass\n", encoding="utf-8")
+    seen = []
+
+    def read(**kwargs):
+        seen.append(_index_complete(agent))  # к первому вводу индекс уже готов
+        return "/exit"
+
+    assert run_repl(agent, ui, commands, read_input=read) == 0
+    assert seen == [True]
+    out = _out(capsys)
+    assert "индексирую проект…" in out and "индекс проекта: 1 файл, 1 определение" in out
+
+    # индекс готов — при следующем запуске не строится заново
+    assert run_repl(agent, ui, commands, read_input=_reader("/exit")) == 0
+    assert "индексирую" not in _out(capsys)
+
+
+def test_repl_without_index_on_start(cli_env):
+    agent, ui, commands, _, _ = cli_env
+    run_repl(agent, ui, commands, read_input=_reader("/exit"), index_on_start=False)
+    assert not (agent.workspace.root / ".devassist").exists()
+
+
+def test_cancelled_index_build_lets_user_continue(cli_env, capsys, monkeypatch):
+    from devassist.project import index as index_mod
+
+    agent, ui, commands, _, _ = cli_env
+    for i in range(3):
+        (agent.workspace.root / f"m{i}.py").write_text("x = 1\n", encoding="utf-8")
+    real_refresh = index_mod.ProjectIndex.refresh
+
+    def interrupted(self, base=None, *, progress=None):
+        def stop(n):
+            if n == 2:
+                raise KeyboardInterrupt  # так приходит Esc/Ctrl+C
+            progress(n)
+
+        return real_refresh(self, base, progress=stop)
+
+    monkeypatch.setattr(index_mod.ProjectIndex, "refresh", interrupted)
+    assert run_repl(agent, ui, commands, read_input=_reader("/exit")) == 0
+    assert "построение индекса прервано (просмотрено: 1 файл" in _out(capsys)
+    assert not _index_complete(agent)
+
+    # следующий запуск достраивает индекс
+    monkeypatch.setattr(index_mod.ProjectIndex, "refresh", real_refresh)
+    assert run_repl(agent, ui, commands, read_input=_reader("/exit")) == 0
+    assert "индекс проекта: 3 файла" in _out(capsys)
+
+
+def test_index_build_error_does_not_block_repl(cli_env, capsys, monkeypatch):
+    from devassist.project import index as index_mod
+
+    agent, ui, commands, _, _ = cli_env
+
+    def broken(self):
+        raise OSError("только чтение")
+
+    monkeypatch.setattr(index_mod.ProjectIndex, "open", broken)
+    assert run_repl(agent, ui, commands, read_input=_reader("/exit")) == 0
+    assert "индекс проекта недоступен: только чтение" in _out(capsys)
+
+
+def test_index_command(cli_env, capsys):
+    agent, ui, commands, ctx, _ = cli_env
+    (agent.workspace.root / "a.py").write_text("class A:\n    pass\n", encoding="utf-8")
+    assert commands.dispatch("/index", ctx) is True
+    out = _out(capsys)
+    assert "индекс проекта: 1 файл, 1 определение" in out
+    assert "языки: python 1" in out and "добавлено 1" in out
+    commands.dispatch("/index", ctx)
+    assert "изменений нет" in _out(capsys)
+    commands.dispatch("/index rebuild", ctx)
+    assert "добавлено 1" in _out(capsys)
+    commands.dispatch("/index что-то", ctx)
+    assert "использование: /index [rebuild]" in _out(capsys)
