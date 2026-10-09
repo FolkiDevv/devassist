@@ -77,8 +77,8 @@ cli.py ──► Agent (agent/loop.py) ──► LLMProvider (llm/gigachat.py)
 - Флаг `-y` авто-подтверждает и DANGEROUS-команды (`rm -rf`, `git reset --hard`).
 - Отказ пользователя считается «неудачным вызовом» и приближает остановку по серии
   ошибок — решить вместе с детектором зацикливания (п.2).
-- `.devassist/` доступна на запись `write_file`/`edit_file` — закрыть, когда там
-  появятся индекс и чаты (п.3–4).
+- `.devassist/` закрыта для `write_file`/`edit_file` (с фичей 4), но `run_shell`
+  по-прежнему может писать туда (как и в любой файл проекта) — после подтверждения.
 - `read_file .env` разрешён (поиск `.env` теперь пропускает, явное чтение — нет).
 - Проверка классификатором shell-команд — эвристика (regex); все команды и так
   требуют подтверждения, но классификация не является защитой.
@@ -99,6 +99,7 @@ devassist/
   agent/               ядро без UI
     events.py          AgentEvents — протокол событий для UI (no-op база, confirm → False)
     conversation.py    история диалога: сериализация, repair, last_usage
+    chat_store.py      сохранённые чаты: ChatStore (.devassist/chats), ChatRecorder
     context_window.py  оценка токенов и окно истории под бюджет
     guard.py           LoopGuard: лимит шагов, серия ошибок (+ повторы в п.2)
     prompts.py         сборка системного промпта
@@ -118,7 +119,7 @@ tools.base`; `agent → llm, tools, project`; `tools → project, security, erro
 | 1. CLI-интерфейс | `AgentEvents.on_stream_delta` (живой Markdown через `rich.live`), `TurnStats`/`Usage` (статус-строка: контекст/токены), `CommandRegistry` (имена и описания для автодополнения prompt_toolkit), `run_repl(read_input=...)`, `ui/theme.py` | **Реализовано** (см. раздел 6) |
 | 2. Остановка при зацикливании | `LoopGuard.after_tool(call, ok)` получает каждый вызов, `StopReason.kind`, `AgentEvents.on_notice` | Детектор повторов по каноническому JSON аргументов; предупреждение модели перед остановкой |
 | 3. Индекс проекта | `project/files.walk_files` + единые правила игнорирования, `Workspace.index_dir`/`ensure_data_dir()`, реестр команд для `/index`, `build_system_prompt(workspace)` | Учёт `.gitignore` в `files.py`; `project/index.py` (файлы, символы, инкрементальное обновление); инструмент поиска по индексу |
-| 4. Сохранение чатов | `Conversation.to_dict/from_dict` (версионированный формат), `Workspace.chats_dir`, `Agent(conversation=...)`, `AgentEvents.on_turn_end` | `ChatStore`, автосохранение после хода, `/resume`, `--continue` |
+| 4. Сохранение чатов | `Conversation.to_dict/from_dict` (версионированный формат), `Workspace.chats_dir`, `Agent(conversation=...)`, `AgentEvents.on_turn_end` | **Реализовано** (см. раздел 6) |
 | 5. Сжатие контекста | `Usage`, `Conversation.last_usage`, `estimate_tokens`, `Config.context_budget_tokens`, единственная точка сборки запроса `Agent._build_request()` | `Agent.compact()` + промпт суммаризации, автозапуск по порогу, `/compact` |
 | 6. AGENTS.md | `INSTRUCTION_FILES` + `load_instructions()` | Добавить имя в список; определить приоритет и вложенные `AGENTS.md` в подкаталогах |
 
@@ -177,3 +178,40 @@ tools.base`; `agent → llm, tools, project`; `tools → project, security, erro
   функций (`uv run pytest -m live` с реквизитами).
 - Известное ограничение: ссылки-сноски, определённые ниже места использования, в уже
   напечатанной части ответа остаются текстом.
+
+### Фича 4. Сохранение чатов (выполнено)
+
+- **Хранилище** — `agent/chat_store.py` (ядро, без UI). Файл на чат:
+  `.devassist/chats/<id>.json` = метаданные (`title` — первый запрос, `created_at`,
+  `updated_at`, `model`, `requests`, `preview` — начало последнего ответа) +
+  `Conversation.to_dict()`; у обёртки своя `version`. Id `YYYYMMDD-HHMMSS-<4 hex>`:
+  сортируется по времени, суффикс исключает коллизии двух сессий. Запись атомарная
+  (`mkstemp` в том же каталоге → `os.replace`), права 0600. `recent()` отбирает
+  файлы по mtime и разбирает только верх списка, битые файлы и чужие версии
+  пропускает; `find()` — по id или однозначному префиксу; `load()` делает `repair()`.
+- **Текущий чат** — `ChatRecorder`: куда писать (`chat_id`, `created_at`),
+  `start_new()` для `/clear`, `switch_to()` для продолжения. Пустой диалог не
+  пишется; `OSError` отключает сохранение до конца сессии с одним предупреждением
+  (как история ввода).
+- **Когда сохраняется** — в CLI после каждого хода (`cli/repl.autosave`), в том
+  числе прерванного и упавшего: `run_turn` к этому моменту уже вызвал `repair()`.
+  Сохранение не привязано к `on_turn_end`, который при прерывании не приходит.
+  Одноразовый режим тоже сохраняет — на этом работает `devassist -c -p …`.
+- **Продолжение** — `Agent.reset(conversation)`: системный промпт собирается
+  заново по текущему проекту, модель — текущая, `context_tokens` — из `last_usage`
+  сохранённого диалога. `/resume [id]` (алиас `/chats`), флаги `-c`/`--continue`,
+  `-r`/`--resume [ID]` (без ID — селектор, отмена → новый чат), `--no-save` /
+  `DEVASSIST_SAVE_CHATS=0`.
+- **Селектор** — `ui/chat_picker.py`, встроенное приложение prompt_toolkit по
+  образцу `ui/choice.py`: окно из 8 чатов с прокруткой, ↑↓ по кругу, PgUp/PgDn и
+  Home/End без перехода через край, поиск по заголовку/ответу/id (все слова, без
+  учёта регистра), у выбранного — preview, id, модель; текущий чат помечен. Без
+  терминала — таблица и ввод номера (`Console.pick_chat`). После выбора
+  `Console.chat_resumed` печатает последний запрос и ответ.
+- **Безопасность** — `write_file`/`edit_file` отказывают в путях внутри
+  `.devassist/` (`Workspace.is_data_path`, без учёта регистра) ещё в превью, до
+  подтверждения.
+- Известные ограничения: один чат, продолженный в двух окнах одновременно, —
+  «последний записавший побеждает»; старые чаты не удаляются автоматически;
+  `recent()` читает файлы целиком (для сотен чатов достаточно — при росте можно
+  завести отдельный индекс метаданных).
