@@ -119,6 +119,13 @@ def test_file_tree_marks_unexpanded_directories(tmp_path):
     assert "d0/" in tree and "  sub/ …" in tree and tree.endswith(TREE_TRUNCATED)
 
 
+def test_empty_directory_does_not_hide_siblings_from_the_budget(tmp_path):
+    (tmp_path / "a").mkdir()
+    _make(tmp_path, "b/main.py")
+    tree = build_file_tree(tmp_path, max_entries=3)
+    assert "  main.py" in tree.splitlines()
+
+
 def test_small_file_tree_is_complete(tmp_path):
     _make(tmp_path, "src/pkg/a.py")
     _make(tmp_path, "src/b.py")

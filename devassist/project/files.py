@@ -227,8 +227,16 @@ def build_file_tree(root: Path, max_entries: int = 200) -> str:
     level = [(root, "", root_stack(root))]
     depth = 0
     while level and budget > 0:
-        level = level[:budget]  # каталогам сверх лимита всё равно не достанется записей
-        listed = [listing(d, rel, stack) for d, rel, stack in level]
+        # Непустых каталогов сверх лимита не раскрыть всё равно — дальше не читаем
+        # (пустые и целиком исключённые лимит не тратят и не обрывают перебор).
+        listed: list[list[tuple[str, bool]]] = []
+        nonempty = 0
+        for d, rel, stack in level:
+            if nonempty >= budget:
+                break
+            listed.append(listing(d, rel, stack))
+            nonempty += bool(listed[-1])
+        level = level[: len(listed)]
         cap = budget if depth == 0 else TREE_DIR_CAP
         shares = _shares([min(len(entries), cap) for entries in listed], budget)
         next_level = []

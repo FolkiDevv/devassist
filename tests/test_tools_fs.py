@@ -664,3 +664,30 @@ def test_read_cp1251_file(ctx):
     res = r.run(r.parse({"path": "old.txt"}), ctx)
     assert "1\tПривет" in res.content and "2\tмир" in res.content
     assert "показан как cp1251" in res.content and "cp1251" in res.summary
+
+
+def test_hard_linked_file_is_edited_in_place(ctx):
+    import os
+
+    if not hasattr(os, "link"):
+        pytest.skip("жёсткие ссылки")
+    (ctx.root / "a.txt").write_text("x = 1\n", encoding="utf-8")
+    os.link(ctx.root / "a.txt", ctx.root / "b.txt")
+    _edit(ctx, "a.txt", "x = 1", "x = 2")
+    assert (ctx.root / "b.txt").read_text(encoding="utf-8") == "x = 2\n"  # ссылка цела
+
+
+def test_file_with_xattrs_is_edited_in_place(ctx):
+    import os
+
+    if not hasattr(os, "setxattr"):
+        pytest.skip("xattr")
+    path = ctx.root / "acl.txt"
+    path.write_text("x = 1\n", encoding="utf-8")
+    try:
+        os.setxattr(path, "user.devassist", b"1")
+    except OSError:
+        pytest.skip("ФС без user xattr")
+    inode = path.stat().st_ino
+    _edit(ctx, "acl.txt", "x = 1", "x = 2")
+    assert path.stat().st_ino == inode and os.getxattr(path, "user.devassist") == b"1"

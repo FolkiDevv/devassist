@@ -97,11 +97,14 @@ def write_atomic(path: Path, data: bytes) -> None:
     """Записывает файл целиком или не трогает его вовсе.
 
     Существующий файл заменяется через временный файл в том же каталоге
-    (``os.replace``) с прежними правами: прерывание (Esc, Ctrl+C) или нехватка
-    места посреди записи не оставят его пустым или обрезанным. Если во временный
-    файл писать нельзя (каталог без права записи), пишем напрямую.
+    (``os.replace``) с прежними правами и группой: прерывание (Esc, Ctrl+C) или
+    нехватка места посреди записи не оставят его пустым или обрезанным.
+
+    Замена создаёт новый inode, поэтому если она потеряла бы метаданные файла —
+    чужой владелец, ACL/xattr, жёсткие ссылки — или во временный файл писать
+    нельзя (каталог без права записи), файл перезаписывается на месте, как раньше.
     """
-    if not path.exists():
+    if not path.exists() or not _replace_keeps_metadata(path):
         path.write_bytes(data)
         return
     try:
@@ -113,10 +116,35 @@ def write_atomic(path: Path, data: bytes) -> None:
         with os.fdopen(fd, "wb") as f:
             f.write(data)
         shutil.copymode(path, tmp)
+        gid = path.stat().st_gid
+        if hasattr(os, "chown") and os.stat(tmp).st_gid != gid:
+            try:
+                os.chown(tmp, -1, gid)  # чужая группа файла или каталог с setgid
+            except PermissionError:
+                Path(tmp).unlink(missing_ok=True)
+                path.write_bytes(data)
+                return
         os.replace(tmp, path)
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise
+
+
+def _replace_keeps_metadata(path: Path) -> bool:
+    """Замену через новый inode можно делать без потерь: файл наш, без жёстких
+    ссылок и расширенных атрибутов (ACL хранятся в xattr)."""
+    st = path.stat()
+    if st.st_nlink > 1:
+        return False
+    if hasattr(os, "geteuid") and st.st_uid != os.geteuid():
+        return False
+    if hasattr(os, "listxattr"):
+        try:
+            if os.listxattr(path):
+                return False
+        except OSError:
+            pass  # ФС без xattr
+    return True
 
 
 def load_existing(path: Path, shown: str) -> TextFile:
