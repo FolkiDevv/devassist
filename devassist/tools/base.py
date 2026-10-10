@@ -238,7 +238,7 @@ def build_default_registry() -> ToolRegistry:
         WriteFileTool,
     )
     from devassist.tools.git import GitTool
-    from devassist.tools.index import FileOutlineTool, FindSymbolTool
+    from devassist.tools.index import FileOutlineTool, FindSymbolTool, RepoMapTool
     from devassist.tools.navigation import (
         CallHierarchyTool,
         FindReferencesTool,
@@ -261,6 +261,7 @@ def build_default_registry() -> ToolRegistry:
         GotoDefinitionTool(),
         CallHierarchyTool(),
         FileOutlineTool(),
+        RepoMapTool(),
         RunShellTool(),
         GitTool(),
         AskUserTool(),

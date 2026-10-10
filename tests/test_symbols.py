@@ -448,3 +448,9 @@ def test_regex_symbols_have_name_column():
 )
 def test_module_parts(path, expected):
     assert module_parts(path) == expected
+
+
+def test_python_signature_skips_comment_lines_before_body():
+    src = "class Conversation:\n    # пояснение к полям\n    # ещё строка\n    items: list = []\n"
+    (sym,) = extract_symbols(src, "python")
+    assert sym.signature == "class Conversation:"

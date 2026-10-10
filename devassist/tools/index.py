@@ -1,4 +1,5 @@
-"""Инструменты навигации по индексу проекта: поиск определений и оглавление файла.
+"""Инструменты навигации по индексу проекта: поиск определений, оглавление файла,
+карта проекта.
 
 Связи между определениями (использования, переход к определению, вызовы) — в
 :mod:`devassist.tools.navigation`.
@@ -28,6 +29,7 @@ from devassist.project.index import (
     RefreshStats,
     SymbolHit,
 )
+from devassist.project.repomap import CHARS_PER_TOKEN, build_repo_map
 from devassist.project.symbols import Symbol, language_of
 from devassist.security import resolve_in_root
 from devassist.tools.base import Tool, ToolContext, ToolError, ToolResult
@@ -268,3 +270,72 @@ class FileOutlineTool(Tool):
             "уточните путь, чтобы увидеть файлы)"
         )
         return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- #
+# repo_map
+# --------------------------------------------------------------------------- #
+MIN_MAP_TOKENS = 200
+MAX_MAP_TOKENS = 8_000
+
+
+class RepoMapParams(BaseModel):
+    focus: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Фокус карты: файлы или каталоги проекта, с которыми идёт работа, и/или "
+            "имена ('ProjectIndex', 'run_turn'). Пусто — главное во всём проекте."
+        ),
+    )
+    max_tokens: int = Field(default=1500, description="Объём карты (оценка в токенах)")
+
+
+class RepoMapTool(Tool):
+    name = "repo_map"
+    description = (
+        "Карта проекта: самые важные определения (классы, функции, методы с "
+        "сигнатурами и номерами строк), ранжированные по тому, как часто и откуда на "
+        "них ссылаются. С фокусом — то, что связано с указанными файлами и именами. "
+        "Помогает быстро понять устройство незнакомого проекта или окрестность "
+        "задачи, не читая файлы целиком."
+    )
+    Params = RepoMapParams
+
+    def describe(self, params: RepoMapParams) -> str:
+        return ", ".join(params.focus) if params.focus else "весь проект"
+
+    def run(self, params: RepoMapParams, ctx: ToolContext) -> ToolResult:
+        tokens = min(max(params.max_tokens, MIN_MAP_TOKENS), MAX_MAP_TOKENS)
+        with open_index(ctx) as index:
+            refreshed = index.refresh()
+            files: list[str] = []
+            names: list[str] = []
+            for item in (f.strip() for f in params.focus):
+                if not item:
+                    continue
+                target = resolve_in_root(ctx.root, item)
+                rel = target.relative_to(ctx.root).as_posix()
+                if target.is_file():
+                    files.append(rel)
+                elif target.is_dir():
+                    files += [e.path for e in index.files_under("" if rel == "." else rel)]
+                else:
+                    names.append(item.rsplit(".", 1)[-1])
+            repo_map = build_repo_map(
+                index,
+                focus_files=files,
+                focus_names=names,
+                max_chars=tokens * CHARS_PER_TOKEN,
+            )
+        if not repo_map.text:
+            body = "(в индексе нет определений)"
+        else:
+            body = (
+                f"карта проекта: определений {repo_map.definitions} из {repo_map.total}, "
+                f"файлов {repo_map.files}\n{repo_map.text}"
+            )
+        return ToolResult(
+            content=body,
+            summary=f"карта: определений {repo_map.definitions}, файлов {repo_map.files}"
+            f"{refresh_note(refreshed)}",
+        )

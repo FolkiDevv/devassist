@@ -219,8 +219,9 @@ def _python_symbols(tree: ast.Module, lines: list[str]) -> list[Symbol]:
         body = getattr(node, "body", None)
         last = body[0].lineno - 1 if body else start
         last = min(max(last, start), start + _MAX_SIGNATURE_LINES - 1)
-        sig = " ".join(lines[i - 1].strip() for i in range(start, last + 1) if i <= len(lines))
-        return _clip(sig)
+        parts = (lines[i - 1].strip() for i in range(start, last + 1) if i <= len(lines))
+        # строки-комментарии между заголовком и телом — не часть сигнатуры
+        return _clip(" ".join(part for part in parts if not part.startswith("#")))
 
     def visit(body: list[ast.stmt], parent: str, depth: int, in_class: bool) -> None:
         for node in body:
