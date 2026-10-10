@@ -150,3 +150,29 @@ def test_interrupted_close_still_kills_server(client, monkeypatch):
     with pytest.raises(KeyboardInterrupt):
         client.close(timeout=1)
     assert proc.poll() is not None and not client.alive  # процесс убит, прерывание проброшено
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="группы процессов POSIX")
+def test_kill_reaches_children_after_leader_exits(tmp_path):
+    import os
+    import subprocess
+
+    from devassist.project.lsp import _kill
+
+    pid_file = tmp_path / "child.pid"
+    proc = subprocess.Popen(
+        ["sh", "-c", f"sleep 60 & echo $! > {pid_file}; exit 0"], start_new_session=True
+    )
+    proc.wait(timeout=5)  # лидер вышел, потомок жив
+    child = int(pid_file.read_text())
+    _kill(proc, timeout=1)
+    import time
+
+    for _ in range(50):
+        try:
+            os.kill(child, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        pytest.fail("потомок сервера пережил _kill")

@@ -272,14 +272,13 @@ class LspClient:
 
 def _kill(proc: subprocess.Popen[bytes], timeout: float) -> None:
     """Убивает сервер вместе с его потомками (своя группа процессов — см. start)."""
-    if proc.poll() is None:
-        try:
-            if os.name == "posix":
-                os.killpg(proc.pid, signal.SIGKILL)
-            else:
-                proc.kill()
-        except OSError:
+    try:
+        if os.name == "posix":  # и если лидер уже вышел: потомки могли остаться
+            os.killpg(proc.pid, signal.SIGKILL)
+        elif proc.poll() is None:
             proc.kill()
+    except OSError:
+        proc.kill()
     try:
         proc.wait(timeout=timeout)
     except subprocess.TimeoutExpired:

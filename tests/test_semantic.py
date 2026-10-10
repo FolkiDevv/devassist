@@ -70,3 +70,11 @@ def test_lines_split_like_lsp(tmp_path):
     path = tmp_path / "f.py"
     path.write_text("#\f\né = 1\n", encoding="utf-8")
     assert semantic._Lines().get(path, 2) == "é = 1"  # \f — не разрыв строки
+
+
+def test_location_keeps_unc_host(tmp_path):
+    server = TyServer(tmp_path, binary="ty")
+    loc = server._location(
+        "file://server/share/a.py", {"line": 0, "character": 0}, semantic._Lines()
+    )
+    assert loc.path.replace("\\", "/").endswith("server/share/a.py") and not loc.in_project

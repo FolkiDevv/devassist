@@ -311,20 +311,21 @@ _COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
 def _local_names(
     fn: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda,
 ) -> tuple[frozenset[str], frozenset[str]]:
-    """(локальные, объявленные ``global``/``nonlocal``) имена самой функции.
+    """(локальные, объявленные ``global``) имена самой функции.
 
     Локальные — параметры, присваивания, ``except … as``, ``match`` (в том числе
     ``case {**rest}``), имена вложенных ``def``/``class``: обращения к ним — не
     использования определений проекта. Не локальные: импорты (вызов
     импортированного имени — использование), связывания внутри вложенных функций,
     классов и включений (у них своя область; ``:=`` во включении связывает имя в
-    функции), объявленные ``global``/``nonlocal`` — они же снимают одноимённые
-    локальные внешних функций.
+    функции), объявленные ``global`` (они же снимают одноимённые локальные внешних
+    функций) и ``nonlocal`` (они остаются локальными — внешней функции).
     """
     a = fn.args
     names = {x.arg for x in (*a.posonlyargs, *a.args, *a.kwonlyargs)}
     names.update(x.arg for x in (a.vararg, a.kwarg) if x is not None)
     declared: set[str] = set()
+    nonlocal_: set[str] = set()
     stack: list[ast.AST] = list(fn.body) if isinstance(fn.body, list) else [fn.body]
     while stack:
         node = stack.pop()
@@ -336,8 +337,10 @@ def _local_names(
         if isinstance(node, ast.Name):
             if not isinstance(node.ctx, ast.Load):
                 names.add(node.id)
-        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+        elif isinstance(node, ast.Global):
             declared.update(node.names)
+        elif isinstance(node, ast.Nonlocal):
+            nonlocal_.update(node.names)
         elif isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)):
             if node.name:
                 names.add(node.name)
@@ -354,7 +357,7 @@ def _local_names(
             )
             continue
         stack.extend(ast.iter_child_nodes(node))
-    return frozenset(names - declared), frozenset(declared)
+    return frozenset(names - declared - nonlocal_), frozenset(declared)
 
 
 def _absolute_module(module: str | None, level: int, path: str) -> str:
@@ -377,7 +380,7 @@ class _RefCollector(ast.NodeVisitor):
         self.path = path
         self.refs: list[Ref] = []
         self.imports: list[Import] = []
-        self._seen: set[tuple[str, str, int, str]] = set()
+        self._seen: set[tuple[str, str, int, int, str]] = set()
         self._scope: list[str] = []
         self._locals: list[frozenset[str]] = []
         self._in_function = 0
@@ -386,11 +389,11 @@ class _RefCollector(ast.NodeVisitor):
         if len(name) < 2 or name in _SKIP_NAMES or (name.startswith("__") and name.endswith("__")):
             return
         scope = ".".join(self._scope)
-        key = (name, kind, line, scope)
+        col = _char_col(_line(self.lines, line), byte_col)
+        key = (name, kind, line, col, scope)  # `a.run(); b.run()` — два использования
         if key in self._seen or len(self.refs) >= MAX_REFS_PER_FILE:
             return
         self._seen.add(key)
-        col = _char_col(_line(self.lines, line), byte_col)
         self.refs.append(Ref(name=name, kind=kind, line=line, col=col, scope=scope))
 
     def _local(self, name: str) -> bool:

@@ -217,7 +217,9 @@ class TyServer:
         parsed = urlparse(uri)
         if parsed.scheme != "file":  # встроенные заглушки ty и т.п.
             return Location(unquote(uri), line, units, in_project=False)
-        abs_path = Path(url2pathname(parsed.path))  # url2pathname сам раскодирует %XX
+        # url2pathname сам раскодирует %XX; netloc — сервер UNC-пути (Windows)
+        host = parsed.netloc if parsed.netloc not in ("", "localhost") else ""
+        abs_path = Path(url2pathname(f"//{host}{parsed.path}" if host else parsed.path))
         col = _from_units(lines.get(abs_path, line), units, self._encoding)
         try:
             rel = abs_path.relative_to(self.root).as_posix()

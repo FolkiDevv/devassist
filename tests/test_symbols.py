@@ -534,3 +534,24 @@ def test_line_numbers_ignore_form_feed_and_unicode_separators():
         ("after", 3, "def after():"),
         ("Later", 6, "class Later:"),
     ]
+
+
+def test_python_nonlocal_stays_local_and_same_line_refs_are_separate():
+    facts = _facts(
+        """\
+        def outer(callback):
+            def inner():
+                nonlocal callback
+                callback()
+            return inner
+
+
+        def both(a, b):
+            a.save(); b.save()
+        """
+    )
+    assert all(r.name != "callback" for r in facts.refs)  # nonlocal — локальное внешней
+    assert [(r.name, r.line, r.col) for r in facts.refs if r.name == "save"] == [
+        ("save", 9, 6),
+        ("save", 9, 16),
+    ]
