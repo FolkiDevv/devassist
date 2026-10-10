@@ -213,6 +213,11 @@ class Config:
     # Точная навигация по Python-коду через ty (LSP-сервер, запускается лениво);
     # False — только индекс проекта.
     ty: bool = True
+    # Ограничители одного запуска суб-агента (инструмент task): шаги, оплаченные
+    # токены и время, с. На исчерпании суб-агент подводит итог.
+    subagent_max_steps: int = 25
+    subagent_max_tokens: int = 300_000
+    subagent_timeout: int = 600
 
     @classmethod
     def load(
@@ -274,6 +279,11 @@ class Config:
             save_chats=save_chats and _env_bool(env, "DEVASSIST_SAVE_CHATS", True),
             auto_measure=_env_bool(env, "DEVASSIST_AUTO_MEASURE", True),
             ty=_env_bool(env, "DEVASSIST_TY", True),
+            subagent_max_steps=_env_int(env, "DEVASSIST_SUBAGENT_MAX_STEPS", 25),
+            subagent_max_tokens=_env_int(
+                env, "DEVASSIST_SUBAGENT_MAX_TOKENS", 300_000, minimum=1_000
+            ),
+            subagent_timeout=_env_int(env, "DEVASSIST_SUBAGENT_TIMEOUT", 600, minimum=10),
         )
 
     @property

@@ -211,3 +211,24 @@ def test_shift_tab_reaches_callback_without_interrupting(pty_pair):
         os.write(master, b"\x1b[Z")
         time.sleep(0.3)
     assert hits == [1] and esc.take_typeahead() == ""
+
+
+def test_on_escape_keeps_interrupt_armed_while_subagent_takes_it():
+    hits: list[int] = []
+    taken = [True, True, False]  # суб-агент: итог, обрыв; затем — ход целиком
+    esc = EscInterrupt(fd=-1, enabled=False, interrupt=lambda: hits.append(1))
+    esc.on_escape = lambda: taken.pop(0)
+    esc._armed = True
+    for _ in range(4):
+        esc._on_escape()
+    assert hits == [1, 1, 1]  # каждый Esc прерывает текущий запрос/команду
+    assert not esc._armed  # после хода целиком — как раньше, один раз
+
+
+def test_without_on_escape_single_interrupt():
+    hits: list[int] = []
+    esc = EscInterrupt(fd=-1, enabled=False, interrupt=lambda: hits.append(1))
+    esc._armed = True
+    esc._on_escape()
+    esc._on_escape()
+    assert hits == [1]

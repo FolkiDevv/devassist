@@ -58,8 +58,10 @@ make test       # быстрые офлайн-тесты
 
 - Ядро (`agent/`, `llm/`, `tools/`, `project/`) не импортирует `ui`, `cli`, `rich`
   и `prompt_toolkit` — проверяется `tests/test_layering.py`. Всё, что видит
-  пользователь, передаётся через `AgentEvents` (`agent/events.py`). Парные события
-  (`on_stream_start/end`, `on_tool_start/end`) вызываются в `try/finally` — UI
+  пользователь, передаётся через `AgentEvents` (`agent/events.py`); события
+  суб-агента доходят до UI только хуками `on_subagent_*` (прокси
+  `agent/subagents.SubagentEvents`). Парные события (`on_stream_start/end`,
+  `on_tool_start/end`, `on_subagent_start/end`) вызываются в `try/finally` — UI
   полагается на то, что конец придёт всегда.
 - В UI одновременно живёт не больше одной временной области (`Console._start_live`
   останавливает предыдущую); печать во время неё — через `Console._print_above_live`,
@@ -96,6 +98,11 @@ make test       # быстрые офлайн-тесты
   file.encode(text))`; путь для записи — только `_writable_path` (песочница,
   `.devassist/`, `.git/`).
 - Зарегистрируйте инструмент в `build_default_registry()`.
+- Решите, нужен ли он суб-агентам (`tools/task.py`): `explore` получает только
+  инструменты из своего списка (только чтение — изменения всё равно заблокирует
+  `read_only`), `general` — все, кроме `SUBAGENT_EXCLUDED` (вопросы пользователю,
+  одобрение плана, `task`). Инструмент, которому нужен пользователь, добавьте в
+  `SUBAGENT_EXCLUDED`.
 - Нужны знания о структуре кода — открывайте `ProjectIndex(ctx.workspace)` и
   обновляйте его (`refresh()`, для одного файла/каталога — `refresh(path)`) перед
   запросом, как `tools/index.py`; ошибки `INDEX_ERRORS` превращайте в `ToolError`.

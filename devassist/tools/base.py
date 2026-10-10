@@ -49,7 +49,9 @@ class ToolContext:
     доступны) реквизиты API. ``ask_user`` — способ задать вопрос пользователю
     (None — спросить некого). ``get_mode``/``set_mode`` — текущий режим разрешений
     агента (None — агента нет, например в тестах инструмента). ``semantic`` —
-    разрешена ли точная навигация через ty (``DEVASSIST_TY``).
+    разрешена ли точная навигация через ty (``DEVASSIST_TY``). ``run_subagent`` —
+    запуск суб-агента (инструмент ``task``): ``(агент, описание, задача) → отчёт``;
+    None — запускать некому (в том числе у самого суб-агента: без вложенности).
     """
 
     workspace: Workspace
@@ -57,6 +59,7 @@ class ToolContext:
     get_mode: Callable[[], PermissionMode] | None = None
     set_mode: Callable[[PermissionMode], None] | None = None
     semantic: bool = True
+    run_subagent: Callable[[str, str, str], ToolResult] | None = None
 
     @property
     def root(self) -> Path:
@@ -87,6 +90,10 @@ class ToolResult:
     # Неуспех — обычный исход работы (команда вернула ненулевой код), а не сбой
     # инструмента: не приближает остановку хода по серии ошибок.
     soft: bool = False
+    # Вызов изменил проект. Агентный цикл ставит сам для успешных вызовов с риском
+    # ≥ WRITE; инструмент с риском ниже ставит, если изменения сделал не он сам
+    # (суб-агент правил файлы): для ограничителя зацикливания это изменение.
+    changed: bool = False
 
     def as_function_content(self) -> str:
         if self.ok:
@@ -225,6 +232,14 @@ class ToolRegistry:
     def specs(self) -> list[ToolSpec]:
         return [t.spec() for t in self._tools.values()]
 
+    def subset(self, keep: Callable[[Tool], bool]) -> ToolRegistry:
+        """Новый реестр из инструментов, для которых ``keep`` истинно (порядок сохраняется)."""
+        reg = ToolRegistry()
+        for tool in self._tools.values():
+            if keep(tool):
+                reg.register(tool)
+        return reg
+
 
 def build_default_registry() -> ToolRegistry:
     """Собирает реестр со всеми штатными инструментами."""
@@ -247,6 +262,7 @@ def build_default_registry() -> ToolRegistry:
     from devassist.tools.plan import ExitPlanModeTool
     from devassist.tools.search import SearchContentTool
     from devassist.tools.shell import RunShellTool
+    from devassist.tools.task import TaskTool
 
     reg = ToolRegistry()
     for tool in (
@@ -266,6 +282,7 @@ def build_default_registry() -> ToolRegistry:
         GitTool(),
         AskUserTool(),
         ExitPlanModeTool(),
+        TaskTool(),
     ):
         reg.register(tool)
     return reg

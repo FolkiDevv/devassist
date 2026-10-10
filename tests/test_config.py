@@ -75,6 +75,10 @@ def test_load_does_not_touch_os_environ(tmp_path, monkeypatch):
         {"DEVASSIST_COMPACT_THRESHOLD": "5"},
         {"DEVASSIST_COMPACT_THRESHOLD": "99"},
         {"DEVASSIST_COMPACT_THRESHOLD": "0.8"},
+        {"DEVASSIST_SUBAGENT_MAX_STEPS": "0"},
+        {"DEVASSIST_SUBAGENT_MAX_TOKENS": "500"},
+        {"DEVASSIST_SUBAGENT_TIMEOUT": "5"},
+        {"DEVASSIST_SUBAGENT_TIMEOUT": "long"},
     ],
 )
 def test_bad_values_raise_config_error(tmp_path, env):
@@ -131,6 +135,30 @@ def test_compaction_settings(tmp_path):
     assert cfg.auto_compact is True and cfg.compact_threshold == 0.8
     cfg = load({"DEVASSIST_AUTO_COMPACT": "0", "DEVASSIST_COMPACT_THRESHOLD": "65"})
     assert cfg.auto_compact is False and cfg.compact_threshold == 0.65
+
+
+def test_subagent_limits(tmp_path):
+    def load(env):
+        return Config.load(project_root=tmp_path, environ=env, cwd=tmp_path)
+
+    cfg = load({})
+    assert (cfg.subagent_max_steps, cfg.subagent_max_tokens, cfg.subagent_timeout) == (
+        25,
+        300_000,
+        600,
+    )
+    cfg = load(
+        {
+            "DEVASSIST_SUBAGENT_MAX_STEPS": "10",
+            "DEVASSIST_SUBAGENT_MAX_TOKENS": "50000",
+            "DEVASSIST_SUBAGENT_TIMEOUT": "120",
+        }
+    )
+    assert (cfg.subagent_max_steps, cfg.subagent_max_tokens, cfg.subagent_timeout) == (
+        10,
+        50_000,
+        120,
+    )
 
 
 def test_yes_all_implies_auto_approve(tmp_path):

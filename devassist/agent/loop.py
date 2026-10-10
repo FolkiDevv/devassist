@@ -12,8 +12,10 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from collections.abc import Callable
+from dataclasses import replace
 
 from pydantic import BaseModel
 
@@ -33,15 +35,32 @@ from devassist.agent.events import (
     AgentEvents,
     Approval,
     CompactResult,
+    SubagentInfo,
     ToolCallInfo,
     TurnStats,
 )
-from devassist.agent.guard import CallCheck, LoopGuard, ToolOutcome, call_key
+from devassist.agent.guard import CallCheck, LoopGuard, StopReason, ToolOutcome, call_key
 from devassist.agent.prompts import (
-    build_system_prompt,
+    SYSTEM_PROMPT,
+    build_project_context,
+    compose_system_prompt,
     mode_prompt,
     nested_instructions_prompt,
+    subagent_system_prompt,
     summary_prompt,
+)
+from devassist.agent.subagents import (
+    MAX_SUBAGENTS_PER_TURN,
+    READ_ONLY_BLOCKED_NOTE,
+    SUBAGENT_PLAN_BLOCKED_NOTE,
+    SUBAGENT_STOP_NOTE,
+    SUBAGENT_USER_STOP_NOTE,
+    SubagentEvents,
+    aborted_report,
+    interrupted_note,
+    model_error_report,
+    subagent_registry,
+    subagent_report,
 )
 from devassist.config import Config
 from devassist.llm.base import LLMError, LLMProvider
@@ -52,6 +71,7 @@ from devassist.project.instructions import NestedInstructions
 from devassist.project.workspace import Workspace
 from devassist.security import RiskLevel
 from devassist.tools.base import Tool, ToolContext, ToolError, ToolRegistry, ToolResult
+from devassist.tools.task import SUBAGENTS, SubagentSpec
 
 REJECTED_NOTE = (
     "Пользователь ОТКЛОНИЛ выполнение этой операции. "
@@ -90,6 +110,10 @@ MIN_SUMMARY_CHARS = 1_000
 MIN_TOKEN_SCALE = 0.5
 MAX_TOKEN_SCALE = 1.5
 
+# Похожие вызовы суб-агента (та же цель): на N-м — предупреждение, затем остановка.
+SUBAGENT_MAX_SIMILAR = 5
+USER_STOP_REASON = "Пользователь остановил суб-агента досрочно."
+
 
 def _with_note(content: str, note: str | None) -> str:
     return f"{content}\n\n{note}" if note else content
@@ -106,11 +130,18 @@ class Agent:
         workspace: Workspace | None = None,
         conversation: Conversation | None = None,
         windows: ModelWindows | None = None,
+        parent: Agent | None = None,
+        subagent: SubagentSpec | None = None,
     ):
         """Конструктор не обращается к файловой системе и сети.
 
         ``windows`` — замеренные окна моделей (по умолчанию пусто: окно
         :data:`~devassist.agent.context_window.DEFAULT_CONTEXT_WINDOW`).
+
+        ``parent``/``subagent`` — это суб-агент: режим разрешений, разрешения «всегда»,
+        калибровка токенов, инструкции подкаталогов и контекст проекта — общие с
+        основным агентом, расход токенов учитывается и у него; запускать суб-агентов
+        и задавать вопросы пользователю суб-агент не может.
         """
         self._provider = provider
         self._registry = registry
@@ -118,34 +149,51 @@ class Agent:
         # `is None`, а не `or`: пустой Conversation ложен (__len__ == 0).
         self._events = AgentEvents() if events is None else events
         self._workspace = Workspace(config.project_root) if workspace is None else workspace
+        self._parent = parent
+        self._subagent = subagent
         self._ctx = ToolContext(
             workspace=self._workspace,
             ask_user=self._events.ask_user,
-            get_mode=lambda: self._mode,
+            get_mode=lambda: self.mode,
             set_mode=self.set_mode,
             semantic=config.ty,
+            run_subagent=None if parent is not None else self._run_subagent,
         )
         self._conversation = Conversation() if conversation is None else conversation
-        self._model = config.model
+        self._model = config.model if parent is None else parent.model
         # Режим разрешений — состояние сессии, как модель: reset() его не меняет.
         # Может смениться посреди хода (Shift+Tab из потока клавиш) — читается при
         # каждом вызове инструмента и каждом обращении к модели.
         self._mode = config.mode
         self._windows = ModelWindows() if windows is None else windows
-        self._system_prompt: str | None = None  # строится лениво, сбрасывается в reset()
+        # Контекст проекта (дерево, инструкции, карта): строится лениво, сбрасывается в
+        # reset(); суб-агент берёт контекст основного агента.
+        self._project_context: str | None = None
         # Инструкции подкаталогов, с которыми агент работал в этом диалоге.
-        self._nested = NestedInstructions(self._workspace.root)
+        self._nested = (
+            NestedInstructions(self._workspace.root) if parent is None else parent._nested
+        )
         self._billed_tokens = 0  # потрачено за сессию (reset() не сбрасывает)
         # Оценка контекста после сжатия — пока модель не сообщит настоящий размер.
         self._compacted_tokens = 0
         self._last_turn: TurnStats | None = None
         # Реальные токены / оценка по модели: оценка ~3 символа на токен грубая, а
         # бюджеты считаются в её единицах (калибруется по prompt_tokens ответов).
-        self._token_scale: dict[str, float] = {}
+        self._token_scale: dict[str, float] = {} if parent is None else parent._token_scale
         # Вызовы, которые пользователь разрешил «всегда» (до конца сессии; reset() не
         # сбрасывает — как и режим).
-        self._session_allowed: set[str] = set()
+        self._session_allowed: set[str] = set() if parent is None else parent._session_allowed
         self._last_estimate = 0  # оценка последнего отправленного запроса
+        self._turn_stats: TurnStats | None = None  # статистика идущего хода
+        # Суб-агенты: запущенный сейчас (для остановки из потока клавиш) и число
+        # запусков за ход.
+        self._stop_lock = threading.Lock()
+        self._child: Agent | None = None
+        self._subagent_runs = 0
+        # Остановка самого суб-агента пользователем: 0 — нет, 1 — подвести итог,
+        # 2 — оборвать. ``_wrapping`` — уже подводит итог (следующая остановка обрывает).
+        self._stop_level = 0
+        self._wrapping = False
 
     # ------------------------------------------------------------------ #
     @property
@@ -166,7 +214,7 @@ class Agent:
 
     @property
     def mode(self) -> PermissionMode:
-        return self._mode
+        return self._mode if self._parent is None else self._parent.mode
 
     @property
     def context_tokens(self) -> int:
@@ -259,13 +307,34 @@ class Agent:
         self._model = name
 
     def set_mode(self, mode: PermissionMode) -> None:
-        """Сменить режим разрешений (действует со следующего вызова инструмента)."""
+        """Сменить режим разрешений (действует со следующего вызова инструмента).
+
+        У суб-агента режим — основного агента.
+        """
+        if self._parent is not None:
+            self._parent.set_mode(mode)
+            return
         self._mode = PermissionMode(mode)
 
     def cycle_mode(self) -> PermissionMode:
         """Следующий режим по кругу (Shift+Tab); возвращает новый режим."""
-        self._mode = next_mode(self._mode)
-        return self._mode
+        self.set_mode(next_mode(self.mode))
+        return self.mode
+
+    def request_subagent_stop(self) -> bool:
+        """Остановить работающего суб-агента (Esc; вызывается из потока клавиш).
+
+        Первый раз — суб-агент подведёт итог по сделанному, повторно (или когда он
+        уже подводит итог) — будет оборван без отчёта. Само прерывание текущего
+        запроса или команды — ``KeyboardInterrupt`` в основном потоке — посылает
+        вызывающий. False — суб-агент не работает: прерывать нужно ход целиком.
+        """
+        with self._stop_lock:
+            child = self._child
+            if child is None:
+                return False
+            child._stop_level = 2 if child._wrapping else child._stop_level + 1
+            return True
 
     def reset(self, conversation: Conversation | None = None) -> None:
         """Начать новый диалог или продолжить сохранённый (``conversation``).
@@ -273,7 +342,7 @@ class Agent:
         Контекст проекта будет собран заново; потраченные токены сессии не сбрасываются.
         """
         self._conversation = Conversation() if conversation is None else conversation
-        self._system_prompt = None
+        self._project_context = None
         self._nested.reset()
         self._compacted_tokens = 0
 
@@ -294,30 +363,76 @@ class Agent:
     def _run_turn(self, user_input: str) -> str:
         self._conversation.add_user(user_input)
         specs = self._registry.specs()
-        guard = LoopGuard(
-            max_steps=self._cfg.max_steps,
-            max_failures=self._cfg.max_tool_failures,
-            max_repeats=self._cfg.max_tool_repeats,
-        )
+        guard = self._new_guard()
         stats = TurnStats()
+        self._turn_stats = stats
+        self._subagent_runs = 0
+        self._wrapping = False
         started = time.monotonic()
-        final_text = ""
-        compact_failed = False  # не удалось — до конца хода не пытаемся снова
+        try:
+            final_text = self._loop(specs, guard, stats)
+        except KeyboardInterrupt:
+            if not self._take_soft_stop():
+                raise
+            final_text = self._user_stop(specs, stats)
+        finally:
+            self._turn_stats = None
+            stats.changes = guard.changes
 
+        stats.duration_s = time.monotonic() - started
+        self._last_turn = stats
+        self._events.on_turn_end(stats)
+        return final_text
+
+    def _new_guard(self) -> LoopGuard:
+        """Ограничители хода; у суб-агента — ещё бюджет токенов, времени и похожие вызовы."""
+        cfg = self._cfg
+        if self._parent is None:
+            return LoopGuard(
+                max_steps=cfg.max_steps,
+                max_failures=cfg.max_tool_failures,
+                max_repeats=cfg.max_tool_repeats,
+            )
+        return LoopGuard(
+            max_steps=cfg.max_steps,  # у суб-агента уже subagent_max_steps
+            max_failures=cfg.max_tool_failures,
+            max_repeats=cfg.max_tool_repeats,
+            max_similar=SUBAGENT_MAX_SIMILAR,
+            max_tokens=cfg.subagent_max_tokens,
+            time_limit=cfg.subagent_timeout,
+        )
+
+    def _take_soft_stop(self) -> bool:
+        """Прерывание — мягкая остановка суб-агента пользователем (подвести итог)?"""
+        return self._parent is not None and self._stop_level == 1 and not self._wrapping
+
+    def _user_stop(self, specs: list[ToolSpec], stats: TurnStats) -> str:
+        """Суб-агент остановлен пользователем: итог по сделанному одним запросом.
+
+        Повторная остановка во время итога (``KeyboardInterrupt``) пробрасывается —
+        суб-агент обрывается без отчёта.
+        """
+        self._conversation.repair()
+        stats.stop_reason = "user_stop"
+        self._events.on_notice("остановлен пользователем — подвожу итог", level="warn")
+        return self._wrap_up(specs, USER_STOP_REASON, stats, as_user=True)
+
+    def _loop(self, specs: list[ToolSpec], guard: LoopGuard, stats: TurnStats) -> str:
+        """Шаги хода до финального ответа модели или остановки ограничителем."""
+        compact_failed = False  # не удалось — до конца хода не пытаемся снова
         while True:
-            stop = guard.before_step()
+            stop = guard.before_step(stats.billed_tokens)
             if stop is None:
                 stats.steps = guard.steps
                 if self._cfg.auto_compact and not compact_failed:
                     compact_failed = not self._auto_compact(specs, stats)
-                turn = self._next_turn(specs)
+                turn = self._next_turn(specs, note=guard.pressure(stats.billed_tokens) or "")
                 msg = turn.message
                 self._conversation.add_assistant(msg, turn.usage)
                 self._account(turn.usage, stats)
 
                 if not turn.wants_tool:
-                    final_text = msg.content
-                    break
+                    return msg.content
 
                 # --- модель просит инструмент ---
                 call = msg.function_call
@@ -338,33 +453,59 @@ class Agent:
                     outcome = self._execute_tool_call(msg, check)
                     stop = guard.after_tool(call, outcome)
             if stop is not None:
-                stats.stop_reason = stop.kind
-                self._events.on_notice(stop.message, level="error")
-                final_text = self._wrap_up(specs, stop.message, stats) or stop.message
-                break
+                return self._stopped(specs, stop, stats)
 
-        stats.duration_s = time.monotonic() - started
-        self._last_turn = stats
-        self._events.on_turn_end(stats)
-        return final_text
+    def _stopped(self, specs: list[ToolSpec], stop: StopReason, stats: TurnStats) -> str:
+        stats.stop_reason = stop.kind
+        self._events.on_notice(stop.message, level="error")
+        text = self._wrap_up(specs, stop.message, stats)
+        # Суб-агенту без итога — пустой ответ: отчёт сам назовёт причину остановки.
+        return text or ("" if self._parent is not None else stop.message)
 
     def _account(self, usage: Usage, stats: TurnStats) -> None:
         """Учесть расход обращения: статистика хода, сессия, калибровка оценки."""
         stats.prompt_tokens += usage.prompt_tokens
         stats.completion_tokens += usage.completion_tokens
-        self._billed_tokens += usage.prompt_tokens + usage.completion_tokens
+        self._bill(usage)
         stats.context_tokens = usage.prompt_tokens + usage.completion_tokens
         self._calibrate(usage.prompt_tokens)
 
-    def _wrap_up(self, specs: list[ToolSpec], reason: str, stats: TurnStats) -> str:
+    def _bill(self, usage: Usage) -> None:
+        """Оплаченные токены сессии; у суб-агента — ещё и у основного агента."""
+        self._billed_tokens += usage.prompt_tokens + usage.completion_tokens
+        if self._parent is not None:
+            self._parent._bill_child(usage)
+
+    def _bill_child(self, usage: Usage) -> None:
+        """Расход суб-агента: в сессию и в статистику идущего хода (не в контекст)."""
+        self._billed_tokens += usage.prompt_tokens + usage.completion_tokens
+        if self._turn_stats is not None:
+            self._turn_stats.prompt_tokens += usage.prompt_tokens
+            self._turn_stats.completion_tokens += usage.completion_tokens
+
+    def _wrap_up(
+        self, specs: list[ToolSpec], reason: str, stats: TurnStats, *, as_user: bool = False
+    ) -> str:
         """Итог модели после остановки ограничителем: что сделано и что дальше.
 
         Инструменты в запросе остаются (иначе API не примет историю с вызовами), но
         вызов из ответа не выполняется — в историю идёт только текст. Сбой обращения
         к модели не мешает: остаётся сообщение ограничителя.
+
+        ``as_user`` — просьба подвести итог уходит сообщением пользователя (остановка
+        суб-агента пользователем: последним в истории может быть оборванный ответ).
         """
+        self._wrapping = True
+        self._events.on_wrap_up(reason)
+        note = ""
+        if as_user:
+            self._conversation.add_user(SUBAGENT_USER_STOP_NOTE)
+        elif self._parent is not None:
+            note = SUBAGENT_STOP_NOTE.format(reason=reason)
+        else:
+            note = STOP_SUMMARY_NOTE.format(reason=reason)
         try:
-            turn = self._next_turn(specs, note=STOP_SUMMARY_NOTE.format(reason=reason))
+            turn = self._next_turn(specs, note=note)
         except LLMError:
             return ""
         self._account(turn.usage, stats)
@@ -376,10 +517,18 @@ class Agent:
         return text
 
     # ------------------------------------------------------------------ #
+    def project_context(self) -> str:
+        """Контекст проекта для системного промпта (строится один раз за диалог)."""
+        if self._parent is not None:
+            return self._parent.project_context()
+        if self._project_context is None:
+            self._project_context = build_project_context(self._workspace)
+        return self._project_context
+
     def system_prompt(self) -> str:
-        if self._system_prompt is None:
-            self._system_prompt = build_system_prompt(self._workspace)
-        return self._system_prompt
+        if self._subagent is not None:
+            return subagent_system_prompt(self._subagent.name, self.project_context())
+        return compose_system_prompt(SYSTEM_PROMPT, self.project_context())
 
     def _system_text(self) -> str:
         """Системное сообщение без краткого содержания: промпт, инструкции
@@ -387,7 +536,7 @@ class Agent:
         parts = [
             self.system_prompt(),
             nested_instructions_prompt(self._nested.files),
-            mode_prompt(self._mode),
+            mode_prompt(self.mode, subagent=self._parent is not None),
         ]
         return "\n\n".join(part for part in parts if part)
 
@@ -488,7 +637,7 @@ class Agent:
             return None
 
         def count(usage: Usage) -> None:
-            self._billed_tokens += usage.prompt_tokens + usage.completion_tokens
+            self._bill(usage)
             if on_usage is not None:
                 on_usage(usage)
 
@@ -605,22 +754,28 @@ class Agent:
         risk = RiskLevel.SAFE
         try:
             risk = tool.risk(params, self._ctx)
+            read_only = self._subagent is not None and self._subagent.read_only
             decision = decide(
-                self._mode,
+                self.mode,
                 risk,
                 tool.kind,
                 auto_approve=self._cfg.auto_approve,
                 yes_all=self._cfg.yes_all,
+                read_only=read_only,
             )
             if decision is Decision.ASK and key in self._session_allowed:
                 decision = Decision.ALLOW  # пользователь разрешил этот вызов «всегда»
             if decision is Decision.BLOCK:
-                return self._fail(
-                    call,
-                    "заблокировано: режим планирования",
-                    model_text=PLAN_BLOCKED_NOTE,
-                    note=note,
-                )
+                if read_only:
+                    error, model_text = "заблокировано: агент только читает", READ_ONLY_BLOCKED_NOTE
+                elif self._parent is not None:
+                    error, model_text = (
+                        "заблокировано: режим планирования",
+                        (SUBAGENT_PLAN_BLOCKED_NOTE),
+                    )
+                else:
+                    error, model_text = "заблокировано: режим планирования", PLAN_BLOCKED_NOTE
+                return self._fail(call, error, model_text=model_text, note=note)
             if decision is Decision.ASK:
                 if check.rejected_before:
                     # Тот же вызов уже отклонён в этом ходе — не переспрашиваем.
@@ -664,18 +819,66 @@ class Agent:
         if result is None:
             return self._fail(call, error or "инструмент не вернул результат", note=note)
 
+        if result.ok and risk >= RiskLevel.WRITE:
+            result.changed = True  # UI и журнал суб-агента видят изменение
         self._events.on_tool_result(call, result, previewed=previewed)
         self._conversation.add_function_result(name, _with_note(result.as_function_content(), note))
         if result.ok:
             self._attach_instructions(tool, params)
-        return ToolOutcome(
-            ok=result.ok, changed=result.ok and risk >= RiskLevel.WRITE, soft=result.soft
+        return ToolOutcome(ok=result.ok, changed=result.changed, soft=result.soft)
+
+    def _run_subagent(self, name: str, description: str, prompt: str) -> ToolResult:
+        """Запустить суб-агента ``name`` с задачей ``prompt`` (инструмент ``task``).
+
+        Суб-агент работает в своей истории; основному агенту возвращается отчёт. Esc
+        во время его работы — подвести итог, повторный Esc — оборвать (ход основного
+        агента продолжается в обоих случаях); Ctrl+C останавливает весь ход.
+        """
+        spec = SUBAGENTS.get(name)
+        if spec is None:
+            raise ToolError(f"неизвестный суб-агент {name!r}; доступны: {', '.join(SUBAGENTS)}.")
+        if self._subagent_runs >= MAX_SUBAGENTS_PER_TURN:
+            raise ToolError(
+                f"лимит суб-агентов в этом ходе исчерпан ({MAX_SUBAGENTS_PER_TURN}) — "
+                "продолжай сам."
+            )
+        self._subagent_runs += 1
+        info = SubagentInfo(spec.name, description)
+        events = SubagentEvents(self._events, info)
+        child = Agent(
+            self._provider,
+            subagent_registry(self._registry, spec),
+            replace(self._cfg, max_steps=self._cfg.subagent_max_steps),
+            events,
+            workspace=self._workspace,
+            windows=self._windows,
+            parent=self,
+            subagent=spec,
         )
+        self._events.on_subagent_start(info)
+        with self._stop_lock:
+            self._child = child
+        try:
+            text = child.run_turn(prompt)
+        except LLMError as e:
+            # Сделанное до сбоя не теряется: основной агент не повторит его вслепую.
+            return model_error_report(spec, e, events.trail)
+        except KeyboardInterrupt:
+            if child._stop_level >= 2:  # повторный Esc: оборвать суб-агента, ход идёт дальше
+                return aborted_report(spec, events.trail)
+            # Ctrl+C: ход останавливается, но модель узнает, что успел сделать суб-агент.
+            self._conversation.add_function_result("task", interrupted_note(spec, events.trail))
+            raise
+        finally:
+            with self._stop_lock:
+                self._child = None
+            self._events.on_subagent_end(info, child.last_turn)
+        return subagent_report(spec, text, child.last_turn, events.trail)
 
     def _allow_always(self, call: ToolCallInfo, key: str) -> None:
         """«Да, и не спрашивать»: правки — режим авто-правок, прочее — этот вызов."""
         if call.kind is ToolKind.EDIT:
-            if self._mode is PermissionMode.MANUAL:
+            if self.mode is PermissionMode.MANUAL:
                 self.set_mode(PermissionMode.ACCEPT_EDITS)
                 self._events.on_notice(
                     "режим «авто-правки»: дальнейшие правки файлов — без вопросов "

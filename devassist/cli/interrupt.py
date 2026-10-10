@@ -163,6 +163,10 @@ class EscInterrupt:
         self._interrupt = interrupt
         # Shift+Tab во время хода (вызывается из фонового потока чтения клавиш).
         self.on_backtab = on_backtab
+        # Esc во время хода, до прерывания (из фонового потока): True — Esc забран
+        # (например, останавливает суб-агента), прерывание остаётся взведённым —
+        # следующий Esc тоже сработает.
+        self.on_escape: Callable[[], bool] | None = None
         self._lock = threading.Lock()
         self._armed = False  # можно ли ещё прервать текущий ход
         self._stop = threading.Event()
@@ -235,7 +239,8 @@ class EscInterrupt:
         with self._lock:
             if not self._armed:
                 return
-            self._armed = False
+            if self.on_escape is None or not self.on_escape():
+                self._armed = False
             self._interrupt()
 
     def _on_backtab(self) -> None:

@@ -61,14 +61,16 @@ def esc_interrupt_for(
 ) -> EscInterrupt:
     """Прерывание ходов клавишей Esc (если stdin — терминал) + подсказка в индикаторе.
 
-    С ``agent`` Shift+Tab во время хода переключает его режим, а индикатор хода
-    показывает текущий режим.
+    С ``agent`` Shift+Tab во время хода переключает его режим, индикатор хода
+    показывает текущий режим, а Esc во время суб-агента останавливает только его
+    (первый — с итогом, повторный — обрывает), Ctrl+C — весь ход.
     """
     interrupt = EscInterrupt() if interrupt is None else interrupt
     if interrupt.enabled:
-        ui.set_interrupt_keys("Esc — прервать", interrupt.paused)
+        ui.set_interrupt_keys("Esc — прервать", interrupt.paused, stop_subagent=agent is not None)
         if agent is not None:
             interrupt.on_backtab = agent.cycle_mode
+            interrupt.on_escape = agent.request_subagent_stop
             ui.set_mode_hint(lambda: f"{mode_badge(agent.mode)} (Shift+Tab)")
     return interrupt
 

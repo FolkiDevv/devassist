@@ -376,3 +376,75 @@ def test_turn_indicator_shows_current_mode():
     ui._live._live.refresh()
     ui.stop_live()
     assert "Esc — прервать  ·  план (Shift+Tab)" in _plain(buf)
+
+
+# ------------------------------ суб-агенты ------------------------------ #
+def test_subagent_steps_nested_and_text_hidden(tmp_path):
+    from fakes import ScriptedProvider, text_turn, tool_turn
+
+    from devassist.agent.loop import Agent
+    from devassist.config import Config
+    from devassist.tools.base import build_default_registry
+
+    (tmp_path / "a.py").write_text("def foo():\n    pass\n", encoding="utf-8")
+    provider = ScriptedProvider(
+        [
+            tool_turn("task", {"agent": "explore", "prompt": "найди foo", "description": "foo"}),
+            tool_turn("search_content", {"pattern": "def foo"}),
+            tool_turn("read_file", {"path": "nope.py"}),
+            text_turn("СЕКРЕТНЫЙ ОТЧЁТ суб-агента"),
+            text_turn("Итог основного"),
+        ]
+    )
+    ui, buf = _live_console(width=100)
+    cfg = Config(access_key="x", project_root=tmp_path, stream=True, auto_approve=True)
+    Agent(provider, build_default_registry(), cfg, ui).run_turn("где foo?")
+    out = _plain(buf)
+    assert "task  explore · foo" in out
+    assert "○ search_content  /def foo/" in out and "○ read_file  nope.py" in out
+    assert "✘ Файл не найден: nope.py" in out  # неудача шага суб-агента видна
+    assert "СЕКРЕТНЫЙ ОТЧЁТ" not in out  # отчёт получает основной агент, не пользователь
+    assert "Итог основного" in out
+    assert out.count("devassist") == 1  # метка ответа — только у основного агента
+    assert "explore · инструментов: 2" in out
+    assert ui._live is None
+
+
+def test_subagent_live_area_survives_confirm():
+    from devassist.agent.events import SubagentInfo
+
+    ui, _ = _live_console()
+    info = SubagentInfo("general", "правка")
+    ui.on_subagent_start(info)
+    assert ui._live is not None
+    seen = {}
+
+    def question(*args, **kwargs):
+        seen["live"] = ui._live
+        return "y"
+
+    ui._question = question
+    ui.confirm(ToolCallInfo("edit_file", "a.py"), Display("+x", "diff", "a.py"), dangerous=False)
+    assert seen["live"] is None  # вопрос — без временной области
+    ui.on_subagent_activity(info, "edit_file")
+    assert ui._live is not None  # индикатор суб-агента вернулся
+    ui.on_subagent_end(info, None)
+    assert ui._live is None
+
+
+def test_subagent_hint_names_stop_keys():
+    import contextlib
+
+    from devassist.agent.events import SubagentInfo
+
+    ui, _ = _live_console()
+    assert "Esc" not in ui._subagent_hint()  # Esc не слушается — подсказки нет
+    ui.set_interrupt_keys("Esc — прервать", contextlib.nullcontext, stop_subagent=True)
+    info = SubagentInfo("explore")
+    ui.on_subagent_start(info)
+    assert "Esc — завершить с итогом" in ui._subagent_hint()
+    assert "Ctrl+C — прервать всё" in ui._subagent_hint()
+    ui.on_subagent_activity(info, "подвожу итог", wrapping_up=True)
+    assert "Esc — оборвать суб-агента" in ui._subagent_hint()
+    assert ui._subagent_label() == "explore · подвожу итог"
+    ui.on_subagent_end(info, None)
