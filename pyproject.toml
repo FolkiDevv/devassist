@@ -7,7 +7,7 @@ name = "devassist"
 version = "0.5.0"
 description = "Локальный CLI-агент для программирования на базе GigaChat (аналог Claude Code)"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.13"
 license = { text = "Proprietary" }
 classifiers = [
     "Programming Language :: Python :: 3",
@@ -34,7 +34,7 @@ include = ["devassist*"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+target-version = "py313"
 
 [tool.ruff.lint]
 # E,F — pyflakes/pycodestyle; I — isort; UP — pyupgrade; B — bugbear; W — warnings.

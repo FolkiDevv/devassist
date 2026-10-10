@@ -144,7 +144,7 @@ GigaChat использует **legacy-формат `functions`** (не `tools`)
 
 ## Установка
 
-Требуется Python ≥ 3.10 и [uv](https://docs.astral.sh/uv/). Зависимости описаны в
+Требуется Python ≥ 3.13 и [uv](https://docs.astral.sh/uv/). Зависимости описаны в
 `pyproject.toml`, точные версии зафиксированы в `uv.lock`.
 
 ```bash

@@ -17,12 +17,12 @@
 
 from __future__ import annotations
 
-from enum import Enum
+from enum import Enum, StrEnum
 
 from devassist.security import RiskLevel
 
 
-class PermissionMode(str, Enum):
+class PermissionMode(StrEnum):
     MANUAL = "manual"
     ACCEPT_EDITS = "edits"
     PLAN = "plan"
@@ -71,7 +71,7 @@ def parse_mode(text: str) -> PermissionMode:
     raise ValueError(f"неизвестный режим {text.strip()!r}; допустимые: {names}")
 
 
-class ToolKind(str, Enum):
+class ToolKind(StrEnum):
     """Вид инструмента — от него зависит поведение в режимах."""
 
     OTHER = "other"

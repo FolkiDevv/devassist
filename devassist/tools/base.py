@@ -19,7 +19,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Generic, Literal, TypeVar
+from typing import Any, Literal
 
 from pydantic import BaseModel
 
@@ -39,8 +39,6 @@ __all__ = [
     "ToolResult",
     "build_default_registry",
 ]
-
-P = TypeVar("P", bound=BaseModel)
 
 
 @dataclass(frozen=True)
@@ -141,7 +139,7 @@ def _clean_schema(model: type[BaseModel]) -> dict[str, Any]:
     return schema
 
 
-class Tool(ABC, Generic[P]):
+class Tool[P: BaseModel](ABC):
     name: str = ""
     description: str = ""
     Params: type[BaseModel] = BaseModel
