@@ -117,3 +117,16 @@ def test_store_in_memory_and_default_path(_isolated_home):
     assert windows.get("A") is not None
     assert not (_isolated_home / ".devassist").exists()
     assert default_path() == _isolated_home / ".devassist" / "models.json"
+
+
+def test_window_from_another_endpoint_is_ignored(tmp_path):
+    from devassist.llm.model_windows import ModelWindows
+
+    entries = {
+        "M": {"context_window": 32_000, "base_url": "https://external/v1"},
+        "Old": {"context_window": 8_000},  # запись без эндпоинта (старый формат)
+    }
+    assert ModelWindows(entries=entries, base_url="https://external/v1").get("M") == 32_000
+    assert ModelWindows(entries=entries, base_url="https://internal/v1").get("M") is None
+    assert ModelWindows(entries=entries).get("M") == 32_000
+    assert ModelWindows(entries=entries, base_url="https://internal/v1").get("Old") == 8_000

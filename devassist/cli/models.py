@@ -3,7 +3,8 @@
 * :class:`ModelCatalog` — список чат-моделей API, загружается фоновым потоком при
   старте REPL (строка ввода не ждёт сети); источник автодополнения ``/model``;
 * :func:`ensure_context_window` — если окно выбранной модели ещё не замерено,
-  замеряет его (при старте, ``/model``, ``/resume``) и сохраняет в ``~/.devassist``;
+  предлагает замерить его (при старте, ``/model``, ``/resume``; с ``-y`` — без
+  вопроса) и сохраняет в ``~/.devassist``;
 * :func:`measure_context_window` — замер с индикатором (Esc/Ctrl+C — отмена);
   его же вызывает ``devassist --test-context``.
 """
@@ -17,7 +18,12 @@ from contextlib import AbstractContextManager
 from devassist.agent.context_window import DEFAULT_CONTEXT_WINDOW
 from devassist.agent.loop import Agent
 from devassist.llm.base import LLMError, LLMProvider
-from devassist.llm.context_probe import ProbeResult, ProbeStep, probe_context_window
+from devassist.llm.context_probe import (
+    MAX_CONTEXT_WINDOW,
+    ProbeResult,
+    ProbeStep,
+    probe_context_window,
+)
 from devassist.llm.model_windows import ModelWindows
 from devassist.ui.console import Console
 from devassist.ui.format import format_tokens, plural
@@ -127,23 +133,48 @@ def save_window(windows: ModelWindows, result: ProbeResult, ui: Console, *, base
 
 
 def ensure_context_window(
-    agent: Agent, ui: Console, *, interrupt: AbstractContextManager[object] | None = None
+    agent: Agent,
+    ui: Console,
+    *,
+    interrupt: AbstractContextManager[object] | None = None,
+    interactive: bool = True,
+    declined: set[str] | None = None,
 ) -> None:
-    """Замеряет окно текущей модели агента, если оно неизвестно.
+    """Предлагает замерить окно текущей модели агента, если оно неизвестно.
 
-    Не нужен при явном бюджете (``DEVASSIST_CONTEXT_TOKENS``) и у провайдера без
-    замера. Отмена или ошибка — работаем с окном по умолчанию, замер повторится при
-    следующем выборе модели.
+    Замер оплачивается (проба размером до окна модели), поэтому без ``-y`` он
+    только с согласия пользователя; не интерактивно (``-p``, ввод не с терминала)
+    — не замеряется, выводится подсказка про ``--test-context``. Отказ запоминается
+    в ``declined`` до конца сессии. Не нужен при явном бюджете
+    (``DEVASSIST_CONTEXT_TOKENS``), при ``DEVASSIST_AUTO_MEASURE=0`` и у провайдера
+    без замера. Отмена или ошибка — работаем с окном по умолчанию.
     """
     if (
         agent.config.context_budget_tokens is not None
         or agent.context_window is not None
         or not agent.provider.supports_measure
+        or not agent.config.auto_measure
     ):
         return
     model = agent.model
+    if declined is not None and model in declined:
+        return
     fallback = format_tokens(DEFAULT_CONTEXT_WINDOW)
-    ui.info(f"окно контекста модели {model} не замерено — замеряю (несколько запросов)")
+    later = f"замерить: devassist --test-context {model}"
+    if not agent.config.auto_approve:
+        if not interactive or not ui.interactive():
+            ui.system(f"окно контекста {model} не замерено — считаем {fallback}; {later}")
+            return
+        question = (
+            f"Окно контекста модели {model} не замерено. Замерить? Пробные запросы "
+            f"оплачиваются — до размера окна модели (≤{format_tokens(MAX_CONTEXT_WINDOW)} ток.)"
+        )
+        if not ui.ask(question):
+            if declined is not None:
+                declined.add(model)
+            ui.system(f"пока считаем окно {model} равным {fallback}; {later}")
+            return
+    ui.info(f"замеряю окно контекста модели {model} (несколько запросов)")
     try:
         result = measure_context_window(agent.provider, model, ui, interrupt=interrupt)
     except KeyboardInterrupt:

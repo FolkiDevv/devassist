@@ -42,9 +42,12 @@ def test_loop_stops_after_repeated_failures(tmp_path):
     events = RecordingEvents()
     agent = _agent(provider, tmp_path, events=events, max_tool_failures=4)
     final = agent.run_turn("сделай что-нибудь")
+    # итог модели — вызов инструмента, а не текст: остаётся сообщение ограничителя
     assert "Прервано" in final
-    # должно остановиться на пороге, а не крутить 50 шагов
-    assert provider.calls == 4
+    # должно остановиться на пороге, а не крутить 50 шагов: 4 шага + запрос итога
+    assert provider.calls == 5
+    assert "ХОД ОСТАНОВЛЕН" in provider.requests[-1]["messages"][0].content
+    assert len(_function_results(agent)) == 4  # вызов из запроса итога не выполнялся
     assert events.stats[-1].stop_reason == "tool_failures"
     assert events.notices and events.notices[-1][0] == "error"
 
@@ -60,7 +63,7 @@ def test_loop_stops_on_repeated_identical_calls(tmp_path):
     agent = _agent(provider, tmp_path, events=events)
     final = agent.run_turn("прочитай")
     assert "зациклился" in final
-    assert provider.calls == 4
+    assert provider.calls == 5  # 4 шага + запрос итога (его вызов не выполняется)
     assert events.stats[-1].stop_reason == "tool_repeats"
     assert events.stats[-1].tool_calls == 3  # 4-й вызов не выполнялся
     assert [level for level, _ in events.notices] == ["warn", "error"]
@@ -850,3 +853,171 @@ def test_resumed_compacted_chat_reports_estimated_context(tmp_path):
     estimate = agent.context_tokens
     assert 0 < estimate < 9_000
     assert agent.context_tokens == estimate  # посчитано один раз
+
+
+# --------------------------- итог при остановке --------------------------- #
+def test_stop_by_guard_asks_model_for_summary(tmp_path):
+    bad = [tool_turn("read_file", {"path": f"nope{i}.txt"}) for i in range(4)]
+    summary = "Не нашёл файлов nope*.txt. Проверьте путь — дальше могу поискать по шаблону."
+    provider = ScriptedProvider([*bad, text_turn(summary)])
+    events = RecordingEvents()
+    agent = _agent(provider, tmp_path, events=events, max_tool_failures=4)
+    assert agent.run_turn("прочитай") == summary
+    assert events.stats[-1].stop_reason == "tool_failures"
+    last = agent.conversation.messages[-1]
+    assert last.role == "assistant" and last.content == summary and last.function_call is None
+    assert ("error", events.notices[-1][1]) == events.notices[-1]  # причина остановки видна
+    _assert_well_formed(agent.conversation.messages)
+
+
+def test_max_steps_summary_and_no_tool_execution(tmp_path):
+    (tmp_path / "f.txt").write_text("x", encoding="utf-8")
+    read = tool_turn("read_file", {"path": "f.txt"})
+    provider = ScriptedProvider([read, text_turn("Прочитал f.txt, дальше — правка.")])
+    agent = _agent(provider, tmp_path, max_steps=1)
+    assert agent.run_turn("x") == "Прочитал f.txt, дальше — правка."
+    assert agent.last_turn.stop_reason == "max_steps"
+    assert len(_function_results(agent)) == 1
+
+
+def test_summary_failure_keeps_guard_message(tmp_path):
+    from devassist.llm.base import LLMError
+
+    bad = [tool_turn("read_file", {"path": f"nope{i}.txt"}) for i in range(2)]
+    provider = ScriptedProvider([*bad, LLMError("сеть")])
+    agent = _agent(provider, tmp_path, max_tool_failures=2)
+    assert "Прервано: 2 неудачных вызовов" in agent.run_turn("x")
+
+
+# --------------------------- калибровка оценки --------------------------- #
+def test_token_estimate_is_calibrated_by_usage(tmp_path):
+    from devassist.llm.model_windows import ModelWindows
+
+    provider = ScriptedProvider(
+        [text_turn("a", Usage(prompt_tokens=1)), text_turn("b", Usage(prompt_tokens=10**6))]
+    )
+    cfg = Config(access_key="x", project_root=tmp_path, stream=False, model="M")
+    windows = ModelWindows(entries={"M": {"context_window": 40_000}})
+    agent = Agent(provider, build_default_registry(), cfg, RecordingEvents(), windows=windows)
+    specs = build_default_registry().specs()
+    budget, history = agent.context_budget, agent._history_budget(specs)
+    agent.run_turn("x")  # реальных токенов меньше оценки — бюджет в оценке растёт
+    assert agent.token_scale == 0.5
+    assert agent.context_budget == budget  # статус-строка — в реальных токенах, как раньше
+    assert agent._history_budget(specs) > history * 1.5
+    agent.run_turn("y")  # больше оценки — бюджет сразу сжимается
+    assert agent.token_scale == 1.5
+
+
+def test_explicit_budget_is_not_scaled(tmp_path):
+    provider = ScriptedProvider([text_turn("a", Usage(prompt_tokens=1))])
+    agent = _agent(provider, tmp_path, context_budget_tokens=20_000)
+    agent.run_turn("x")
+    assert agent._estimate_budget() == 20_000
+
+
+# --------------------------- «мягкие» ошибки команд --------------------------- #
+def test_nonzero_exit_codes_do_not_stop_the_turn(tmp_path):
+    turns = [tool_turn("run_shell", {"command": f"exit {code}"}) for code in (1, 2, 1, 3, 1)]
+    provider = ScriptedProvider([*turns, text_turn("ок")])
+    events = RecordingEvents()
+    agent = _agent(provider, tmp_path, events=events, max_tool_failures=4)
+    assert agent.run_turn("x") == "ок"
+    assert events.stats[-1].stop_reason is None
+    assert all(not result.ok for _, result, _ in events.results)  # в UI — по-прежнему неуспех
+
+
+def test_missing_commands_still_count_as_failures(tmp_path):
+    turns = [tool_turn("run_shell", {"command": f"no-such-cmd-{i}"}) for i in range(4)]
+    provider = ScriptedProvider([*turns, text_turn("ок")])
+    events = RecordingEvents()
+    _agent(provider, tmp_path, events=events, max_tool_failures=4).run_turn("x")
+    assert events.stats[-1].stop_reason == "tool_failures"
+
+
+# --------------------------- прерванный поток --------------------------- #
+class _BrokenStream(ScriptedProvider):
+    def __init__(self, error):
+        super().__init__()
+        self.error = error
+
+    def stream(self, messages, tools=None, *, on_delta=None, **kwargs):
+        on_delta("Начинаю: сначала прочитаю")
+        raise self.error
+
+
+@pytest.mark.parametrize("error", [KeyboardInterrupt(), RuntimeError("сеть")])
+def test_interrupted_stream_keeps_shown_text(tmp_path, error):
+    cfg = Config(access_key="x", project_root=tmp_path, stream=True)
+    agent = Agent(_BrokenStream(error), build_default_registry(), cfg, RecordingEvents())
+    with pytest.raises(type(error)):
+        agent.run_turn("x")
+    last = agent.conversation.messages[-1]
+    assert last.role == "assistant" and last.content.startswith("Начинаю: сначала прочитаю")
+    note = "прерван пользователем" if isinstance(error, KeyboardInterrupt) else "ошибки"
+    assert note in last.content
+
+
+def test_invalid_call_is_shown_with_tool_line(tmp_path):
+    provider = ScriptedProvider(
+        [tool_turn("read_file", {}), tool_turn("nope", {}), text_turn("ок")]
+    )
+    events = RecordingEvents()
+    _agent(provider, tmp_path, events=events).run_turn("x")
+    kinds = [(kind, getattr(value, "summary", None)) for kind, value in events.events]
+    assert ("tool_call", "(неверные аргументы)") in kinds
+    assert ("tool_call", "(неизвестный инструмент)") in kinds
+    first_call = kinds.index(("tool_call", "(неверные аргументы)"))
+    assert kinds[first_call + 1][0] == "tool_result"
+
+
+# --------------------------- «всегда» и -y для опасного --------------------------- #
+class _ApprovingEvents(RecordingEvents):
+    def __init__(self, answers):
+        super().__init__()
+        self._answers = list(answers)
+
+    def confirm(self, call, preview, *, dangerous):
+        self.confirms.append((call, preview, dangerous))
+        return self._answers.pop(0)
+
+
+def test_always_for_edit_switches_to_accept_edits(tmp_path):
+    from devassist.agent.events import Approval
+
+    writes = [tool_turn("write_file", {"path": f"f{i}.txt", "content": "x"}) for i in range(2)]
+    provider = ScriptedProvider([*writes, text_turn("ок")])
+    events = _ApprovingEvents([Approval.ALWAYS])
+    agent = _agent(provider, tmp_path, events=events, auto_approve=False)
+    agent.run_turn("x")
+    assert len(events.confirms) == 1  # вторая правка — уже без вопроса
+    assert agent.mode is PermissionMode.ACCEPT_EDITS
+    assert (tmp_path / "f1.txt").exists()
+    assert any("авто-правки" in text for _, text in events.notices)
+
+
+def test_always_for_command_allows_only_the_same_call(tmp_path):
+    from devassist.agent.events import Approval
+
+    echo = tool_turn("run_shell", {"command": "echo 1"})
+    other = tool_turn("run_shell", {"command": "echo 2"})
+    provider = ScriptedProvider([echo, text_turn("ок"), echo, other, text_turn("ок")])
+    events = _ApprovingEvents([Approval.ALWAYS, Approval.YES])
+    agent = _agent(provider, tmp_path, events=events, auto_approve=False)
+    agent.run_turn("x")
+    agent.run_turn("ещё")  # разрешение действует и в следующих ходах
+    assert [call.summary for call, _, _ in events.confirms] == ["echo 1", "echo 2"]
+    assert agent.mode is PermissionMode.MANUAL
+
+
+def test_yes_flag_still_asks_for_dangerous_commands(tmp_path):
+    rm = tool_turn("run_shell", {"command": "rm -rf build"})
+    provider = ScriptedProvider([rm, text_turn("ок")])
+    events = RecordingEvents(confirm_answer=False)
+    agent = _agent(provider, tmp_path, events=events)  # auto_approve=True
+    agent.run_turn("почисти")
+    assert [dangerous for _, _, dangerous in events.confirms] == [True]
+    provider = ScriptedProvider([rm, text_turn("ок")])
+    events = RecordingEvents(confirm_answer=False)
+    _agent(provider, tmp_path, events=events, yes_all=True).run_turn("почисти")
+    assert events.confirms == []

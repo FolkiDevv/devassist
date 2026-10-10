@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from devassist.config import Config
 from devassist.llm.gigachat import GigaChatProvider
 from devassist.llm.types import FunctionCall, Message
@@ -136,4 +138,13 @@ def test_parse_response_arguments_as_string():
     }
     turn = p._parse_response(data)
     assert turn.message.function_call.arguments == {"k": "v"}
+    p.close()
+
+
+@pytest.mark.parametrize("content", ["42", "true", "null", "[]", '"строка"', "1"])
+def test_bare_json_values_are_wrapped(content):
+    """Не объект — значит текст: GigaChat ждёт в содержимом функции JSON-объект."""
+    p = _provider()
+    payload = p._message_to_payload(Message(role="function", name="list_dir", content=content))
+    assert json.loads(payload["content"]) == {"result": content}
     p.close()

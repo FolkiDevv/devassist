@@ -29,8 +29,14 @@ from devassist.agent.context_window import (
     fit_history,
 )
 from devassist.agent.conversation import Conversation, Summary
-from devassist.agent.events import AgentEvents, CompactResult, ToolCallInfo, TurnStats
-from devassist.agent.guard import CallCheck, LoopGuard, ToolOutcome
+from devassist.agent.events import (
+    AgentEvents,
+    Approval,
+    CompactResult,
+    ToolCallInfo,
+    TurnStats,
+)
+from devassist.agent.guard import CallCheck, LoopGuard, ToolOutcome, call_key
 from devassist.agent.prompts import (
     build_system_prompt,
     mode_prompt,
@@ -41,7 +47,7 @@ from devassist.config import Config
 from devassist.llm.base import LLMError, LLMProvider
 from devassist.llm.model_windows import ModelWindows
 from devassist.llm.types import AssistantTurn, Message, ToolSpec, Usage
-from devassist.permissions import Decision, PermissionMode, decide, next_mode
+from devassist.permissions import Decision, PermissionMode, ToolKind, decide, next_mode
 from devassist.project.instructions import NestedInstructions
 from devassist.project.workspace import Workspace
 from devassist.security import RiskLevel
@@ -58,6 +64,13 @@ REJECTED_AGAIN_NOTE = (
 LOOP_STOP_NOTE = (
     "Не выполнено: повтор того же вызова без изменений. Ход остановлен из-за зацикливания."
 )
+STOP_SUMMARY_NOTE = (
+    "=== ХОД ОСТАНОВЛЕН ===\n{reason}\nИнструменты больше не вызывай. Кратко ответь "
+    "пользователю: что уже сделано, что не получилось и почему, что осталось и что "
+    "предлагаешь дальше."
+)
+INTERRUPTED_ANSWER_NOTE = "\n\n(ответ прерван пользователем)"
+BROKEN_ANSWER_NOTE = "\n\n(ответ оборван из-за ошибки)"
 PLAN_BLOCKED_NOTE = (
     "Не выполнено: включён режим планирования, изменения запрещены. Не пытайся "
     "вносить их: опиши нужные изменения в плане и передай его пользователю "
@@ -72,6 +85,10 @@ COMPACT_MIN_SHARE = 0.2  # меньше — сжимать не стоит за�
 SUMMARY_SHARE = 0.15  # предел краткого содержания
 MAX_SUMMARY_CHARS = 12_000
 MIN_SUMMARY_CHARS = 1_000
+
+# Калибровка оценки токенов по фактическому usage: реальные токены / оценка.
+MIN_TOKEN_SCALE = 0.5
+MAX_TOKEN_SCALE = 1.5
 
 
 def _with_note(content: str, note: str | None) -> str:
@@ -120,6 +137,14 @@ class Agent:
         self._billed_tokens = 0  # потрачено за сессию (reset() не сбрасывает)
         # Оценка контекста после сжатия — пока модель не сообщит настоящий размер.
         self._compacted_tokens = 0
+        self._last_turn: TurnStats | None = None
+        # Реальные токены / оценка по модели: оценка ~3 символа на токен грубая, а
+        # бюджеты считаются в её единицах (калибруется по prompt_tokens ответов).
+        self._token_scale: dict[str, float] = {}
+        # Вызовы, которые пользователь разрешил «всегда» (до конца сессии; reset() не
+        # сбрасывает — как и режим).
+        self._session_allowed: set[str] = set()
+        self._last_estimate = 0  # оценка последнего отправленного запроса
 
     # ------------------------------------------------------------------ #
     @property
@@ -157,8 +182,8 @@ class Agent:
             return 0
         if not self._compacted_tokens:
             specs = self._registry.specs()
-            self._compacted_tokens = self._overhead_tokens(specs) + self._history_tokens(
-                self._conversation
+            self._compacted_tokens = self._to_real(
+                self._overhead_tokens(specs) + self._history_tokens(self._conversation)
             )
         return self._compacted_tokens
 
@@ -177,10 +202,48 @@ class Agent:
 
     @property
     def context_budget(self) -> int:
-        """Бюджет запроса (оценка в токенах): явный из конфига или от окна модели."""
+        """Бюджет запроса: явный из конфига (в единицах оценки) или от окна модели."""
         if self._cfg.context_budget_tokens is not None:
             return self._cfg.context_budget_tokens
         return budget_for_window(self.context_window or DEFAULT_CONTEXT_WINDOW)
+
+    @property
+    def token_scale(self) -> float:
+        """Реальные токены на единицу оценки для текущей модели (1.0 — ещё не известно)."""
+        return self._token_scale.get(self._model, 1.0)
+
+    def _estimate_budget(self) -> int:
+        """Бюджет запроса в единицах оценки, в которых меряется история.
+
+        Бюджет от окна модели — в реальных токенах: делится на калибровку, иначе
+        грубая оценка (~3 символа на токен) срабатывала бы раньше времени и часть
+        окна пропадала. Явный ``DEVASSIST_CONTEXT_TOKENS`` уже задан в единицах оценки.
+        """
+        if self._cfg.context_budget_tokens is not None:
+            return self._cfg.context_budget_tokens
+        return int(self.context_budget / self.token_scale)
+
+    def _to_real(self, estimate: int) -> int:
+        return int(estimate * self.token_scale)
+
+    def _calibrate(self, prompt_tokens: int) -> None:
+        """Уточнить калибровку по фактическому размеру отправленного запроса.
+
+        Рост принимается сразу (осторожность), снижение — наполовину: один запрос с
+        необычным текстом не должен резко раздвинуть бюджет.
+        """
+        if prompt_tokens <= 0 or self._last_estimate <= 0:
+            return
+        ratio = min(max(prompt_tokens / self._last_estimate, MIN_TOKEN_SCALE), MAX_TOKEN_SCALE)
+        old = self._token_scale.get(self._model)
+        if old is not None and ratio < old:
+            ratio = (old + ratio) / 2
+        self._token_scale[self._model] = ratio
+
+    @property
+    def last_turn(self) -> TurnStats | None:
+        """Итоги последнего хода (None — ход прерван исключением или ещё не было)."""
+        return self._last_turn
 
     @property
     def billed_tokens(self) -> int:
@@ -220,6 +283,7 @@ class Agent:
         При любом прерывании (Ctrl+C, ошибка LLM) история приводится в
         согласованное состояние, исключение пробрасывается дальше.
         """
+        self._last_turn = None
         try:
             return self._run_turn(user_input)
         except BaseException:
@@ -248,10 +312,7 @@ class Agent:
                 turn = self._next_turn(specs)
                 msg = turn.message
                 self._conversation.add_assistant(msg, turn.usage)
-                stats.prompt_tokens += turn.usage.prompt_tokens
-                stats.completion_tokens += turn.usage.completion_tokens
-                self._billed_tokens += turn.usage.prompt_tokens + turn.usage.completion_tokens
-                stats.context_tokens = turn.usage.prompt_tokens + turn.usage.completion_tokens
+                self._account(turn.usage, stats)
 
                 if not turn.wants_tool:
                     final_text = msg.content
@@ -276,14 +337,42 @@ class Agent:
                     outcome = self._execute_tool_call(msg, check)
                     stop = guard.after_tool(call, outcome)
             if stop is not None:
-                final_text = stop.message
                 stats.stop_reason = stop.kind
                 self._events.on_notice(stop.message, level="error")
+                final_text = self._wrap_up(specs, stop.message, stats) or stop.message
                 break
 
         stats.duration_s = time.monotonic() - started
+        self._last_turn = stats
         self._events.on_turn_end(stats)
         return final_text
+
+    def _account(self, usage: Usage, stats: TurnStats) -> None:
+        """Учесть расход обращения: статистика хода, сессия, калибровка оценки."""
+        stats.prompt_tokens += usage.prompt_tokens
+        stats.completion_tokens += usage.completion_tokens
+        self._billed_tokens += usage.prompt_tokens + usage.completion_tokens
+        stats.context_tokens = usage.prompt_tokens + usage.completion_tokens
+        self._calibrate(usage.prompt_tokens)
+
+    def _wrap_up(self, specs: list[ToolSpec], reason: str, stats: TurnStats) -> str:
+        """Итог модели после остановки ограничителем: что сделано и что дальше.
+
+        Инструменты в запросе остаются (иначе API не примет историю с вызовами), но
+        вызов из ответа не выполняется — в историю идёт только текст. Сбой обращения
+        к модели не мешает: остаётся сообщение ограничителя.
+        """
+        try:
+            turn = self._next_turn(specs, note=STOP_SUMMARY_NOTE.format(reason=reason))
+        except LLMError:
+            return ""
+        self._account(turn.usage, stats)
+        text = turn.message.content.strip()
+        if text:
+            self._conversation.add_assistant(
+                Message(role="assistant", content=turn.message.content), turn.usage
+            )
+        return text
 
     # ------------------------------------------------------------------ #
     def system_prompt(self) -> str:
@@ -308,7 +397,7 @@ class Agent:
 
     def _history_budget(self, specs: list[ToolSpec]) -> int:
         """Бюджет истории: бюджет запроса за вычетом системного сообщения и схем."""
-        return max(self.context_budget - self._overhead_tokens(specs), MIN_HISTORY_TOKENS)
+        return max(self._estimate_budget() - self._overhead_tokens(specs), MIN_HISTORY_TOKENS)
 
     @staticmethod
     def _history_tokens(conversation: Conversation) -> int:
@@ -318,7 +407,7 @@ class Agent:
             size += estimate_text_tokens(summary_prompt(conversation.summary.text))
         return size
 
-    def _build_request(self, specs: list[ToolSpec]) -> list[Message]:
+    def _build_request(self, specs: list[ToolSpec], note: str = "") -> list[Message]:
         """Сообщения для модели: системный промпт + история в пределах бюджета.
 
         Единственная точка сборки запроса. Краткое содержание сжатого начала диалога
@@ -330,11 +419,15 @@ class Agent:
         summary = self._conversation.summary
         if summary is not None:
             system_text = f"{system_text}\n\n{summary_prompt(summary.text)}"
+        if note:
+            system_text = f"{system_text}\n\n{note}"
         system = Message(role="system", content=system_text)
         # Схемы инструментов уходят в каждом запросе и занимают то же окно.
         used = estimate_tokens([system]) + estimate_specs_tokens(specs)
-        budget = max(self.context_budget - used, MIN_HISTORY_TOKENS)
-        return [system, *fit_history(self._conversation.context_messages(), budget)]
+        budget = max(self._estimate_budget() - used, MIN_HISTORY_TOKENS)
+        history = fit_history(self._conversation.context_messages(), budget)
+        self._last_estimate = used + estimate_tokens(history)
+        return [system, *history]
 
     # ------------------------------------------------------------------ #
     def compact(self, instructions: str = "") -> CompactResult | None:
@@ -410,7 +503,7 @@ class Agent:
                 plan.messages,
                 model=self._model,
                 temperature=self._cfg.temperature,
-                input_budget=self.context_budget,
+                input_budget=self._estimate_budget(),
                 max_chars=min(max(max_chars, MIN_SUMMARY_CHARS), MAX_SUMMARY_CHARS),
                 previous=previous,
                 instructions=instructions,
@@ -421,10 +514,10 @@ class Agent:
             if after >= before:
                 raise CompactionError("краткое содержание вышло не короче самой истории")
             conversation.set_summary(summary)
-            self._compacted_tokens = overhead + after
+            self._compacted_tokens = self._to_real(overhead + after)
             result = CompactResult(
-                before_tokens=overhead + before,
-                after_tokens=overhead + after,
+                before_tokens=self._to_real(overhead + before),
+                after_tokens=self._compacted_tokens,
                 messages=len(plan.messages),
                 auto=auto,
             )
@@ -432,9 +525,21 @@ class Agent:
             self._events.on_compact_end(result)
         return result
 
-    def _next_turn(self, specs: list[ToolSpec]) -> AssistantTurn:
-        """Один проход модели с выводом текста (потоковым или цельным)."""
-        messages = self._build_request(specs)
+    def _next_turn(self, specs: list[ToolSpec], note: str = "") -> AssistantTurn:
+        """Один проход модели с выводом текста (потоковым или цельным).
+
+        ``note`` — дополнение к системному сообщению только для этого запроса.
+        Оборванный поток (Esc, сбой сети) оставляет в истории уже показанный текст с
+        пометкой — модель знает, что её ответ прерван, а следующий запрос не идёт
+        двумя репликами пользователя подряд.
+        """
+        messages = self._build_request(specs, note)
+        streamed: list[str] = []
+
+        def on_delta(text: str) -> None:
+            streamed.append(text)
+            self._events.on_stream_delta(text)
+
         self._events.on_stream_start()
         try:
             if self._cfg.stream:
@@ -443,11 +548,21 @@ class Agent:
                     tools=specs,
                     model=self._model,
                     temperature=self._cfg.temperature,
-                    on_delta=self._events.on_stream_delta,
+                    on_delta=on_delta,
                 )
             turn = self._provider.complete(
                 messages, tools=specs, model=self._model, temperature=self._cfg.temperature
             )
+        except BaseException as e:
+            partial = "".join(streamed).rstrip()
+            if partial.strip():
+                tail = (
+                    INTERRUPTED_ANSWER_NOTE
+                    if isinstance(e, KeyboardInterrupt)
+                    else (BROKEN_ANSWER_NOTE)
+                )
+                self._conversation.add_assistant(Message(role="assistant", content=partial + tail))
+            raise
         finally:
             self._events.on_stream_end()
 
@@ -468,31 +583,36 @@ class Agent:
         note = check.warning
 
         if tool is None:
-            return self._fail(
-                ToolCallInfo(name, "(неизвестный инструмент)"),
-                f"инструмент '{name}' не существует.",
-                note=note,
-            )
+            unknown = ToolCallInfo(name, "(неизвестный инструмент)")
+            self._events.on_tool_call(unknown)
+            return self._fail(unknown, f"инструмент '{name}' не существует.", note=note)
 
         # 1) Валидация параметров
         try:
             params = tool.parse(msg.function_call.arguments)
         except Exception as e:  # ошибка схемы — возвращаем модели
-            return self._fail(
-                ToolCallInfo(name, "(неверные аргументы)"),
-                f"валидация аргументов: {e}",
-                note=note,
-            )
+            invalid = ToolCallInfo(name, "(неверные аргументы)")
+            self._events.on_tool_call(invalid)
+            return self._fail(invalid, f"валидация аргументов: {e}", note=note)
 
-        call = ToolCallInfo(name, self._describe(tool, params))
+        call = ToolCallInfo(name, self._describe(tool, params), tool.kind)
         self._events.on_tool_call(call)
+        key = call_key(msg.function_call)
 
         # 2) Разрешение по режиму: выполнить, спросить или заблокировать
         previewed = False
         risk = RiskLevel.SAFE
         try:
             risk = tool.risk(params, self._ctx)
-            decision = decide(self._mode, risk, tool.kind, auto_approve=self._cfg.auto_approve)
+            decision = decide(
+                self._mode,
+                risk,
+                tool.kind,
+                auto_approve=self._cfg.auto_approve,
+                yes_all=self._cfg.yes_all,
+            )
+            if decision is Decision.ASK and key in self._session_allowed:
+                decision = Decision.ALLOW  # пользователь разрешил этот вызов «всегда»
             if decision is Decision.BLOCK:
                 return self._fail(
                     call,
@@ -514,7 +634,12 @@ class Agent:
                 # не запускается и подтверждение не запрашивается.
                 preview = tool.preview(params, self._ctx)
                 dangerous = risk >= RiskLevel.DANGEROUS
-                if not self._events.confirm(call, preview, dangerous=dangerous):
+                answer = self._events.confirm(call, preview, dangerous=dangerous)
+                if isinstance(answer, bool):
+                    answer = Approval.YES if answer else Approval.NO
+                if answer is Approval.ALWAYS and not dangerous:
+                    self._allow_always(call, key)
+                elif answer is not Approval.YES:
                     self._fail(call, "отклонено пользователем", model_text=REJECTED_NOTE, note=note)
                     return ToolOutcome(ok=False, rejected=True)
                 previewed = preview is not None
@@ -542,7 +667,24 @@ class Agent:
         self._conversation.add_function_result(name, _with_note(result.as_function_content(), note))
         if result.ok:
             self._attach_instructions(tool, params)
-        return ToolOutcome(ok=result.ok, changed=result.ok and risk >= RiskLevel.WRITE)
+        return ToolOutcome(
+            ok=result.ok, changed=result.ok and risk >= RiskLevel.WRITE, soft=result.soft
+        )
+
+    def _allow_always(self, call: ToolCallInfo, key: str) -> None:
+        """«Да, и не спрашивать»: правки — режим авто-правок, прочее — этот вызов."""
+        if call.kind is ToolKind.EDIT:
+            if self._mode is PermissionMode.MANUAL:
+                self.set_mode(PermissionMode.ACCEPT_EDITS)
+                self._events.on_notice(
+                    "режим «авто-правки»: дальнейшие правки файлов — без вопросов "
+                    "(Shift+Tab — сменить)"
+                )
+            return
+        self._session_allowed.add(key)
+        self._events.on_notice(
+            f"{call.name} с этими аргументами больше не требует подтверждения до конца сессии"
+        )
 
     def _attach_instructions(self, tool: Tool, params: BaseModel) -> None:
         """Подключить инструкции подкаталогов, которых коснулся вызов.

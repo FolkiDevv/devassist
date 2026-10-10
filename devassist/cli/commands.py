@@ -8,10 +8,11 @@
 from __future__ import annotations
 
 import contextlib
+import difflib
 import re
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from devassist.agent.chat_store import ChatRecorder, ChatStoreError, SavedChat
 from devassist.agent.loop import Agent
@@ -33,6 +34,8 @@ class CommandContext:
     # Прерывание долгих команд клавишей Esc (как хода агента); None — только Ctrl+C.
     interrupt: AbstractContextManager[object] | None = None
     models: ModelCatalog | None = None  # список моделей для /model (None — не загружался)
+    # Модели, замер окна которых пользователь отклонил в этой сессии (не спрашивать снова).
+    declined_windows: set[str] = field(default_factory=set)
 
 
 # Обработчик получает контекст и аргумент (текст после имени команды).
@@ -75,7 +78,10 @@ class CommandRegistry:
         arg = parts[1].strip() if len(parts) > 1 else ""
         command = self.get(name)
         if command is None:
-            ctx.ui.error(f"неизвестная команда: {name} (список — /help)")
+            names = [n for cmd in self for n in (cmd.name, *cmd.aliases)]
+            close = difflib.get_close_matches(name.lower(), names, n=1, cutoff=0.6)
+            hint = f" — возможно, {close[0]}?" if close else ""
+            ctx.ui.error(f"неизвестная команда: {name}{hint} (список — /help)")
             return True
         return command.handler(ctx, arg)
 
@@ -113,11 +119,14 @@ def _model(ctx: CommandContext, arg: str) -> bool:
             lines += [f"  • {name} — {describe_model(name, agent.windows)}" for name in known]
         ctx.ui.info("\n".join(lines))
         return True
+    if known and arg not in known:
+        # имена моделей в API регистрозависимы: «gigachat-2-max» → «GigaChat-2-Max»
+        arg = next((name for name in known if name.lower() == arg.lower()), arg)
     agent.set_model(arg)
     if known and arg not in known:
         ctx.ui.warn(f"модели {arg} нет в списке доступных чат-моделей")
     ctx.ui.info(f"модель теперь: {arg} (применится со следующего запроса)")
-    ensure_context_window(agent, ctx.ui, interrupt=ctx.interrupt)
+    ensure_context_window(agent, ctx.ui, interrupt=ctx.interrupt, declined=ctx.declined_windows)
     if ctx.chats is not None:  # модель — часть чата: сохраняем, не дожидаясь хода
         warning = ctx.chats.save(agent.conversation, model=agent.model)
         if warning:
@@ -222,7 +231,9 @@ def _resume(ctx: CommandContext, arg: str) -> bool:
     ctx.ui.chat_resumed(saved.info, saved.conversation.messages)
     if ctx.agent.model != previous:
         ctx.ui.info(f"модель чата: {ctx.agent.model}")
-        ensure_context_window(ctx.agent, ctx.ui, interrupt=ctx.interrupt)
+        ensure_context_window(
+            ctx.agent, ctx.ui, interrupt=ctx.interrupt, declined=ctx.declined_windows
+        )
     return True
 
 

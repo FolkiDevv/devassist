@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 
 import pytest
@@ -95,6 +96,13 @@ def test_history_creates_data_dir_lazily(tmp_path):
     history.append_string("первый запрос")
     assert (ws.data_dir / ".gitignore").is_file()
     assert list(LazyFileHistory(ws).load_history_strings()) == ["первый запрос"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="права POSIX")
+def test_history_file_is_private(tmp_path):
+    ws = Workspace(tmp_path)
+    LazyFileHistory(ws).append_string("token=секрет")
+    assert (ws.data_dir / "history").stat().st_mode & 0o777 == 0o600
 
 
 def test_history_write_errors_are_swallowed(tmp_path):

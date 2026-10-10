@@ -165,45 +165,113 @@ def glob_match(rel_posix: str, pattern: str) -> bool:
     return compile_glob(pattern).match(target) is not None
 
 
+TREE_DIR_CAP = 30  # записей одного каталога ниже корня (корень — без ограничения)
+
+
+def _shares(sizes: list[int], budget: int) -> list[int]:
+    """Делит ``budget`` между каталогами поровну, отдавая недобранное остальным."""
+    shares = [0] * len(sizes)
+    pending = [i for i, size in enumerate(sizes) if size]
+    while pending and budget > 0:
+        fair = max(budget // len(pending), 1)
+        still = []
+        for i in pending:
+            take = min(sizes[i] - shares[i], fair, budget)
+            shares[i] += take
+            budget -= take
+            if shares[i] < sizes[i]:
+                still.append(i)
+        pending = still
+    return shares
+
+
 def build_file_tree(root: Path, max_entries: int = 200) -> str:
     """Компактное дерево проекта (отсортированное, с обрезкой).
+
+    Записи отбираются по уровням: сначала корень целиком, затем его каталоги
+    (лимит делится между ними поровну, не больше :data:`TREE_DIR_CAP` на каталог)
+    и так далее вглубь. Поэтому большой первый каталог не вытесняет файлы корня
+    (``README.md``, ``pyproject.toml``) и соседние каталоги. Урезанный каталог
+    помечается «… ещё N», нераскрытый — ``name/ …``.
 
     Скрытые файлы и каталоги (``.github``, ``.gitignore``) показываются,
     служебные каталоги (``.git``, ``node_modules``…) и исключённое ``.gitignore`` — нет.
     """
     root = root.resolve()
-    lines: list[str] = []
-    count = 0
 
     def is_real_dir(p: Path) -> bool:
         # симлинки на каталоги не раскрываем (возможны циклы и выход из корня)
         return p.is_dir() and not p.is_symlink()
 
-    def walk(directory: Path, rel_dir: str, stack: IgnoreStack, prefix: str) -> None:
-        nonlocal count
+    def listing(directory: Path, rel_dir: str, stack: IgnoreStack) -> list[tuple[str, bool]]:
         try:
             entries = sorted(
                 directory.iterdir(), key=lambda e: (not is_real_dir(e), e.name.lower())
             )
         except OSError:
-            return
+            return []
+        kept = []
         for e in entries:
-            if count >= max_entries:
-                return
             is_dir = is_real_dir(e)
             rel = f"{rel_dir}/{e.name}" if rel_dir else e.name
             if is_dir and is_ignored_dir(e.name):
                 continue
             if stack.is_ignored(rel, is_dir=is_dir):
                 continue
-            count += 1
-            if is_dir:
-                lines.append(f"{prefix}{e.name}/")
-                walk(e, rel, stack.enter(root, rel), prefix + "  ")
-            else:
-                lines.append(f"{prefix}{e.name}")
+            kept.append((e.name, is_dir))
+        return kept
 
-    walk(root, "", root_stack(root), "")
-    if count >= max_entries:
+    shown: dict[str, list[tuple[str, bool]]] = {}  # каталог → показанные записи
+    hidden: dict[str, int] = {}  # каталог → сколько записей не показано
+    budget = max_entries
+    level = [(root, "", root_stack(root))]
+    depth = 0
+    while level and budget > 0:
+        # Непустых каталогов сверх лимита не раскрыть всё равно — дальше не читаем
+        # (пустые и целиком исключённые лимит не тратят и не обрывают перебор).
+        listed: list[list[tuple[str, bool]]] = []
+        nonempty = 0
+        for d, rel, stack in level:
+            if nonempty >= budget:
+                break
+            listed.append(listing(d, rel, stack))
+            nonempty += bool(listed[-1])
+        level = level[: len(listed)]
+        cap = budget if depth == 0 else TREE_DIR_CAP
+        shares = _shares([min(len(entries), cap) for entries in listed], budget)
+        next_level = []
+        for (directory, rel_dir, stack), entries, share in zip(level, listed, shares, strict=True):
+            shown[rel_dir] = entries[:share]
+            if len(entries) > share:
+                hidden[rel_dir] = len(entries) - share
+            for name, is_dir in shown[rel_dir]:
+                if is_dir:
+                    rel = f"{rel_dir}/{name}" if rel_dir else name
+                    next_level.append((directory / name, rel, stack.enter(root, rel)))
+        budget -= sum(shares)
+        level = next_level
+        depth += 1
+
+    lines: list[str] = []
+    truncated = bool(hidden)
+
+    def render(rel_dir: str, prefix: str) -> None:
+        nonlocal truncated
+        for name, is_dir in shown.get(rel_dir, []):
+            if not is_dir:
+                lines.append(f"{prefix}{name}")
+                continue
+            rel = f"{rel_dir}/{name}" if rel_dir else name
+            if rel in shown:
+                lines.append(f"{prefix}{name}/")
+                render(rel, prefix + "  ")
+            else:
+                truncated = True
+                lines.append(f"{prefix}{name}/ …")
+        if hidden.get(rel_dir):
+            lines.append(f"{prefix}… ещё {hidden[rel_dir]}")
+
+    render("", "")
+    if truncated:
         lines.append(TREE_TRUNCATED)
     return "\n".join(lines)

@@ -29,6 +29,11 @@ from devassist.llm.base import LLMError
 from devassist.ui.console import Console
 from devassist.ui.format import mode_badge
 
+TLS_OFF_WARNING = (
+    "проверка TLS-сертификата GigaChat выключена — ключ можно перехватить подменой "
+    "сервера; задайте GIGACHAT_CA_BUNDLE (корневой сертификат Минцифры)"
+)
+
 
 def status_of(agent: Agent) -> StatusInfo:
     """Данные для статус-строки (вычисляются при каждой отрисовке приглашения)."""
@@ -89,7 +94,7 @@ def run_repl(
     его последний обмен.
 
     ``models`` — каталог моделей для ``/model``; по умолчанию с настоящей строкой
-    ввода список загружается в фоне. Окно контекста незамеренной модели замеряется
+    ввода список загружается в фоне. Замер окна незамеренной модели предлагается
     до первого ввода (:func:`~devassist.cli.models.ensure_context_window`)."""
     if interrupt is None:
         interrupt = EscInterrupt(enabled=None if read_input is None else False)
@@ -116,16 +121,26 @@ def run_repl(
         auto_approve=agent.config.auto_approve,
         mode=agent.mode,
     )
+    cfg = agent.config
+    if cfg.auth_mode == "oauth" and not cfg.verify_ssl:
+        ui.warn(TLS_OFF_WARNING)
     if resumed is not None:
         ui.chat_resumed(resumed, agent.conversation.messages)
     # Ввод не принимается, пока строится индекс (Esc/Ctrl+C — отменить построение).
     if index_on_start:
         ensure_index(agent.workspace, ui, esc)
-    ensure_context_window(agent, ui, interrupt=esc)
+    declined: set[str] = set()  # замер окна отклонён — до конца сессии не спрашиваем
+    ensure_context_window(agent, ui, interrupt=esc, declined=declined)
     if models is not None:
         models.start()  # после замера: не делить с ним соединение; ввод сети не ждёт
     ctx = CommandContext(
-        agent=agent, ui=ui, commands=commands, chats=chats, interrupt=esc, models=models
+        agent=agent,
+        ui=ui,
+        commands=commands,
+        chats=chats,
+        interrupt=esc,
+        models=models,
+        declined_windows=declined,
     )
     typeahead = esc.take_typeahead()  # набранное во время хода — в следующую строку ввода
 

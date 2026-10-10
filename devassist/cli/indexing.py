@@ -65,10 +65,20 @@ def run_indexing(
     return refreshed, stats
 
 
+NOT_A_REPO_NOTE = (
+    "проект не в git-репозитории — индекс не строится автоматически (/index — построить)"
+)
+
+
 def ensure_index(
     workspace: Workspace, ui: Console, interrupt: AbstractContextManager[object] | None = None
 ) -> None:
-    """Строит индекс, если его нет или прошлое построение не завершилось."""
+    """Строит индекс, если его нет или прошлое построение не завершилось.
+
+    Только для проектов в git-репозитории: запуск в домашнем или другом
+    «не проектном» каталоге иначе обходил бы всё его дерево при каждом старте.
+    Вне репозитория индекс строится по ``/index`` и по требованию инструментов.
+    """
     index = ProjectIndex(workspace)
     try:
         if index.is_complete():
@@ -77,6 +87,9 @@ def ensure_index(
         pass  # повреждённая база пересоздаётся при построении
     finally:
         index.close()
+    if not workspace.in_git_repo():
+        ui.system(NOT_A_REPO_NOTE)
+        return
     result = run_indexing(index, ui, interrupt)
     if result is not None:
         refreshed, stats = result

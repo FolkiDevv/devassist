@@ -11,7 +11,8 @@
   передаётся пользователю инструментом ``exit_plan_mode``.
 
 Решение по конкретному вызову принимает :func:`decide` — единственное место, где
-сводятся вместе режим, уровень риска операции, вид инструмента и ``-y``.
+сводятся вместе режим, уровень риска операции, вид инструмента, ``-y`` и
+``--yes-all``.
 """
 
 from __future__ import annotations
@@ -85,19 +86,26 @@ class Decision(Enum):
 
 
 def decide(
-    mode: PermissionMode, risk: RiskLevel, kind: ToolKind, *, auto_approve: bool
+    mode: PermissionMode,
+    risk: RiskLevel,
+    kind: ToolKind,
+    *,
+    auto_approve: bool,
+    yes_all: bool = False,
 ) -> Decision:
     """Как поступить с вызовом инструмента.
 
     Чтение разрешено всегда. В режиме плана изменения запрещены даже с ``-y``;
     исключение — команды shell: они нужны для исследования (тесты, просмотр) и
-    подтверждаются, как в ручном режиме.
+    подтверждаются, как в ручном режиме. ``-y`` (``auto_approve``) снимает вопросы,
+    кроме опасных операций (``rm -rf``, ``git reset --hard``…) — их без вопроса
+    выполняет только явный ``--yes-all``.
     """
     if risk < RiskLevel.WRITE:
         return Decision.ALLOW
     if mode is PermissionMode.PLAN and kind is not ToolKind.COMMAND:
         return Decision.BLOCK
-    if auto_approve:
+    if auto_approve and (risk < RiskLevel.DANGEROUS or yes_all):
         return Decision.ALLOW
     if mode is PermissionMode.ACCEPT_EDITS and kind is ToolKind.EDIT:
         return Decision.ALLOW

@@ -17,10 +17,12 @@
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from prompt_toolkit import PromptSession
@@ -167,6 +169,10 @@ class LazyFileHistory(FileHistory):
             return
         try:
             self._workspace.ensure_data_dir()
+            path = Path(self.filename)
+            if not path.exists():
+                # В истории бывают вставленные секреты — права как у чатов (0600).
+                os.close(os.open(path, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600))
             super().store_string(string)
         except OSError:
             self._persist = False

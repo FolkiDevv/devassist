@@ -29,6 +29,13 @@ DOCS = {
     "unclosed_fence": "Код:\n\n```\nprint(1)\n",
     "no_trailing_newline": "Абзац один.\n\nАбзац два без перевода строки",
     "loose_list_continuation": "- пункт\n\n  продолжение пункта\n\n- второй\n\nконец",
+    "code_blocks_table_nested_list": (
+        "Шаги:\n\n```py\nx = 1\n```\n\n```bash\nls\n```\n\n1. a\n2. b\n\n"
+        "| a | b |\n|---|---|\n| 1 | 2 |\n\n- x\n  - y\n    - z\n\nКонец.\n"
+    ),
+    "heading_then_list": "## H\n- a\n- b\n### H3\ntext\n",
+    "quote_with_list_and_hr": "> q1\n>\n> - item\n\npara\n\n***\n\nend\n",
+    "table_after_table": "| a |\n|---|\n| 1 |\n\n| b |\n|---|\n| 2 |\n\n---\n# H\n",
 }
 
 
@@ -94,3 +101,15 @@ def test_empty_answer():
     stream = MarkdownStream(_console())
     stream.feed("  \n")
     assert stream.finish() == []
+
+
+def test_each_block_is_rendered_once_with_one_block_of_context(monkeypatch):
+    """Новый блок не перерисовывает весь напечатанный ответ (раньше — O(n²))."""
+    doc = "".join(f"Абзац {i}.\n\n" for i in range(40))
+    stream = MarkdownStream(_console())
+    sizes: list[int] = []
+    render = stream.render
+    monkeypatch.setattr(stream, "render", lambda src: (sizes.append(len(src)), render(src))[1])
+    for ch in doc:
+        stream.feed(ch)
+    assert sizes and max(sizes) < 40  # контекст — один блок, а не весь префикс

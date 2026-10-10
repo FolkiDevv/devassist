@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import os
+import re
 import ssl
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -53,10 +54,22 @@ def read_dotenv(path: Path) -> dict[str, str]:
         key = key.strip()
         if key.startswith("export "):
             key = key[len("export ") :].strip()
-        value = value.strip().strip('"').strip("'")
         if key:
-            values[key] = value
+            values[key] = _dotenv_value(value)
     return values
+
+
+_INLINE_COMMENT_RE = re.compile(r"\s#")
+
+
+def _dotenv_value(raw: str) -> str:
+    """Значение из .env: в кавычках — до парной закрывающей (остальное — комментарий),
+    без кавычек — до « #» (``MODEL=GigaChat-2-Max # быстрая``)."""
+    value = raw.strip()
+    if value[:1] in ("'", '"'):
+        end = value.find(value[0], 1)
+        return value[1:end] if end != -1 else value
+    return _INLINE_COMMENT_RE.split(value, maxsplit=1)[0].rstrip()
 
 
 def load_environment(
@@ -165,11 +178,15 @@ class Config:
     auth_url: str = DEFAULT_AUTH_URL
     base_url: str = DEFAULT_OAUTH_URL
     verify_ssl: bool = False
+    # Корневой сертификат для проверки сервера (Минцифры для API Сбера); задан —
+    # проверка TLS включена по умолчанию.
+    ca_bundle: str | None = None
     timeout: int = 120
 
     # --- Агент / окружение ---
     project_root: Path = field(default_factory=Path.cwd)
-    auto_approve: bool = False  # пропускать подтверждения (опасно)
+    auto_approve: bool = False  # пропускать подтверждения, кроме опасных операций (-y)
+    yes_all: bool = False  # пропускать и подтверждения опасных операций (--yes-all)
     # Начальный режим разрешений (ручной / авто-правки / план); в работе режим
     # меняется в агенте (Shift+Tab, /mode).
     mode: PermissionMode = PermissionMode.MANUAL
@@ -190,6 +207,9 @@ class Config:
     compact_threshold: float = 0.8
     # Сохранять чаты в .devassist/chats/ (продолжение — /resume, --continue).
     save_chats: bool = True
+    # Предлагать замер окна незамеренной модели (пробы оплачиваются); False — только
+    # по --test-context.
+    auto_measure: bool = True
 
     @classmethod
     def load(
@@ -198,6 +218,7 @@ class Config:
         project_root: Path | None = None,
         model: str | None = None,
         auto_approve: bool = False,
+        yes_all: bool = False,
         mode: PermissionMode | None = None,
         stream: bool = True,
         save_chats: bool = True,
@@ -220,6 +241,9 @@ class Config:
         base_url = env.get("GIGACHAT_URL")
         if not base_url:
             base_url = DEFAULT_MTLS_URL if (not access_key and cert and key) else DEFAULT_OAUTH_URL
+        ca_bundle = env.get("GIGACHAT_CA_BUNDLE") or None
+        if ca_bundle and not Path(ca_bundle).expanduser().is_file():
+            raise ConfigError(f"GIGACHAT_CA_BUNDLE: файл не найден: {ca_bundle}")
 
         return cls(
             access_key=access_key,
@@ -229,10 +253,12 @@ class Config:
             model=model or env.get("GIGACHAT_MODEL") or DEFAULT_MODEL,
             auth_url=env.get("GIGACHAT_AUTH_URL") or DEFAULT_AUTH_URL,
             base_url=base_url.rstrip("/"),
-            verify_ssl=_env_bool(env, "GIGACHAT_VERIFY_SSL", False),
+            verify_ssl=_env_bool(env, "GIGACHAT_VERIFY_SSL", ca_bundle is not None),
+            ca_bundle=str(Path(ca_bundle).expanduser()) if ca_bundle else None,
             timeout=_env_int(env, "GIGACHAT_TIMEOUT", 120),
             project_root=root,
-            auto_approve=auto_approve,
+            auto_approve=auto_approve or yes_all,
+            yes_all=yes_all,
             mode=mode or _env_mode(env, "DEVASSIST_MODE"),
             stream=stream,
             temperature=_env_float(env, "DEVASSIST_TEMPERATURE", 0.2, lo=0.0, hi=2.0),
@@ -243,6 +269,7 @@ class Config:
             )
             / 100,
             save_chats=save_chats and _env_bool(env, "DEVASSIST_SAVE_CHATS", True),
+            auto_measure=_env_bool(env, "DEVASSIST_AUTO_MEASURE", True),
         )
 
     @property
@@ -262,10 +289,12 @@ class Config:
         """Значение для httpx ``verify=``.
 
         Для mTLS строит SSL-контекст с клиентским сертификатом (cert+key); файлы
-        проверяются на существование и загружаемость. Для OAuth возвращает флаг
-        проверки TLS-сертификата сервера (verify_ssl).
+        проверяются на существование и загружаемость. Для OAuth — флаг проверки
+        TLS-сертификата сервера (verify_ssl) или контекст с ``ca_bundle``.
         """
         if self.auth_mode != "mtls":
+            if self.verify_ssl and self.ca_bundle:
+                return ssl.create_default_context(cafile=self.ca_bundle)
             return self.verify_ssl
 
         cert_path = Path(self.cert)  # type: ignore[arg-type]
@@ -280,6 +309,12 @@ class Config:
             # Внутренний контур: самоподписанный серверный сертификат.
             context.check_hostname = False
             context.verify_mode = ssl.CERT_NONE
+        elif self.ca_bundle:
+            context.load_verify_locations(cafile=self.ca_bundle)
+        else:
+            # Голый SSLContext не знает ни одного корневого сертификата: без этого
+            # проверка сервера с GIGACHAT_VERIFY_SSL=1 не проходила бы никогда.
+            context.load_default_certs()
         try:
             context.load_cert_chain(certfile=str(cert_path), keyfile=str(key_path))
         except ssl.SSLError as e:

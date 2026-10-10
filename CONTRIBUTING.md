@@ -91,6 +91,10 @@ make test       # быстрые офлайн-тесты
 - Нужен ответ пользователя — используйте `ctx.ask_user` (как `tools/ask_user.py`);
   `None` в контексте или `QuestionsUnavailable` — спросить некого.
 - Внешние процессы запускайте только через `tools/process.run_process`.
+- Файлы проекта читайте для правки через `tools/fs.load_existing` (текст с `\n`,
+  исходные переводы строк и BOM — в `TextFile`), пишите — `write_atomic(path,
+  file.encode(text))`; путь для записи — только `_writable_path` (песочница,
+  `.devassist/`, `.git/`).
 - Зарегистрируйте инструмент в `build_default_registry()`.
 - Нужны знания о структуре кода — открывайте `ProjectIndex(ctx.workspace)` и
   обновляйте его (`refresh()`, для одного файла/каталога — `refresh(path)`) перед

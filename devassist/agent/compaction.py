@@ -168,7 +168,9 @@ def _recent_chunks(messages: Sequence[Message], budget_tokens: int) -> list[list
     return kept
 
 
-def _request_text(previous: str | None, chunk: str, instructions: str, omitted: bool) -> str:
+def _request_text(
+    previous: str | None, chunk: str, instructions: str, omitted: bool, max_chars: int
+) -> str:
     parts = []
     if previous:
         parts.append(
@@ -180,14 +182,30 @@ def _request_text(previous: str | None, chunk: str, instructions: str, omitted: 
     parts.append(f"Фрагмент диалога для сжатия:\n{chunk}")
     if instructions.strip():
         parts.append(f"Пожелания пользователя к краткому содержанию: {instructions.strip()}")
-    parts.append("Составь краткое содержание по правилам.")
+    parts.append(
+        f"Составь краткое содержание по правилам. Объём — не больше {max_chars} символов "
+        f"(~{max(max_chars // CHARS_PER_WORD, 1)} слов)."
+    )
     return "\n\n".join(parts)
 
 
+CHARS_PER_WORD = 7  # русский текст с пробелами — для подсказки модели об объёме
+CLIPPED_MARK = "\n…(краткое содержание обрезано)"
+
+
 def _clip_summary(text: str, max_chars: int) -> str:
+    """Резюме не длиннее ``max_chars``: режется с конца, по границе строки.
+
+    Модель кладёт важное первым (текущее состояние, следующий шаг), поэтому
+    теряется хвост, а не начало, и строка не обрывается на полуслове.
+    """
     if len(text) <= max_chars:
         return text
-    return text[:max_chars].rstrip() + "\n…(краткое содержание обрезано)"
+    head = text[:max_chars]
+    cut = head.rfind("\n")
+    if cut >= max_chars // 2:
+        head = head[:cut]
+    return head.rstrip() + CLIPPED_MARK
 
 
 def summarize(
@@ -230,7 +248,7 @@ def summarize(
             Message(
                 role="user",
                 content=_request_text(
-                    summary, "\n\n".join(chunk), instructions, omitted and i == 0
+                    summary, "\n\n".join(chunk), instructions, omitted and i == 0, max_chars
                 ),
             ),
         ]

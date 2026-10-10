@@ -7,7 +7,7 @@ import os
 import pytest
 
 from devassist.agent.prompts import SYSTEM_PROMPT, build_system_prompt, nested_instructions_prompt
-from devassist.project.files import build_file_tree, glob_match, walk_files
+from devassist.project.files import TREE_TRUNCATED, build_file_tree, glob_match, walk_files
 from devassist.project.instructions import (
     INSTRUCTION_FILES,
     InstructionFile,
@@ -96,6 +96,54 @@ def test_file_tree_shows_dotfiles_hides_service_dirs(tmp_path):
     assert ".github/" in tree
     for hidden in ("node_modules", ".git/", ".devassist"):
         assert hidden not in tree
+
+
+def test_file_tree_keeps_root_files_when_a_directory_is_big(tmp_path):
+    for i in range(300):
+        _make(tmp_path, f"big/f{i:03d}.py")
+    _make(tmp_path, "README.md")
+    _make(tmp_path, "pyproject.toml")
+    _make(tmp_path, "zzz/main.py")
+    tree = build_file_tree(tmp_path, max_entries=50)
+    lines = tree.splitlines()
+    for name in ("big/", "README.md", "pyproject.toml", "zzz/", "  main.py"):
+        assert name in lines
+    assert "  … ещё 270" in lines  # big/ урезан до TREE_DIR_CAP
+    assert tree.endswith(TREE_TRUNCATED)
+
+
+def test_file_tree_marks_unexpanded_directories(tmp_path):
+    for d in range(5):
+        _make(tmp_path, f"d{d}/sub/x.py")
+    tree = build_file_tree(tmp_path, max_entries=7)
+    assert "d0/" in tree and "  sub/ …" in tree and tree.endswith(TREE_TRUNCATED)
+
+
+def test_empty_directory_does_not_hide_siblings_from_the_budget(tmp_path):
+    (tmp_path / "a").mkdir()
+    _make(tmp_path, "b/main.py")
+    tree = build_file_tree(tmp_path, max_entries=3)
+    assert "  main.py" in tree.splitlines()
+
+
+def test_small_file_tree_is_complete(tmp_path):
+    _make(tmp_path, "src/pkg/a.py")
+    _make(tmp_path, "src/b.py")
+    _make(tmp_path, "README.md")
+    assert build_file_tree(tmp_path) == "src/\n  pkg/\n    a.py\n  b.py\nREADME.md"
+
+
+def test_in_git_repo(tmp_path):
+    from devassist.project.workspace import Workspace
+
+    assert not Workspace(tmp_path).in_git_repo()
+    (tmp_path / "repo" / ".git").mkdir(parents=True)
+    (tmp_path / "repo" / "sub").mkdir()
+    assert Workspace(tmp_path / "repo").in_git_repo()
+    assert Workspace(tmp_path / "repo" / "sub").in_git_repo()  # предок — репозиторий
+    (tmp_path / "wt").mkdir()
+    (tmp_path / "wt" / ".git").write_text("gitdir: ../repo/.git/worktrees/wt\n")
+    assert Workspace(tmp_path / "wt").in_git_repo()  # рабочее дерево: .git — файл
 
 
 # ------------------------------ instructions ------------------------------ #

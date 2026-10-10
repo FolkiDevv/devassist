@@ -70,6 +70,15 @@ def test_help_lists_all_commands(cli_env, capsys):
     assert "/quit" in out
 
 
+def test_unknown_command_suggests_closest(cli_env, capsys):
+    _, _, commands, ctx, _ = cli_env
+    assert commands.dispatch("/hlep", ctx) is True
+    assert "неизвестная команда: /hlep — возможно, /help?" in _out(capsys)
+    commands.dispatch("/zzzz", ctx)
+    out = _out(capsys)
+    assert "неизвестная команда: /zzzz (список — /help)" in out and "возможно" not in out
+
+
 def test_aliases_and_case_insensitive(cli_env, capsys):
     _, _, commands, ctx, _ = cli_env
     assert commands.get("/Q") is commands.get("/exit")
@@ -145,6 +154,7 @@ def oneshot(tmp_path, monkeypatch):
         "DEVASSIST_MODE",
         "DEVASSIST_AUTO_COMPACT",
         "DEVASSIST_COMPACT_THRESHOLD",
+        "DEVASSIST_AUTO_MEASURE",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -208,6 +218,7 @@ def test_repl_prefills_typeahead_and_uses_esc(cli_env, capsys):
     import contextlib
 
     agent, ui, commands, _, provider = cli_env
+    (agent.workspace.root / ".git").mkdir()  # автоиндекс при старте — только в репозитории
 
     class FakeEsc:
         enabled = True
@@ -512,6 +523,7 @@ def _index_complete(agent) -> bool:
 
 def test_repl_builds_index_before_first_input(cli_env, capsys):
     agent, ui, commands, _, _ = cli_env
+    (agent.workspace.root / ".git").mkdir()  # автоиндекс — только в git-репозитории
     (agent.workspace.root / "mod.py").write_text("def f():\n    pass\n", encoding="utf-8")
     seen = []
 
@@ -529,6 +541,31 @@ def test_repl_builds_index_before_first_input(cli_env, capsys):
     assert "индексирую" not in _out(capsys)
 
 
+def test_repl_does_not_index_outside_git_repo(cli_env, capsys):
+    """Запуск в $HOME или другой не-проектной папке не обходит всё её дерево."""
+    agent, ui, commands, ctx, _ = cli_env
+    (agent.workspace.root / "mod.py").write_text("def f():\n    pass\n", encoding="utf-8")
+    assert run_repl(agent, ui, commands, read_input=_reader("/exit")) == 0
+    out = _out(capsys)
+    assert "не в git-репозитории" in out and "индексирую" not in out
+    assert not (agent.workspace.root / ".devassist").exists()
+    commands.dispatch("/index", ctx)  # вручную — строится
+    assert "индекс проекта: 1 файл, 1 определение" in _out(capsys)
+
+
+def test_repl_warns_when_tls_verification_is_off(tmp_path, capsys):
+    from dataclasses import replace
+
+    from devassist.cli.repl import TLS_OFF_WARNING
+
+    agent, ui, ctx, _ = _measure_env(tmp_path, auto_approve=True)
+    run_repl(agent, ui, ctx.commands, read_input=_reader("/exit"), index_on_start=False)
+    assert " ".join(TLS_OFF_WARNING.split()[:4]) in _out(capsys)
+    agent._cfg = replace(agent.config, verify_ssl=True)
+    run_repl(agent, ui, ctx.commands, read_input=_reader("/exit"), index_on_start=False)
+    assert "TLS" not in _out(capsys)
+
+
 def test_repl_without_index_on_start(cli_env):
     agent, ui, commands, _, _ = cli_env
     run_repl(agent, ui, commands, read_input=_reader("/exit"), index_on_start=False)
@@ -539,6 +576,7 @@ def test_cancelled_index_build_lets_user_continue(cli_env, capsys, monkeypatch):
     from devassist.project import index as index_mod
 
     agent, ui, commands, _, _ = cli_env
+    (agent.workspace.root / ".git").mkdir()
     for i in range(3):
         (agent.workspace.root / f"m{i}.py").write_text("x = 1\n", encoding="utf-8")
     real_refresh = index_mod.ProjectIndex.refresh
@@ -566,6 +604,7 @@ def test_index_build_error_does_not_block_repl(cli_env, capsys, monkeypatch):
     from devassist.project import index as index_mod
 
     agent, ui, commands, _, _ = cli_env
+    (agent.workspace.root / ".git").mkdir()
 
     def broken(self):
         raise OSError("только чтение")
@@ -636,29 +675,95 @@ def test_test_context_reports_failed_save(tmp_path, oneshot, capsys, monkeypatch
     assert "не сохранён" in out and "записано в" not in out
 
 
-def test_oneshot_measures_unknown_window_once(tmp_path, oneshot, capsys, monkeypatch):
+def test_oneshot_does_not_measure_unknown_window(tmp_path, oneshot, capsys, monkeypatch):
+    """Замер оплачивается — в -p (в том числе в CI) он не делается, только подсказка."""
     provider = WindowProvider(8_192, [text_turn("ok")])
     oneshot(provider)
     assert _main(tmp_path, "-m", "M1", "-p", "x") == 0
-    assert "не замерено — замеряю" in capsys.readouterr().out and provider.measured
-    provider = WindowProvider(8_192, [text_turn("ok")])
-    oneshot(provider)
-    assert _main(tmp_path, "-m", "M1", "-p", "x") == 0  # окно уже в ~/.devassist
-    assert provider.measured == [] and "замеряю" not in capsys.readouterr().out
-    monkeypatch.setenv("DEVASSIST_CONTEXT_TOKENS", "8000")  # явный бюджет — замер не нужен
-    oneshot(provider)
-    assert _main(tmp_path, "-m", "M2", "-p", "x") == 0
+    out = " ".join(capsys.readouterr().out.split())  # без переносов по ширине терминала
     assert provider.measured == []
+    assert "окно контекста M1 не замерено — считаем 32k" in out
+    assert "devassist --test-context M1" in out
+    monkeypatch.setenv("DEVASSIST_CONTEXT_TOKENS", "8000")  # явный бюджет — и подсказка не нужна
+    oneshot(WindowProvider(8_192, [text_turn("ok")]))
+    assert _main(tmp_path, "-m", "M2", "-p", "x") == 0
+    assert "не замерено" not in capsys.readouterr().out
 
 
-def test_failed_measurement_falls_back(tmp_path, oneshot, capsys, _isolated_home):
+def _measure_env(tmp_path, *, auto_approve=False, window=16_384, **provider_kw):
+    cfg = Config(access_key="x", project_root=tmp_path, stream=False, auto_approve=auto_approve)
+    provider = WindowProvider(window, [text_turn("ответ")], **provider_kw)
+    ui = Console(no_color=True)
+    agent = Agent(provider, build_default_registry(), cfg, ui)
+    ctx = CommandContext(agent=agent, ui=ui, commands=default_commands())
+    return agent, ui, ctx, provider
+
+
+def test_repl_asks_before_measuring(tmp_path, capsys, monkeypatch):
+    agent, ui, ctx, provider = _measure_env(tmp_path)
+    questions = []
+    monkeypatch.setattr(ui, "interactive", lambda: True)
+    monkeypatch.setattr(ui, "ask", lambda q, **kw: questions.append(q) or False)
+    run_repl(agent, ui, ctx.commands, read_input=_reader("/model Qwen-14B", "/exit"))
+    out = _out(capsys)
+    assert provider.measured == []
+    assert len(questions) == 2  # при старте — для текущей модели, затем для Qwen-14B
+    assert "оплачиваются" in questions[0] and "пока считаем окно" in out
+    # отказ запомнен: повторный выбор той же модели не спрашивает снова
+    ctx.declined_windows.update({agent.model})
+    commands = ctx.commands
+    commands.dispatch(f"/model {agent.model}", ctx)
+    assert len(questions) == 2
+    monkeypatch.setattr(ui, "ask", lambda q, **kw: questions.append(q) or True)
+    commands.dispatch("/model Qwen-32B", ctx)
+    assert {model for model, _ in provider.measured} == {"Qwen-32B"}
+    assert 16_000 <= agent.context_window <= 16_384
+
+
+def test_repl_without_terminal_does_not_ask(tmp_path, capsys, monkeypatch):
+    agent, ui, ctx, provider = _measure_env(tmp_path)
+    monkeypatch.setattr(ui, "interactive", lambda: False)
+    monkeypatch.setattr(ui, "ask", lambda q, **kw: pytest.fail("вопрос без терминала"))
+    run_repl(agent, ui, ctx.commands, read_input=_reader("/exit"))
+    assert provider.measured == [] and "--test-context" in _out(capsys)
+
+
+def test_auto_measure_can_be_disabled(tmp_path, capsys, monkeypatch):
+    from dataclasses import replace
+
+    from devassist.cli.models import ensure_context_window
+
+    agent, ui, ctx, provider = _measure_env(tmp_path, auto_approve=True)
+    agent._cfg = replace(agent.config, auto_measure=False)
+    ensure_context_window(agent, ui)
+    assert provider.measured == [] and _out(capsys) == ""
+    monkeypatch.setenv("DEVASSIST_AUTO_MEASURE", "0")
+    assert Config.load(project_root=tmp_path).auto_measure is False
+
+
+def test_failed_measurement_falls_back(tmp_path, capsys, _isolated_home):
     from devassist.llm.base import LLMError
 
-    oneshot(WindowProvider(8_192, [text_turn("ok")], error=LLMError("сбой")))
-    assert _main(tmp_path, "-m", "M1", "-p", "x") == 0
-    out = capsys.readouterr().out
+    agent, ui, ctx, provider = _measure_env(tmp_path, auto_approve=True, error=LLMError("сбой"))
+    ctx.commands.dispatch("/model M1", ctx)
+    out = _out(capsys)
     assert "не удалось замерить окно M1" in out and "пока считаем окно M1 равным 32k" in out
     assert _models_json(_isolated_home) == {}
+
+
+def test_oneshot_exit_code_when_stopped_by_guard(tmp_path, oneshot):
+    missing = tool_turn("read_file", {"path": "нет.txt"})
+    oneshot(ScriptedProvider([missing] * 4 + [text_turn("не вышло")]))
+    assert _main(tmp_path, "-p", "прочитай") == app.EXIT_STOPPED == 3
+
+
+def test_oneshot_internal_error_is_reported(tmp_path, oneshot, capsys):
+    oneshot(ScriptedProvider([RuntimeError("сломалось")]))
+    assert _main(tmp_path, "-p", "вопрос") == 1
+    out = capsys.readouterr().out
+    assert "внутренняя ошибка: RuntimeError: сломалось" in out and "Traceback" not in out
+    (saved,) = _store(tmp_path).recent()  # чат с запросом всё равно сохранён
+    assert saved.title == "вопрос"
 
 
 @pytest.fixture
@@ -705,6 +810,8 @@ def test_model_command_lists_catalog(window_env, capsys, monkeypatch):
     assert "доступные модели" in out and "• Qwen-14B — окно не замерено" in out
     commands.dispatch("/model Unknown", ctx)
     assert "нет в списке доступных" in _out(capsys)
+    commands.dispatch("/model qwen-14b", ctx)  # регистр в имени модели исправляется
+    assert agent.model == "Qwen-14B" and "нет в списке" not in _out(capsys)
 
 
 def test_model_catalog_swallows_errors():

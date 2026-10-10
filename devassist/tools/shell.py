@@ -12,6 +12,8 @@ from devassist.tools.process import run_process, truncate_middle
 _MAX_OUTPUT = 30_000
 MIN_TIMEOUT = 1
 MAX_TIMEOUT = 600
+# Коды оболочки: команда не запускается (126) или не найдена (127).
+_SHELL_FAILURES = (126, 127)
 
 
 class RunShellParams(BaseModel):
@@ -63,9 +65,13 @@ class RunShellTool(Tool):
             summary = f"$ {params.command[:60]} → код {res.returncode}"
         note_text = "".join(f"\n[{n}]" for n in notes)
         content = f"{head}{note_text}\n{combined or '(пустой вывод)'}"
+        ok = res.returncode == 0 and not res.timed_out
         return ToolResult(
             content=content,
-            ok=res.returncode == 0 and not res.timed_out,
+            ok=ok,
             summary=summary,
+            # Ненулевой код (grep без совпадений, упавшие тесты) — результат, а не
+            # застревание; таймаут и «команда не найдена/не запускается» — сбой.
+            soft=not ok and not res.timed_out and res.returncode not in _SHELL_FAILURES,
             display=Display(combined, title=f"$ {params.command[:60]}") if combined else None,
         )

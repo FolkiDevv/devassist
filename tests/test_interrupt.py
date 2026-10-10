@@ -86,6 +86,32 @@ def test_escape_interrupts_main_thread_and_restores_terminal(pty_pair):
     assert termios.tcgetattr(slave) == before
 
 
+@pty_only
+def test_interrupted_exit_still_stops_reader_and_restores_terminal(pty_pair):
+    """SIGINT от Esc в самом конце хода прерывает ожидание блокировки в __exit__:
+    поток чтения всё равно останавливается, терминал восстанавливается."""
+    import termios
+
+    master, slave = pty_pair
+    before = termios.tcgetattr(slave)
+    esc = EscInterrupt(fd=slave, enabled=True, interrupt=lambda: None)
+
+    class Interrupted:
+        def __enter__(self):
+            raise KeyboardInterrupt
+
+        def __exit__(self, *exc):
+            return None
+
+    esc.__enter__()
+    thread = esc._thread
+    esc._lock = Interrupted()
+    with pytest.raises(KeyboardInterrupt):
+        esc.__exit__(None, None, None)
+    assert esc._thread is None and not thread.is_alive()
+    assert termios.tcgetattr(slave) == before
+
+
 @pytest.mark.parametrize("keys", [b"\x1b[A", b"abc\n"])
 @pty_only
 def test_other_keys_do_not_interrupt(pty_pair, keys):

@@ -46,8 +46,9 @@ def test_search_skips_ignored_binary_large_and_secrets(ctx):
     (ctx.root / "big.txt").write_text("needle\n" * 200_000, encoding="utf-8")
     s = SearchContentTool()
     out = s.run(s.parse({"pattern": "needle"}), ctx).content
-    files = sorted({line.split(":", 1)[0] for line in out.splitlines()})
+    files = sorted({ln.split(":", 1)[0] for ln in out.splitlines() if not ln.startswith("…")})
     assert files == [".env.example", "src/a.py"]
+    assert "пропущено больших файлов (>1 МБ): 1" in out  # модель знает, где не искали
 
 
 def test_search_glob_with_path(ctx):
@@ -149,6 +150,86 @@ def test_git_disallowed_subcommand(git_repo):
         g.run(g.parse({"subcommand": "push"}), git_repo)
 
 
+def test_git_command_disables_external_programs():
+    g = GitTool()
+    cmd = g._command(g.parse({"subcommand": "diff", "args": ["--", "a.py"]}))
+    assert cmd[:5] == ["git", "-c", "core.fsmonitor=false", "-c", "safe.bareRepository=explicit"]
+    assert cmd[5:] == ["diff", "--no-ext-diff", "--", "a.py"]
+    assert g._command(g.parse({"subcommand": "log"}))[5:] == [
+        "log",
+        "--no-ext-diff",
+        "--oneline",
+        "-n",
+        "20",
+    ]
+    stash = g._command(g.parse({"subcommand": "stash", "args": ["show", "-p"]}))
+    assert stash[5:] == ["stash", "show", "--no-ext-diff", "-p"]
+    assert g._command(g.parse({"subcommand": "status"}))[5:] == ["status"]
+
+
+def _marker_script(root, name):
+    script = root / f"{name}.sh"
+    marker = root / f"{name}.marker"
+    script.write_text(f'#!/bin/sh\ntouch "{marker}"\nexit 0\n', encoding="utf-8")
+    script.chmod(0o755)
+    return script, marker
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="sh-скрипты")
+def test_git_status_does_not_run_fsmonitor_hook(git_repo):
+    """Подменённый .git/config не запускает команду на `git status` (SAFE, без вопроса)."""
+    root = git_repo.root
+    hook, marker = _marker_script(root, "fsmonitor")
+    subprocess.run(["git", "config", "core.fsmonitor", str(hook)], cwd=root, check=True)
+    subprocess.run(["git", "status"], cwd=root, capture_output=True)
+    if not marker.exists():
+        pytest.skip("эта версия git не запускает fsmonitor-хук")
+    marker.unlink()
+    g = GitTool()
+    g.run(g.parse({"subcommand": "status"}), git_repo)
+    assert not marker.exists()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="sh-скрипты")
+def test_git_diff_does_not_run_external_diff(git_repo):
+    root = git_repo.root
+    _write(git_repo, "f.txt", "one\n")
+    subprocess.run(["git", "add", "f.txt"], cwd=root, check=True)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=root, check=True)
+    _write(git_repo, "f.txt", "two\n")
+    ext, marker = _marker_script(root, "extdiff")
+    subprocess.run(["git", "config", "diff.external", str(ext)], cwd=root, check=True)
+    subprocess.run(["git", "diff"], cwd=root, capture_output=True)
+    assert marker.exists()  # голый git внешнюю программу запускает
+    marker.unlink()
+    g = GitTool()
+    res = g.run(g.parse({"subcommand": "diff"}), git_repo)
+    assert not marker.exists()
+    assert "-one" in res.content and "+two" in res.content
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="sh-скрипты")
+def test_git_ignores_implicit_bare_repository(ctx):
+    """HEAD/config/objects обычными файлами в проекте не делают его bare-репозиторием."""
+    if subprocess.run(["git", "--version"], capture_output=True).returncode:
+        pytest.skip("нет git")
+    bare = ctx.root / "planted"
+    subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+    hook, marker = _marker_script(ctx.root, "planted")
+    subprocess.run(["git", "config", "core.fsmonitor", str(hook)], cwd=bare, check=True)
+    res = subprocess.run(
+        ["git", "-c", "safe.bareRepository=explicit", "status"], cwd=bare, capture_output=True
+    )
+    if res.returncode == 0:
+        pytest.skip("эта версия git не знает safe.bareRepository")
+    from devassist.project.workspace import Workspace
+    from devassist.tools.base import ToolContext
+
+    g = GitTool()
+    out = g.run(g.parse({"subcommand": "log"}), ToolContext(workspace=Workspace(bare)))
+    assert not out.ok and "safe.bareRepository" in out.content and not marker.exists()
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="FIFO")
 def test_search_skips_fifo(ctx):
     import os
@@ -176,3 +257,25 @@ def test_search_skips_symlinks_to_secrets(tmp_path):
     ctx = ToolContext(workspace=Workspace(tmp_path))
     result = SearchContentTool().run(SearchContentParams(pattern="s3cr3t"), ctx)
     assert "s3cr3t" not in result.content
+
+
+def test_git_describe_quotes_arguments():
+    g = GitTool()
+    params = g.parse({"subcommand": "commit", "args": ["-m", "fix bug"]})
+    assert g.describe(params) == "commit -m 'fix bug'"
+    assert g.preview(params, None).text == "$ git commit -m 'fix bug'"
+
+
+def test_search_limit_note_only_when_more_matches(ctx):
+    _write(ctx, "a.txt", "hit\n" * 3)
+    s = SearchContentTool()
+    exact = s.run(s.parse({"pattern": "hit", "max_results": 3}), ctx).content
+    assert "показаны первые" not in exact and exact.count("a.txt:") == 3
+    more = s.run(s.parse({"pattern": "hit", "max_results": 2}), ctx).content
+    assert more.count("a.txt:") == 2 and "показаны первые 2 совпадений" in more
+
+
+def test_search_line_numbers_match_read_file(ctx):
+    _write(ctx, "f.txt", "a\x0cb\nneedle\n")
+    s = SearchContentTool()
+    assert s.run(s.parse({"pattern": "needle"}), ctx).content == "f.txt:2:needle"
