@@ -691,3 +691,40 @@ def test_file_with_xattrs_is_edited_in_place(ctx):
     inode = path.stat().st_ino
     _edit(ctx, "acl.txt", "x = 1", "x = 2")
     assert path.stat().st_ino == inode and os.getxattr(path, "user.devassist") == b"1"
+
+
+def _fake_git_dir(directory):
+    (directory / "objects").mkdir(parents=True)
+    (directory / "refs").mkdir()
+    (directory / "HEAD").write_text("ref: refs/heads/main\n", encoding="utf-8")
+    (directory / "config").write_text("[core]\n", encoding="utf-8")
+
+
+def test_nested_repository_git_dir_is_not_writable(ctx):
+    """Вложенный репозиторий, чей .git — симлинк или gitdir:-файл на каталог в проекте:
+    ни путь через .git, ни прямой путь к его каталогу git не пишутся."""
+    import os
+
+    if os.name == "nt":
+        pytest.skip("симлинки")
+    _fake_git_dir(ctx.root / "nested" / "store")
+    (ctx.root / "nested" / ".git").symlink_to(ctx.root / "nested" / "store")
+    _fake_git_dir(ctx.root / "store2")
+    (ctx.root / "other").mkdir()
+    (ctx.root / "other" / ".git").write_text("gitdir: ../store2\n", encoding="utf-8")
+    _fake_git_dir(ctx.root / "bare.git")
+    w = WriteFileTool()
+    for path in (
+        "nested/.git/config",
+        "nested/store/config",
+        "nested/store/hooks/pre-commit",
+        "store2/config",
+        "bare.git/config",
+    ):
+        with pytest.raises(ToolError, match="Внутренности git"):
+            w.preview(w.parse({"path": path, "content": "x"}), ctx)
+    assert (ctx.root / "nested" / "store" / "config").read_text(encoding="utf-8") == "[core]\n"
+    # каталог с одним файлом HEAD — не каталог git
+    (ctx.root / "docs").mkdir()
+    (ctx.root / "docs" / "HEAD").write_text("x", encoding="utf-8")
+    assert w.run(w.parse({"path": "docs/HEAD", "content": "y"}), ctx).ok

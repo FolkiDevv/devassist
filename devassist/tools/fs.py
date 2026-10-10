@@ -202,19 +202,39 @@ def _git_dirs(root: Path) -> list[Path]:
     return []
 
 
-def _is_git_internal(root: Path, path: Path) -> bool:
-    """Разрешённый путь внутри корня — сам ``.git`` или лежит в каталоге git.
+def _looks_like_git_dir(directory: Path) -> bool:
+    """Каталог устроен как каталог git (обычный ``.git``, bare-репозиторий или цель
+    ``gitdir:``/симлинка вложенного репозитория): ``HEAD``, ``objects/``, ``refs/``."""
+    try:
+        return (
+            (directory / "HEAD").is_file()
+            and (directory / "objects").is_dir()
+            and (directory / "refs").is_dir()
+        )
+    except OSError:
+        return False
 
-    Компонент ``.git`` сравнивается без учёта регистра (``.GIT`` на macOS/Windows),
-    на любой глубине (вложенные репозитории); ``.github``, ``.gitignore`` — обычные.
+
+def _is_git_internal(root: Path, path: Path, raw: str = "") -> bool:
+    """Путь внутри корня — сам ``.git`` или лежит в каталоге git.
+
+    Проверяются и путь как его прислали (``raw``: ``nested/.git/config``, даже если
+    ``nested/.git`` — симлинк, который раскрытие уберёт), и раскрытый: компонент
+    ``.git`` без учёта регистра (``.GIT`` на macOS/Windows) на любой глубине; каталоги
+    по пути от корня, устроенные как каталог git (цель симлинка или ``gitdir:``
+    вложенного репозитория); каталог git корня. ``.github``, ``.gitignore`` — обычные.
     """
     try:
         parts = path.relative_to(root).parts
     except ValueError:
         return False
-    if any(part.casefold() == GIT_DIR_NAME for part in parts):
+    raw_parts = Path(raw).parts if raw else ()
+    if any(part.casefold() == GIT_DIR_NAME for part in (*parts, *raw_parts)):
         return True
-    return any(path == d or d in path.parents for d in _git_dirs(root))
+    if any(path == d or d in path.parents for d in _git_dirs(root)):
+        return True
+    candidates = [path, *path.parents] if path.is_dir() else list(path.parents)
+    return any(_looks_like_git_dir(d) for d in candidates if d != root and root in d.parents)
 
 
 def _writable_path(ctx: ToolContext, path: str) -> Path:
@@ -234,7 +254,7 @@ def _writable_path(ctx: ToolContext, path: str) -> Path:
             f"Служебная папка {DATA_DIR_NAME}/ (индекс, история, чаты агента) "
             f"недоступна для записи: {path}"
         )
-    if _is_git_internal(ctx.root, p):
+    if _is_git_internal(ctx.root, p, path):
         raise ToolError(
             f"Внутренности git ({GIT_DIR_NAME}/) недоступны для записи: {path}. "
             "Для операций с репозиторием используйте инструмент git."
