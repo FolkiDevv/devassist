@@ -7,7 +7,9 @@ import textwrap
 import pytest
 
 from devassist.project.symbols import (
+    _RULES,
     MAX_SYMBOLS_PER_FILE,
+    _regex_symbols,
     extract,
     extract_symbols,
     language_of,
@@ -87,17 +89,31 @@ def test_python_symbols_with_nesting_and_ranges():
     assert symbols[1].signature == "class Agent(Base):"
 
 
-def test_python_syntax_error_falls_back_to_regex():
-    got = _names(
-        """\
-        class Broken:
-            def method(self):
-                return (
-        def tail():
-        """,
+def test_python_syntax_error_falls_back_to_tree_sitter():
+    symbols = extract_symbols(
+        textwrap.dedent(
+            """\
+            class Broken:
+                def method(self):
+                    return (
+            def tail():
+                pass
+            """
+        ),
         "python",
     )
-    assert got == [("class", "Broken"), ("function", "method"), ("function", "tail")]
+    assert [(s.kind, s.qualname) for s in symbols][:2] == [
+        ("class", "Broken"),
+        ("method", "Broken.method"),
+    ]
+
+
+def test_python_without_grammar_falls_back_to_regex(monkeypatch):
+    from devassist.project import treesitter
+
+    monkeypatch.setattr(treesitter, "extract", lambda text, language, path="": None)
+    got = _names("class Broken:\n    def method(self):\n        return (\n", "python")
+    assert got == [("class", "Broken"), ("function", "method")]
 
 
 def test_markdown_headings_with_parents_skip_code_fences():
@@ -251,8 +267,10 @@ def test_markdown_headings_with_parents_skip_code_fences():
         ),
     ],
 )
-def test_regex_languages(language, src, expected):
-    assert _names(src, language) == expected
+def test_regex_fallback_languages(language, src, expected):
+    """Запасной путь без грамматики: построчные шаблоны (здесь — на обрывках кода)."""
+    symbols = _regex_symbols(textwrap.dedent(src), _RULES[language])
+    assert [(s.kind, s.qualname) for s in symbols] == expected
 
 
 def test_unknown_language_has_no_symbols():
@@ -425,10 +443,11 @@ def test_python_docstring_and_name_column():
     assert (by_name["бег"].doc, by_name["бег"].col) == ("", 15)  # не литерал — не докстринг
 
 
-def test_python_syntax_error_has_symbols_but_no_refs():
-    facts = _facts("def ok():\n    call()\n\ndef broken(:\n")
+def test_python_syntax_error_keeps_calls_but_not_imports():
+    facts = _facts("import os\n\ndef ok():\n    call_me()\n\ndef broken(:\n")
     assert [s.name for s in facts.symbols] == ["ok", "broken"]
-    assert facts.refs == [] and facts.imports == []
+    assert [(r.name, r.kind, r.scope) for r in facts.refs] == [("call_me", "call", "ok")]
+    assert facts.imports == []  # импорты — только из ast
 
 
 def test_regex_symbols_have_name_column():

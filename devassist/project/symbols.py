@@ -1,10 +1,12 @@
 """Извлечение фактов о файле для индекса проекта: определения, использования, импорты.
 
 Python разбирается модулем :mod:`ast` (точно: вложенность, диапазон строк,
-докстринги, использования имён и импорты); остальные языки — построчными
-регулярными выражениями (быстро, без зависимостей, но эвристично: диапазон строк
-неизвестен, вложенность почти не отслеживается, использований нет). Новый язык —
-расширения в :data:`EXTENSIONS` и правила в :data:`_RULES`.
+докстринги, использования имён и импорты); JS/TS, Go, Rust, Java, Kotlin, C#, Ruby,
+PHP, C/C++, shell, Scala и Swift — tree-sitter (:mod:`devassist.project.treesitter`:
+определения с диапазоном и вложенностью, вызовы). Построчные регулярные выражения —
+запасной путь, если грамматика не загрузилась. Новый язык — расширения в
+:data:`EXTENSIONS` и таблицы в ``treesitter.SPECS`` (правила в :data:`_RULES` —
+по желанию).
 """
 
 from __future__ import annotations
@@ -150,7 +152,14 @@ def module_parts(path: str) -> list[str] | None:
 
 
 def extract(text: str, language: str | None, path: str = "") -> FileFacts:
-    """Факты о файле. ``path`` (от корня проекта) нужен для относительных импортов."""
+    """Факты о файле. ``path`` (от корня проекта) нужен для относительных импортов.
+
+    Python — ``ast`` (при неудаче — tree-sitter, затем регэкспы); Markdown —
+    заголовки; остальные языки — tree-sitter, без грамматики — регэкспы.
+    """
+    # импорт здесь: treesitter сам опирается на типы этого модуля
+    from devassist.project import treesitter
+
     if language == "python":
         try:
             tree = ast.parse(text)
@@ -158,15 +167,20 @@ def extract(text: str, language: str | None, path: str = "") -> FileFacts:
             symbols = _python_symbols(tree, lines)
             refs, imports = _python_refs(tree, lines, path)
         except (SyntaxError, ValueError, RecursionError):
+            facts = treesitter.extract(text, language, path)
+            if facts is not None:
+                return facts
             return FileFacts(_regex_symbols(text, _RULES["python"])[:MAX_SYMBOLS_PER_FILE])
         return FileFacts(symbols[:MAX_SYMBOLS_PER_FILE], refs, imports)
     if language == "markdown":
-        symbols = _markdown_symbols(text)
-    elif language in _RULES:
-        symbols = _regex_symbols(text, _RULES[language])
-    else:
-        symbols = []
-    return FileFacts(symbols[:MAX_SYMBOLS_PER_FILE])
+        return FileFacts(_markdown_symbols(text)[:MAX_SYMBOLS_PER_FILE])
+    if language is not None and treesitter.supports(language):
+        facts = treesitter.extract(text, language, path)
+        if facts is not None:
+            return facts
+    if language in _RULES:
+        return FileFacts(_regex_symbols(text, _RULES[language])[:MAX_SYMBOLS_PER_FILE])
+    return FileFacts([])
 
 
 def extract_symbols(text: str, language: str | None) -> list[Symbol]:
@@ -174,7 +188,8 @@ def extract_symbols(text: str, language: str | None) -> list[Symbol]:
     return extract(text, language).symbols
 
 
-def _clip(signature: str) -> str:
+def clip_signature(signature: str) -> str:
+    """Сигнатура в одну строку, не длиннее :data:`_MAX_SIGNATURE`."""
     signature = " ".join(signature.split())
     if len(signature) > _MAX_SIGNATURE:
         signature = signature[: _MAX_SIGNATURE - 1] + "…"
@@ -221,7 +236,7 @@ def _python_symbols(tree: ast.Module, lines: list[str]) -> list[Symbol]:
         last = min(max(last, start), start + _MAX_SIGNATURE_LINES - 1)
         parts = (lines[i - 1].strip() for i in range(start, last + 1) if i <= len(lines))
         # строки-комментарии между заголовком и телом — не часть сигнатуры
-        return _clip(" ".join(part for part in parts if not part.startswith("#")))
+        return clip_signature(" ".join(part for part in parts if not part.startswith("#")))
 
     def visit(body: list[ast.stmt], parent: str, depth: int, in_class: bool) -> None:
         for node in body:
@@ -250,7 +265,7 @@ def _python_symbols(tree: ast.Module, lines: list[str]) -> list[Symbol]:
                                 kind="constant",
                                 line=node.lineno,
                                 end_line=node.end_lineno,
-                                signature=_clip(lines[node.lineno - 1]),
+                                signature=clip_signature(lines[node.lineno - 1]),
                                 col=_char_col(_line(lines, t.lineno), t.col_offset),
                             )
                         )
@@ -477,7 +492,7 @@ def _markdown_symbols(text: str) -> list[Symbol]:
                 line=i,
                 parent=stack[-1][1] if stack else "",
                 depth=len(stack),
-                signature=_clip(line),
+                signature=clip_signature(line),
             )
         )
         stack.append((level, title))
@@ -639,7 +654,7 @@ def _regex_symbols(text: str, rules: list[_Rule]) -> list[Symbol]:
                     line=i,
                     parent=groups.get("parent") or "",
                     depth=1 if indent else 0,
-                    signature=_clip(line),
+                    signature=clip_signature(line),
                     col=m.start("name"),
                 )
             )

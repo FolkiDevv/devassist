@@ -32,7 +32,7 @@ from devassist.project.files import glob_match, is_excluded, is_secret_path, wal
 from devassist.project.symbols import Symbol, extract, language_of, module_parts
 from devassist.project.workspace import Workspace
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3  # 3 — tree-sitter: другие языки с диапазонами и вызовами
 INDEX_FILE_NAME = "index.sqlite3"
 MAX_INDEX_FILE_BYTES = 1_000_000  # крупнее — сгенерированное/дампы: без разбора
 _BINARY_PROBE = 8192
