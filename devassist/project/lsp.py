@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import signal
 import subprocess
 import threading
 from collections.abc import Callable, Mapping, Sequence
@@ -60,6 +61,7 @@ class LspClient:
         self._proc: subprocess.Popen[bytes] | None = None
         self._outbox: queue.Queue[bytes | None] = queue.Queue()
         self._writer: threading.Thread | None = None
+        self._reader: threading.Thread | None = None
         self._pending: dict[int, queue.Queue[object]] = {}
         self._pending_lock = threading.Lock()
         self._next_id = 0
@@ -91,7 +93,8 @@ class LspClient:
         finally:
             if stderr is not subprocess.DEVNULL:
                 stderr.close()  # у процесса своя копия дескриптора
-        threading.Thread(target=self._read_loop, name="lsp-reader", daemon=True).start()
+        self._reader = threading.Thread(target=self._read_loop, name="lsp-reader", daemon=True)
+        self._reader.start()
         self._writer = threading.Thread(target=self._write_loop, name="lsp-writer", daemon=True)
         self._writer.start()
 
@@ -128,7 +131,12 @@ class LspClient:
         self._send({"jsonrpc": "2.0", "method": method, "params": params})
 
     def close(self, timeout: float = 2.0) -> None:
-        """Вежливое завершение (shutdown/exit), при неудаче — kill. Повторный вызов безопасен."""
+        """Вежливое завершение (shutdown/exit), при неудаче — kill всей группы процессов.
+
+        Не зависает: и при Ctrl+C посреди завершения (процесс всё равно убивается,
+        прерывание пробрасывается), и когда сервер не читает или потомки держат
+        канал. Повторный вызов безопасен.
+        """
         proc = self._proc
         if proc is None:
             return
@@ -138,18 +146,17 @@ class LspClient:
                 self.notify("exit")
             proc.wait(timeout=timeout)
         except (LspError, OSError, subprocess.TimeoutExpired):
-            proc.kill()
-            try:
-                proc.wait(timeout=timeout)
-            except subprocess.TimeoutExpired:
-                pass
+            pass
         finally:
-            # процесс завершён — застрявшая запись получает EPIPE, поток-писатель выходит
+            _kill(proc, timeout)
+            # процесс мёртв: застрявшая запись получает EPIPE, чтение — конец потока
             self._outbox.put(None)
-            if self._writer is not None:
-                self._writer.join(timeout=timeout)
-            for stream in (proc.stdin, proc.stdout):
-                if stream is not None:
+            for thread in (self._writer, self._reader):
+                if thread is not None:
+                    thread.join(timeout=timeout)
+            # поток, всё ещё занятый каналом, держит его блокировку — такой не закрываем
+            for stream, thread in ((proc.stdin, self._writer), (proc.stdout, self._reader)):
+                if stream is not None and (thread is None or not thread.is_alive()):
                     try:
                         stream.close()
                     except OSError:
@@ -261,3 +268,19 @@ class LspClient:
             self._send(reply)
         except LspError:
             pass
+
+
+def _kill(proc: subprocess.Popen[bytes], timeout: float) -> None:
+    """Убивает сервер вместе с его потомками (своя группа процессов — см. start)."""
+    if proc.poll() is None:
+        try:
+            if os.name == "posix":
+                os.killpg(proc.pid, signal.SIGKILL)
+            else:
+                proc.kill()
+        except OSError:
+            proc.kill()
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        pass

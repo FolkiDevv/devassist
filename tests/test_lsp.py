@@ -138,3 +138,15 @@ def test_stalled_server_cannot_block_requests_or_close(client):
     client.close(timeout=1)
     assert not client.alive
     assert time.monotonic() - started < 10
+
+
+def test_interrupted_close_still_kills_server(client, monkeypatch):
+    proc = client._proc  # noqa: SLF001
+
+    def interrupted(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(client, "request", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        client.close(timeout=1)
+    assert proc.poll() is not None and not client.alive  # процесс убит, прерывание проброшено

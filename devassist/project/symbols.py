@@ -130,6 +130,14 @@ class FileFacts:
     imports: list[Import] = field(default_factory=list)
 
 
+def split_lines(text: str) -> list[str]:
+    """Строки как их нумеруют ``ast``, tree-sitter и LSP: разрыв — только ``\\n``,
+    ``\\r\\n`` или ``\\r``. ``str.splitlines`` режет ещё и по ``\\f``, ``\\v``,
+    ``\\u2028``… — номера строк после таких символов разъезжаются.
+    """
+    return text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+
+
 def language_of(path: str | PurePath) -> str | None:
     """Язык файла по имени/расширению (None — неизвестен)."""
     p = PurePath(path)
@@ -163,7 +171,7 @@ def extract(text: str, language: str | None, path: str = "") -> FileFacts:
     if language == "python":
         try:
             tree = ast.parse(text)
-            lines = text.splitlines()
+            lines = split_lines(text)
             symbols = _python_symbols(tree, lines)
             refs, imports = _python_refs(tree, lines, path)
         except (SyntaxError, ValueError, RecursionError):
@@ -300,14 +308,18 @@ _SKIP_NAMES = frozenset(dir(builtins)) | {"self", "cls"}
 _COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
 
 
-def _local_names(fn: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda) -> frozenset[str]:
-    """Имена, связанные в самой функции: параметры, присваивания, ``except … as``,
-    ``match``, имена вложенных ``def``/``class``.
+def _local_names(
+    fn: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda,
+) -> tuple[frozenset[str], frozenset[str]]:
+    """(локальные, объявленные ``global``/``nonlocal``) имена самой функции.
 
-    Обращения к ним — не использования определений проекта. Не локальные:
-    импорты (вызов импортированного имени — использование), связывания внутри
-    вложенных функций, классов и включений (у них своя область; ``:=`` во включении
-    связывает имя в функции), объявленные ``global``/``nonlocal``.
+    Локальные — параметры, присваивания, ``except … as``, ``match`` (в том числе
+    ``case {**rest}``), имена вложенных ``def``/``class``: обращения к ним — не
+    использования определений проекта. Не локальные: импорты (вызов
+    импортированного имени — использование), связывания внутри вложенных функций,
+    классов и включений (у них своя область; ``:=`` во включении связывает имя в
+    функции), объявленные ``global``/``nonlocal`` — они же снимают одноимённые
+    локальные внешних функций.
     """
     a = fn.args
     names = {x.arg for x in (*a.posonlyargs, *a.args, *a.kwonlyargs)}
@@ -329,6 +341,8 @@ def _local_names(fn: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda) -> fro
         elif isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)):
             if node.name:
                 names.add(node.name)
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            names.add(node.rest)  # `case {**rest}` — строка, а не узел Name
         if isinstance(node, _COMPREHENSIONS):  # цели включения — его область
             for gen in node.generators:
                 stack.append(gen.iter)
@@ -340,7 +354,7 @@ def _local_names(fn: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda) -> fro
             )
             continue
         stack.extend(ast.iter_child_nodes(node))
-    return frozenset(names - declared)
+    return frozenset(names - declared), frozenset(declared)
 
 
 def _absolute_module(module: str | None, level: int, path: str) -> str:
@@ -402,20 +416,24 @@ class _RefCollector(ast.NodeVisitor):
         if indexed:
             self._scope.append(node.name)
         a = node.args
-        # декораторы и значения по умолчанию вычисляются в объемлющей области
-        for expr in (*node.decorator_list, *a.defaults, *(d for d in a.kw_defaults if d)):
-            self.visit(expr)
-        self._in_function += 1
-        outer = self._locals[-1] if self._locals else frozenset()
-        self._locals.append(outer | _local_names(node))
         params = (*a.posonlyargs, *a.args, *a.kwonlyargs, a.vararg, a.kwarg)
+        # декораторы, значения по умолчанию и аннотации вычисляются в объемлющей
+        # области: `def convert(Model: Model) -> Model` — использования Model
         for expr in (
+            *node.decorator_list,
+            *a.defaults,
+            *(d for d in a.kw_defaults if d),
             *(p.annotation for p in params if p is not None and p.annotation is not None),
             *([node.returns] if node.returns is not None else []),
             *node.type_params,
-            *node.body,
         ):
             self.visit(expr)
+        self._in_function += 1
+        own, declared = _local_names(node)
+        outer = self._locals[-1] if self._locals else frozenset()
+        self._locals.append((outer - declared) | own)
+        for stmt in node.body:
+            self.visit(stmt)
         self._locals.pop()
         self._in_function -= 1
         if indexed:
@@ -425,7 +443,7 @@ class _RefCollector(ast.NodeVisitor):
     visit_AsyncFunctionDef = _visit_function
 
     def visit_Lambda(self, node: ast.Lambda) -> None:
-        self._with_locals(node, _local_names(node))
+        self._with_locals(node, _local_names(node)[0])
 
     def _visit_comprehension(self, node: ast.AST) -> None:
         generators: list[ast.comprehension] = node.generators  # type: ignore[attr-defined]
@@ -511,7 +529,7 @@ def _markdown_symbols(text: str) -> list[Symbol]:
     out: list[Symbol] = []
     stack: list[tuple[int, str]] = []  # (уровень, заголовок)
     fence = ""  # открывающая ограда блока кода ("```", "~~~~"…), пусто — вне блока
-    for i, line in enumerate(text.splitlines(), start=1):
+    for i, line in enumerate(split_lines(text), start=1):
         m = _FENCE_RE.match(line)
         if fence:
             # закрывает только ограда того же символа, не короче, без текста после
@@ -678,7 +696,7 @@ _RULES: dict[str, list[_Rule]] = {
 
 def _regex_symbols(text: str, rules: list[_Rule]) -> list[Symbol]:
     out: list[Symbol] = []
-    for i, line in enumerate(text.splitlines(), start=1):
+    for i, line in enumerate(split_lines(text), start=1):
         if not line.strip() or len(line) > 1000:
             continue
         for kind, regex in rules:

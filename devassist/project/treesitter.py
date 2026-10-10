@@ -69,6 +69,7 @@ _NAME_NODES = frozenset(
         "private_property_identifier",
         "destructor_name",
         "operator_name",
+        "string_fragment",  # JS: метод с именем в кавычках — `"save"() {}`
     }
 )
 # Поля, в которых лежит последняя часть составного имени (a.b.c → c).
@@ -309,6 +310,8 @@ def _leaf_name(node: Node | None) -> Node | None:
                 node = named[-1]
             elif node.type in ("command_name", "generic_name", "user_type") and named:
                 node = named[0]
+            elif node.type in ("parenthesized_expression", "string") and named:
+                node = named[0]  # `(load)()`, `"save"() {}`
             elif node.type == "command_name":
                 return node
             else:
@@ -428,6 +431,9 @@ class _Source:
 
     def signature(self, node: Node) -> str:
         body = node.child_by_field_name("body")
+        if body is None:  # `const f = (x) => {…}` — тело у функции в поле value
+            value = node.child_by_field_name("value")
+            body = value.child_by_field_name("body") if value is not None else None
         if body is None:
             body = next((c for c in node.named_children if c.type in _BODY_NODES), None)
         end = body.start_byte if body is not None and body.start_byte > node.start_byte else None

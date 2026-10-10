@@ -339,3 +339,19 @@ def test_merge_matches_by_position_not_line(root):
             (first, RESOLVED_IMPORT),
             (second, RESOLVED_TY),
         ]
+
+
+def test_index_hierarchy_has_one_shared_budget(plain, monkeypatch):
+    from devassist.tools import navigation
+
+    monkeypatch.setattr(navigation, "MAX_HIERARCHY_NODES", 2)
+    lines = _calls(plain, "helper", depth=3).content.splitlines()
+    assert sum(line.lstrip().startswith("←") for line in lines) == 2
+    assert lines[-1] == "… дерево обрезано (2 узлов); уменьшите depth"
+
+
+def test_call_hierarchy_with_ty_keeps_other_language_definitions(typed):
+    _make(typed.root, "web/helper.js", "function helper() {}\nfunction use() { helper(); }\n")
+    lines = _calls(typed, "helper").content.splitlines()
+    assert lines[0] == "кто вызывает (глубина 1, ty + индекс):"
+    assert "helper — web/helper.js:1" in lines and "  ← use — web/helper.js (строка 2)" in lines

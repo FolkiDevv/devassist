@@ -303,3 +303,17 @@ def test_js_private_members_are_called():
     facts = extract("class A {\n  #persist() {}\n  save() { this.#persist(); }\n}\n", "javascript")
     assert [s.qualname for s in facts.symbols] == ["A", "A.#persist", "A.save"]
     assert [(r.name, r.scope) for r in facts.refs] == [("#persist", "A.save")]
+
+
+def test_parenthesized_callees_quoted_methods_and_arrow_signatures():
+    facts = extract(
+        'class A {\n  "save"() { (load)(); (obj.persist)(); }\n}\n'
+        "const handler = (req) => { respond(req); };\n",
+        "javascript",
+    )
+    assert [(s.qualname, s.signature) for s in facts.symbols] == [
+        ("A", "class A"),
+        ("A.save", '"save"()'),
+        ("handler", "handler = (req) =>"),  # без тела функции
+    ]
+    assert [r.name for r in facts.refs] == ["load", "persist", "respond"]

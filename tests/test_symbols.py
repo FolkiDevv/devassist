@@ -499,3 +499,38 @@ def test_python_scopes_of_comprehensions_imports_and_defaults():
     assert ("lazy", "call", "run") in got  # локальный импорт — использование
     assert ("helper", "call", "run") in got  # переменная включения не скрывает глобальное
     assert ("decorate", "call", "other") in got and ("option", "name", "other") in got
+
+
+def test_python_annotations_globals_and_match_rest():
+    facts = _facts(
+        """\
+        def convert(Model: Model) -> Model:
+            return Model
+
+
+        def outer(helper):
+            def inner():
+                global helper
+                helper()
+            return inner
+
+
+        def route(event):
+            match event:
+                case {"kind": kind, **settings}:
+                    return settings
+        """
+    )
+    got = [(r.name, r.kind, r.line) for r in facts.refs]
+    assert ("Model", "name", 1) in got  # аннотации — в объемлющей области
+    assert ("helper", "call", 8) in got  # global снимает локальное имя внешней функции
+    assert all(r.name not in ("settings", "kind") for r in facts.refs)  # case {**rest}
+
+
+def test_line_numbers_ignore_form_feed_and_unicode_separators():
+    src = "# \f заголовок\n\ndef after():\n    pass\n\u2028\nclass Later:\n    pass\n"
+    symbols = extract_symbols(src, "python")
+    assert [(s.name, s.line, s.signature) for s in symbols] == [
+        ("after", 3, "def after():"),
+        ("Later", 6, "class Later:"),
+    ]

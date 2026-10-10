@@ -64,3 +64,9 @@ def test_interrupted_start_does_not_leave_server(tmp_path, monkeypatch):
         semantic.server_for(Workspace(tmp_path))
     assert len(closed) == 1
     semantic.shutdown_all()
+
+
+def test_lines_split_like_lsp(tmp_path):
+    path = tmp_path / "f.py"
+    path.write_text("#\f\né = 1\n", encoding="utf-8")
+    assert semantic._Lines().get(path, 2) == "é = 1"  # \f — не разрыв строки

@@ -26,6 +26,7 @@ from urllib.request import url2pathname
 
 from devassist.project.index import add_change_listener
 from devassist.project.lsp import LspClient, LspError
+from devassist.project.symbols import split_lines
 from devassist.project.workspace import Workspace
 
 START_TIMEOUT = 15.0  # запуск и initialize
@@ -101,7 +102,7 @@ class _Lines:
         if path not in self._cache:
             try:
                 text = path.read_text(encoding="utf-8", errors="replace")
-                self._cache[path] = text.splitlines()
+                self._cache[path] = split_lines(text)  # нумерация строк как у LSP
             except OSError:
                 self._cache[path] = []
         lines = self._cache[path]

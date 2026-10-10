@@ -29,6 +29,7 @@ from devassist.project.index import (
 )
 from devassist.project.lsp import LspError
 from devassist.project.semantic import CallItem, Location, SemanticUnavailable, TyServer
+from devassist.project.symbols import split_lines
 from devassist.security import resolve_in_root
 from devassist.tools.base import Tool, ToolContext, ToolError, ToolResult
 from devassist.tools.index import (
@@ -106,7 +107,7 @@ class _SourceLines:
         if path not in self._cache:
             try:
                 text = (self._root / path).read_text(encoding="utf-8", errors="replace")
-                self._cache[path] = text.splitlines()
+                self._cache[path] = split_lines(text)
             except OSError:
                 self._cache[path] = []
         lines = self._cache[path]
@@ -359,7 +360,7 @@ class GotoDefinitionTool(Tool):
         if is_secret_path(target):
             raise ToolError(f"Файлы с секретами не разбираются: {params.path}")
         try:
-            lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
+            lines = split_lines(target.read_text(encoding="utf-8", errors="replace"))
         except OSError as e:
             raise ToolError(f"Не удалось прочитать {params.path}: {e}") from e
         if not 0 < params.line <= len(lines):
@@ -480,6 +481,11 @@ class CallHierarchyTool(Tool):
             if tree is None:
                 source = "по индексу"
                 tree = self._index_tree(index, definitions[:MAX_TY_DEFINITIONS], incoming, depth)
+            else:  # определения на других языках ty не видит — их дерево по индексу
+                others = [d for d in definitions if not semantic.is_python(d.path)]
+                if others:
+                    source = "ty + индекс"
+                    tree += self._index_tree(index, others[:MAX_TY_DEFINITIONS], incoming, depth)
         title = "кто вызывает" if incoming else "что вызывает"
         lines = [f"{title} (глубина {depth}, {source}):", *tree]
         if py_defs:
@@ -551,19 +557,27 @@ class CallHierarchyTool(Tool):
     def _index_tree(
         self, index: ProjectIndex, definitions: list[SymbolHit], incoming: bool, depth: int
     ) -> list[str]:
+        """Дерево по индексу; общий бюджет узлов на все корни и уровни."""
         lines: list[str] = []
+        budget = [MAX_HIERARCHY_NODES]
+        seen = {d.symbol.qualname for d in definitions}
         for d in definitions:
             lines.append(f"{d.symbol.qualname} — {d.path}:{d.symbol.line}")
             before = len(lines)
             if incoming:
-                self._index_callers(index, d.symbol.qualname, depth, 1, {d.symbol.qualname}, lines)
+                self._index_callers(index, d.symbol.qualname, depth, 1, seen, lines, budget)
             else:
                 for name, call_lines in self._group(index.calls_in(d.path, d.symbol.qualname)):
+                    if budget[0] <= 0:
+                        break
+                    budget[0] -= 1
                     lines.append(f"  → {name}{_lines_note(call_lines)}")
                 if depth > 1:
                     lines.append("  (глубже 1 уровня исходящие вызовы — только через ty)")
             if len(lines) == before:
                 lines.append("  (вызовов не найдено)")
+        if budget[0] <= 0:
+            lines.append(f"… дерево обрезано ({MAX_HIERARCHY_NODES} узлов); уменьшите depth")
         return lines
 
     def _index_callers(
@@ -574,18 +588,24 @@ class CallHierarchyTool(Tool):
         level: int,
         seen: set[str],
         lines: list[str],
+        budget: list[int],
     ) -> None:
-        result = index.find_refs(qualname, kind="call", limit=MAX_HIERARCHY_NODES)
+        if budget[0] <= 0:
+            return
+        result = index.find_refs(qualname, kind="call", limit=budget[0])
         groups: dict[tuple[str, str, str], list[int]] = {}
         for h in result.hits:
             groups.setdefault((h.path, h.scope, h.resolution), []).append(h.line)
         for (path, scope, resolution), call_lines in groups.items():
+            if budget[0] <= 0:
+                return
+            budget[0] -= 1
             guess = " (по имени)" if resolution == RESOLVED_NAME else ""
             caller = scope or "<уровень модуля>"
             lines.append(f"{'  ' * level}← {caller} — {path}{_lines_note(call_lines)}{guess}")
             if level < depth and scope and scope not in seen:
                 seen.add(scope)
-                self._index_callers(index, scope, depth, level + 1, seen, lines)
+                self._index_callers(index, scope, depth, level + 1, seen, lines, budget)
 
     @staticmethod
     def _group(calls: list[tuple[str, int]]) -> list[tuple[str, list[int]]]:
