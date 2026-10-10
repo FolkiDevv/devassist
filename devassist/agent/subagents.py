@@ -81,15 +81,20 @@ class SubagentTrail:
     """Что суб-агент сделал с проектом — для отчёта (не со слов модели, а по фактам)."""
 
     changed_files: list[str] = field(default_factory=list)
-    commands: list[str] = field(default_factory=list)
+    # Прочие изменяющие операции: команды, изменяющий git.
+    operations: list[str] = field(default_factory=list)
     rejected: list[str] = field(default_factory=list)
+
+    @property
+    def changed(self) -> bool:
+        return bool(self.changed_files or self.operations)
 
     def lines(self) -> list[str]:
         out = []
         if self.changed_files:
             out.append(f"Изменённые файлы: {', '.join(dict.fromkeys(self.changed_files))}")
-        if self.commands:
-            out.append(f"Выполненные команды: {'; '.join(dict.fromkeys(self.commands))}")
+        if self.operations:
+            out.append(f"Изменяющие операции: {'; '.join(dict.fromkeys(self.operations))}")
         if self.rejected:
             out.append(f"Отклонено пользователем: {'; '.join(dict.fromkeys(self.rejected))}")
         return out
@@ -123,10 +128,11 @@ class SubagentEvents(AgentEvents):
         self._activity(call.name)
 
     def on_tool_result(self, call: ToolCallInfo, result: ToolResult, *, previewed: bool) -> None:
-        if result.ok and call.kind is ToolKind.EDIT and call.summary:
-            self.trail.changed_files.append(call.summary)
-        elif result.ok and call.kind is ToolKind.COMMAND and call.summary:
-            self.trail.commands.append(call.summary)
+        if result.ok and result.changed:
+            if call.kind is ToolKind.EDIT and call.summary:
+                self.trail.changed_files.append(call.summary)
+            else:
+                self.trail.operations.append(f"{call.name} {call.summary}".strip())
         elif not result.ok and REJECTED_MARK in result.content:
             self.trail.rejected.append(f"{call.name} {call.summary}".strip())
         self._parent.on_subagent_tool_result(self._info, call, result, previewed=previewed)
@@ -210,7 +216,18 @@ def aborted_report(spec: SubagentSpec, trail: SubagentTrail) -> ToolResult:
         content="\n\n".join(parts),
         ok=False,
         summary=_summary(spec, None, "оборван пользователем"),
-        changed=bool(trail.changed_files or trail.commands),
+        changed=trail.changed,
+    )
+
+
+def model_error_report(spec: SubagentSpec, error: Exception, trail: SubagentTrail) -> ToolResult:
+    """Суб-агент упал на ошибке модели: ошибка + что он успел сделать до неё."""
+    parts = [f"суб-агент {spec.name}: ошибка модели: {error}", *trail.lines()]
+    return ToolResult(
+        content="\n\n".join(parts),
+        ok=False,
+        summary=_summary(spec, None, "ошибка модели"),
+        changed=trail.changed,
     )
 
 

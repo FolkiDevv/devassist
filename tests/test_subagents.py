@@ -308,6 +308,35 @@ def test_llm_error_in_subagent_reported_to_model(tmp_path):
     _assert_well_formed(agent.conversation.messages)
 
 
+def test_other_kind_changes_kept_in_trail_on_ctrl_c(tmp_path):
+    # изменяющий вызов не-EDIT вида (как git commit) — тоже в журнале суб-агента
+    provider = ScriptedProvider(
+        [_task("general", "закоммить"), tool_turn("fake_write", {"path": "x"}), KeyboardInterrupt()]
+    )
+    agent = _agent(provider, tmp_path, registry=_registry_with_fake(FakeTool()))
+    with pytest.raises(KeyboardInterrupt):
+        agent.run_turn("x")
+    assert "Изменяющие операции: fake_write x" in _results(agent.conversation.messages)[-1]
+
+
+def test_llm_error_after_changes_keeps_trail(tmp_path):
+    provider = ScriptedProvider(
+        [
+            _task("general", "создай b.txt"),
+            tool_turn("write_file", {"path": "b.txt", "content": "x\n"}),
+            LLMError("сбой сети"),
+            text_turn("продолжаю"),
+        ]
+    )
+    events = RecordingEvents()
+    agent = _agent(provider, tmp_path, events=events)
+    assert agent.run_turn("x") == "продолжаю"
+    result = _results(agent.conversation.messages)[0]
+    assert "ошибка модели: сбой сети" in result and "Изменённые файлы: b.txt" in result
+    task_result = events.results[-1][1]
+    assert not task_result.ok and task_result.changed
+
+
 def test_parent_repeat_guard_sees_subagent_changes(tmp_path):
     shell = tool_turn("run_shell", {"command": "echo hi"})
     provider = ScriptedProvider(

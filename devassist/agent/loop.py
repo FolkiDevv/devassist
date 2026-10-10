@@ -58,6 +58,7 @@ from devassist.agent.subagents import (
     SubagentEvents,
     aborted_report,
     interrupted_note,
+    model_error_report,
     subagent_registry,
     subagent_report,
 )
@@ -818,15 +819,13 @@ class Agent:
         if result is None:
             return self._fail(call, error or "инструмент не вернул результат", note=note)
 
+        if result.ok and risk >= RiskLevel.WRITE:
+            result.changed = True  # UI и журнал суб-агента видят изменение
         self._events.on_tool_result(call, result, previewed=previewed)
         self._conversation.add_function_result(name, _with_note(result.as_function_content(), note))
         if result.ok:
             self._attach_instructions(tool, params)
-        return ToolOutcome(
-            ok=result.ok,
-            changed=(result.ok and risk >= RiskLevel.WRITE) or result.changed,
-            soft=result.soft,
-        )
+        return ToolOutcome(ok=result.ok, changed=result.changed, soft=result.soft)
 
     def _run_subagent(self, name: str, description: str, prompt: str) -> ToolResult:
         """Запустить суб-агента ``name`` с задачей ``prompt`` (инструмент ``task``).
@@ -862,7 +861,8 @@ class Agent:
         try:
             text = child.run_turn(prompt)
         except LLMError as e:
-            raise ToolError(f"суб-агент {spec.name}: ошибка модели: {e}") from e
+            # Сделанное до сбоя не теряется: основной агент не повторит его вслепую.
+            return model_error_report(spec, e, events.trail)
         except KeyboardInterrupt:
             if child._stop_level >= 2:  # повторный Esc: оборвать суб-агента, ход идёт дальше
                 return aborted_report(spec, events.trail)
