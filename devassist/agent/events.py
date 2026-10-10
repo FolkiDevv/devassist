@@ -59,6 +59,8 @@ class TurnStats:
     stop_reason: str | None = None
     # Длительность хода, секунды.
     duration_s: float = 0.0
+    # Успешных изменяющих вызовов за ход (правки, изменяющие команды).
+    changes: int = 0
 
     @property
     def billed_tokens(self) -> int:
@@ -73,6 +75,14 @@ class CompactResult:
     after_tokens: int
     messages: int  # сколько сообщений свёрнуто в краткое содержание
     auto: bool = False  # запущено автоматически (контекст подошёл к порогу)
+
+
+@dataclass(frozen=True)
+class SubagentInfo:
+    """Запущенный суб-агент: тип (``explore``) и краткое описание задачи для UI."""
+
+    name: str
+    description: str = ""
 
 
 class AgentEvents:
@@ -136,7 +146,38 @@ class AgentEvents:
     def on_compact_end(self, result: CompactResult | None) -> None:
         """Сжатие закончилось (вызывается всегда). None — не удалось или прервано."""
 
+    # --- суб-агенты ---
+    # Суб-агент работает внутри вызова инструмента ``task`` (между ``on_tool_start`` и
+    # ``on_tool_end``). Его собственные события не приходят как события основного
+    # агента: текст суб-агента пользователю не печатается, а инструменты и ожидание
+    # сообщаются хуками ниже. Подтверждения суб-агента приходят обычным ``confirm``.
+    def on_subagent_start(self, info: SubagentInfo) -> None:
+        """Суб-агент запущен."""
+
+    def on_subagent_activity(
+        self, info: SubagentInfo, activity: str, *, wrapping_up: bool = False
+    ) -> None:
+        """Чем занят суб-агент: «думаю», имя инструмента, «сжимаю контекст».
+
+        ``wrapping_up`` — суб-агент остановлен и подводит итог (повторная остановка
+        оборвёт его без отчёта).
+        """
+
+    def on_subagent_tool_call(self, info: SubagentInfo, call: ToolCallInfo) -> None:
+        """Суб-агент вызвал инструмент."""
+
+    def on_subagent_tool_result(
+        self, info: SubagentInfo, call: ToolCallInfo, result: ToolResult, *, previewed: bool
+    ) -> None:
+        """Результат инструмента суб-агента."""
+
+    def on_subagent_end(self, info: SubagentInfo, stats: TurnStats | None) -> None:
+        """Суб-агент закончил (вызывается всегда). None — прерван исключением."""
+
     # --- служебное ---
+    def on_wrap_up(self, reason: str) -> None:
+        """Ход остановлен (ограничитель или пользователь) — модель подводит итог."""
+
     def on_notice(self, text: str, *, level: NoticeLevel = "info") -> None:
         """Сообщение агента пользователю (лимиты, остановки, предупреждения)."""
 

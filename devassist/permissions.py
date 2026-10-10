@@ -10,9 +10,12 @@
   изменяющий git заблокированы, команды shell — с подтверждением. План
   передаётся пользователю инструментом ``exit_plan_mode``.
 
+Суб-агент «только для чтения» (``explore``) не меняет ничего ни в каком режиме и
+ни с какими флагами.
+
 Решение по конкретному вызову принимает :func:`decide` — единственное место, где
-сводятся вместе режим, уровень риска операции, вид инструмента, ``-y`` и
-``--yes-all``.
+сводятся вместе режим, уровень риска операции, вид инструмента, ``-y``,
+``--yes-all`` и «только чтение».
 """
 
 from __future__ import annotations
@@ -92,6 +95,7 @@ def decide(
     *,
     auto_approve: bool,
     yes_all: bool = False,
+    read_only: bool = False,
 ) -> Decision:
     """Как поступить с вызовом инструмента.
 
@@ -99,10 +103,13 @@ def decide(
     исключение — команды shell: они нужны для исследования (тесты, просмотр) и
     подтверждаются, как в ручном режиме. ``-y`` (``auto_approve``) снимает вопросы,
     кроме опасных операций (``rm -rf``, ``git reset --hard``…) — их без вопроса
-    выполняет только явный ``--yes-all``.
+    выполняет только явный ``--yes-all``. ``read_only`` (суб-агент для исследования)
+    блокирует любые изменения, включая команды shell, независимо от режима и флагов.
     """
     if risk < RiskLevel.WRITE:
         return Decision.ALLOW
+    if read_only:
+        return Decision.BLOCK
     if mode is PermissionMode.PLAN and kind is not ToolKind.COMMAND:
         return Decision.BLOCK
     if auto_approve and (risk < RiskLevel.DANGEROUS or yes_all):

@@ -15,6 +15,7 @@ from devassist.permissions import PermissionMode, ToolKind
 from devassist.tools.base import Display, ToolRegistry, ToolResult, build_default_registry
 from devassist.tools.plan import APPROVE_EDITS
 from devassist.tools.questions import Answer
+from devassist.tools.task import EXPLORE
 
 
 def _agent(provider, tmp_path: Path, *, events=None, registry=None, **cfg_kw) -> Agent:
@@ -329,8 +330,15 @@ def test_constructor_has_no_filesystem_side_effects(tmp_path, monkeypatch):
     def boom(_ws):
         raise AssertionError("системный промпт собран в конструкторе")
 
-    monkeypatch.setattr(loop, "build_system_prompt", boom)
-    _agent(ScriptedProvider(), tmp_path)  # не падает
+    monkeypatch.setattr(loop, "build_project_context", boom)
+    parent = _agent(ScriptedProvider(), tmp_path)  # не падает
+    loop.Agent(  # суб-агент — тоже
+        parent.provider,
+        build_default_registry(),
+        parent.config,
+        parent=parent,
+        subagent=EXPLORE,
+    )
 
 
 def test_long_turn_keeps_current_task_in_context(tmp_path):

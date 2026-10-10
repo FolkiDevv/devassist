@@ -22,6 +22,7 @@ ICON_OK = "✔"
 ICON_FAIL = "✘"
 ICON_BRAND = "✦"
 ICON_ARROW = "↳"
+ICON_SUBSTEP = "○"  # шаг суб-агента под вызовом task
 SPINNER = "✦"
 # Значки режимов разрешений (ключ — PermissionMode.value); ручной — без значка.
 MODE_ICONS: dict[str, str] = {"edits": "⏵⏵", "plan": "⏸"}

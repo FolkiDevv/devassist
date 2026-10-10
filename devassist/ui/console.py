@@ -44,6 +44,7 @@ from devassist.agent.events import (
     Approval,
     CompactResult,
     NoticeLevel,
+    SubagentInfo,
     ToolCallInfo,
     TurnStats,
 )
@@ -73,6 +74,7 @@ from devassist.ui.theme import (
     ICON_BRAND,
     ICON_FAIL,
     ICON_OK,
+    ICON_SUBSTEP,
     ICON_TOOL,
     MARKDOWN_STYLES,
     MUTED,
@@ -112,11 +114,14 @@ class _LiveView:
         tail: Callable[[], list[list[Segment]]] | None = None,
         *,
         hint: str | Callable[[], str] = "Ctrl+C — прервать",
+        started: float | None = None,
     ):
         self._label = label
         self._tail = tail
         self._hint = hint
-        self._started = time.monotonic()
+        # Отсчёт времени — с ``started`` (например, с запуска суб-агента, а не с
+        # последнего перезапуска области после вопроса).
+        self._started = time.monotonic() if started is None else started
 
     def __rich_console__(self, console: RichConsole, options: ConsoleOptions) -> RenderResult:
         elapsed = time.monotonic() - self._started
@@ -212,17 +217,30 @@ class Console(AgentEvents):
         self._interrupt_hint = "Ctrl+C — прервать"
         self._mode_hint: Callable[[], str] | None = None
         self._input_guard: Callable[[], AbstractContextManager[None]] = contextlib.nullcontext
+        self._esc_stops_subagent = False
+        # Работающий суб-агент: кто, с какого момента, чем занят, подводит ли итог.
+        self._sub: SubagentInfo | None = None
+        self._sub_started = 0.0
+        self._sub_activity = ""
+        self._sub_wrapping = False
 
     def set_interrupt_keys(
-        self, hint: str, input_guard: Callable[[], AbstractContextManager[None]]
+        self,
+        hint: str,
+        input_guard: Callable[[], AbstractContextManager[None]],
+        *,
+        stop_subagent: bool = False,
     ) -> None:
         """Подсказка о прерывании в индикаторе и защита ввода во время хода.
 
         ``input_guard`` оборачивает вопрос пользователю (подтверждение) — например,
         чтобы на это время отпустить терминал, который слушает клавишу Esc.
+        ``stop_subagent`` — Esc во время суб-агента останавливает его (подсказка в
+        индикаторе суб-агента).
         """
         self._interrupt_hint = hint
         self._input_guard = input_guard
+        self._esc_stops_subagent = stop_subagent
 
     def set_mode_hint(self, hint: Callable[[], str] | None) -> None:
         """Режим разрешений в индикаторе хода; перечитывается при каждой отрисовке,
@@ -233,6 +251,13 @@ class Console(AgentEvents):
         if self._mode_hint is None:
             return self._interrupt_hint
         return f"{self._interrupt_hint}  ·  {self._mode_hint()}"
+
+    def _subagent_hint(self) -> str:
+        if not self._esc_stops_subagent:
+            return self._turn_hint()
+        keys = "Esc — оборвать суб-агента" if self._sub_wrapping else "Esc — завершить с итогом"
+        hint = f"{keys}  ·  Ctrl+C — прервать всё"
+        return hint if self._mode_hint is None else f"{hint}  ·  {self._mode_hint()}"
 
     @property
     def no_color(self) -> bool:
@@ -252,20 +277,22 @@ class Console(AgentEvents):
     def rule(self, title: str = "") -> None:
         self._c.rule(Text(title, style=MUTED) if title else "", style=MUTED)
 
+    # Сообщения печатаются над временной областью, если она есть (например,
+    # уведомление суб-агента во время его работы).
     def system(self, text: str) -> None:
-        self._c.print(Text(text, style=MUTED))
+        self._print_above_live(Text(text, style=MUTED))
 
     def error(self, text: str) -> None:
-        self._c.print(Text(f"{ICON_FAIL} {text}", style=f"bold {DANGER}"))
+        self._print_above_live(Text(f"{ICON_FAIL} {text}", style=f"bold {DANGER}"))
 
     def warn(self, text: str) -> None:
-        self._c.print(Text(f"⚠ {text}", style=WARN))
+        self._print_above_live(Text(f"⚠ {text}", style=WARN))
 
     def info(self, text: str) -> None:
-        self._c.print(Text(text, style=ACCENT))
+        self._print_above_live(Text(text, style=ACCENT))
 
     def success(self, text: str) -> None:
-        self._c.print(Text(f"{ICON_OK} {text}", style=f"bold {OK}"))
+        self._print_above_live(Text(f"{ICON_OK} {text}", style=f"bold {OK}"))
 
     # ------------------------- временная область ------------------------ #
     def _start_live(self, view: _LiveView) -> None:
@@ -450,16 +477,16 @@ class Console(AgentEvents):
         else:
             self.output_block(clip_lines(shown.text), title=shown.title or "вывод")
 
-    def tool_result(self, summary: str, ok: bool = True) -> None:
+    def tool_result(self, summary: str, ok: bool = True, *, indent: str = "  ") -> None:
         summary = sanitize(summary)
-        line = Text("  ")
+        line = Text(indent)
         if ok:
             line.append(f"{ICON_ARROW} ", style=OK)
             line.append(summary, style=MUTED)
         else:
             line.append(f"{ICON_ARROW} {ICON_FAIL} ", style=f"bold {DANGER}")
             line.append(summary, style=DANGER)
-        self._c.print(line)
+        self._print_above_live(line)
 
     def diff(self, diff_text: str, *, title: str | None = None) -> None:
         if not diff_text.strip():
@@ -471,7 +498,7 @@ class Console(AgentEvents):
             background_color="default",
             word_wrap=True,
         )
-        self._c.print(
+        self._print_above_live(
             Panel(
                 syntax,
                 title=Text(title or "изменения", style=ACCENT),
@@ -488,7 +515,7 @@ class Console(AgentEvents):
             return
         body = Text(sanitize(text).rstrip())
         body.highlight_regex(_SKIPPED_RE, f"italic {MUTED}")
-        self._c.print(
+        self._print_above_live(
             Panel(
                 body,
                 title=Text(title, style=MUTED),
@@ -499,6 +526,58 @@ class Console(AgentEvents):
                 expand=False,
             )
         )
+
+    # ---------------------------- суб-агенты ----------------------------- #
+    def on_subagent_start(self, info: SubagentInfo) -> None:
+        self._sub = info
+        self._sub_started = time.monotonic()
+        self._sub_activity = "думаю"
+        self._sub_wrapping = False
+        self._start_subagent_live()
+
+    def _subagent_label(self) -> str:
+        name = self._sub.name if self._sub is not None else "суб-агент"
+        return f"{name} · {self._sub_activity}"
+
+    def _start_subagent_live(self) -> None:
+        if self._sub is None:
+            return
+        self._start_live(
+            _LiveView(self._subagent_label, hint=self._subagent_hint, started=self._sub_started)
+        )
+
+    def on_subagent_activity(
+        self, info: SubagentInfo, activity: str, *, wrapping_up: bool = False
+    ) -> None:
+        self._sub_activity = activity
+        self._sub_wrapping = wrapping_up
+        if self._live is None:  # область убрал вопрос пользователю — вернуть
+            self._start_subagent_live()
+
+    def on_subagent_tool_call(self, info: SubagentInfo, call: ToolCallInfo) -> None:
+        line = Text(f"    {ICON_SUBSTEP} ", style=MUTED)
+        line.append(call.name, style="bold")
+        if call.summary:
+            line.append("  ", style=MUTED)
+            line.append(sanitize(call.summary), style=MUTED)
+        self._print_above_live(line)
+
+    def on_subagent_tool_result(
+        self, info: SubagentInfo, call: ToolCallInfo, result: ToolResult, *, previewed: bool
+    ) -> None:
+        # Шаги суб-агента — коротко: только неудачи и правки, не показанные при
+        # подтверждении (вывод команд и найденное читает сам суб-агент).
+        if not result.ok:
+            self.tool_result(result.summary or "ошибка", ok=False, indent="      ")
+            return
+        shown = result.display
+        if shown and shown.kind == "diff" and shown.text.strip() and not previewed:
+            self.diff(shown.text, title=shown.title or None)
+
+    def on_subagent_end(self, info: SubagentInfo, stats: TurnStats | None) -> None:
+        self.stop_live()  # до сброса: последняя отрисовка ещё читает метку
+        self._sub = None
+        self._sub_wrapping = False
 
     # ---------------------------- статистика ---------------------------- #
     def on_compact_start(self, *, auto: bool) -> None:
@@ -538,6 +617,7 @@ class Console(AgentEvents):
 
     # -------------------------- подтверждения --------------------------- #
     def confirm(self, call: ToolCallInfo, preview: Display | None, *, dangerous: bool) -> Approval:
+        self.stop_live()  # превью печатается до вопроса — область уже не нужна
         if preview and preview.text.strip():
             if preview.kind == "diff":
                 self.diff(preview.text, title=preview.title or None)

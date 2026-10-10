@@ -188,6 +188,24 @@ class RecordingEvents(AgentEvents):
     def on_turn_end(self, stats: TurnStats) -> None:
         self.stats.append(stats)
 
+    def on_wrap_up(self, reason):
+        self.events.append(("wrap_up", reason))
+
+    def on_subagent_start(self, info):
+        self.events.append(("subagent_start", info))
+
+    def on_subagent_activity(self, info, activity, *, wrapping_up=False):
+        self.events.append(("subagent_activity", (activity, wrapping_up)))
+
+    def on_subagent_tool_call(self, info, call):
+        self.events.append(("subagent_tool_call", call))
+
+    def on_subagent_tool_result(self, info, call, result, *, previewed):
+        self.events.append(("subagent_tool_result", (call, result)))
+
+    def on_subagent_end(self, info, stats):
+        self.events.append(("subagent_end", stats))
+
 
 class FakeParams(BaseModel):
     path: str = "x"
