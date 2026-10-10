@@ -6,7 +6,13 @@ import textwrap
 
 import pytest
 
-from devassist.project.symbols import MAX_SYMBOLS_PER_FILE, extract_symbols, language_of
+from devassist.project.symbols import (
+    MAX_SYMBOLS_PER_FILE,
+    extract,
+    extract_symbols,
+    language_of,
+    module_parts,
+)
 
 
 def _names(text: str, language: str) -> list[tuple[str, str]]:
@@ -317,3 +323,128 @@ def test_python_try_blocks_in_source_order():
         """
     )
     assert [s.name for s in extract_symbols(src, "python")] == ["a", "b", "c", "d"]
+
+
+# ------------------------- использования и импорты ------------------------- #
+def _facts(src: str, path: str = "pkg/mod.py"):
+    return extract(textwrap.dedent(src), "python", path)
+
+
+def test_python_refs_scopes_kinds_and_locals():
+    facts = _facts(
+        """\
+        LIMIT = 5
+
+
+        class Agent(Base):
+            def run(self, text, n=LIMIT):
+                def inner(y):
+                    return helper(y) + text
+                local = Thing()
+                local.go()
+                self.index.refresh(text)
+                print(len(text))
+                return [x for x in items if x]
+
+
+        def helper(value):
+            return Agent().run(value)
+        """
+    )
+    got = [(r.name, r.kind, r.line, r.scope) for r in facts.refs]
+    assert got == [
+        ("Base", "name", 4, "Agent"),
+        ("LIMIT", "name", 5, "Agent.run"),
+        ("helper", "call", 7, "Agent.run"),  # вложенная функция — в области внешней
+        ("Thing", "call", 8, "Agent.run"),
+        ("go", "call", 9, "Agent.run"),
+        ("refresh", "call", 10, "Agent.run"),
+        ("index", "attr", 10, "Agent.run"),
+        ("items", "name", 12, "Agent.run"),
+        ("run", "call", 16, "helper"),
+        ("Agent", "call", 16, "helper"),
+    ]
+    # параметры, локальные переменные, переменные включений, self и builtins — не использования
+    names = {r.name for r in facts.refs}
+    assert not names & {"text", "y", "local", "x", "value", "self", "print", "len", "inner"}
+
+
+def test_python_ref_columns_are_characters():
+    facts = _facts("ё = 'ж'; obj.метод()\n")
+    (ref,) = [r for r in facts.refs if r.name == "метод"]
+    assert (ref.kind, ref.col) == ("call", 13)  # в символах: в байтах было бы 16
+
+
+def test_python_imports_absolute_relative_and_aliases():
+    facts = _facts(
+        """\
+        import os.path as osp
+        import json, a.b.c
+        from . import sibling
+        from .core import Engine as E
+        from ..up import thing
+        from ...top import y
+        from ....beyond import x
+        """,
+        path="pkg/sub/mod.py",
+    )
+    got = [(i.module, i.name, i.alias) for i in facts.imports]
+    assert got == [
+        ("os.path", "", "osp"),
+        ("json", "", "json"),
+        ("a.b.c", "", "a"),
+        ("pkg.sub", "sibling", "sibling"),
+        ("pkg.sub.core", "Engine", "E"),
+        ("pkg.up", "thing", "thing"),
+        ("top", "y", "y"),  # модуль в корне проекта
+        ("....beyond", "x", "x"),  # выше корня проекта — не разрешается
+    ]
+    init = _facts("from . import a\n", path="pkg/__init__.py")
+    assert [(i.module, i.name) for i in init.imports] == [("pkg", "a")]
+
+
+def test_python_docstring_and_name_column():
+    symbols = extract_symbols(
+        textwrap.dedent(
+            '''\
+            class Ёж:
+                """
+
+                Первая строка.
+                Вторая.
+                """
+
+                async def  бег(self):
+                    """Очень длинная документация """ + "x" * 0
+            '''
+        ),
+        "python",
+    )
+    by_name = {s.name: s for s in symbols}
+    assert (by_name["Ёж"].doc, by_name["Ёж"].col) == ("Первая строка.", 6)
+    assert (by_name["бег"].doc, by_name["бег"].col) == ("", 15)  # не литерал — не докстринг
+
+
+def test_python_syntax_error_has_symbols_but_no_refs():
+    facts = _facts("def ok():\n    call()\n\ndef broken(:\n")
+    assert [s.name for s in facts.symbols] == ["ok", "broken"]
+    assert facts.refs == [] and facts.imports == []
+
+
+def test_regex_symbols_have_name_column():
+    (sym,) = extract_symbols("export function runTurn() {}\n", "typescript")
+    assert sym.col == len("export function ")
+
+
+@pytest.mark.parametrize(
+    "path, expected",
+    [
+        ("a/b/c.py", ["a", "b", "c"]),
+        ("a/b/__init__.py", ["a", "b"]),
+        ("stubs/x.pyi", ["stubs", "x"]),
+        ("top.py", ["top"]),
+        ("README.md", None),
+    ],
+)
+def test_module_parts(path, expected):
+    assert module_parts(path) == expected

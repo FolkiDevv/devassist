@@ -1,22 +1,25 @@
-"""Извлечение определений (символов) из исходников для индекса проекта.
+"""Извлечение фактов о файле для индекса проекта: определения, использования, импорты.
 
-Python разбирается модулем :mod:`ast` (точно: вложенность, диапазон строк);
-остальные языки — построчными регулярными выражениями (быстро, без
-зависимостей, но эвристично: диапазон строк неизвестен, вложенность почти не
-отслеживается). Новый язык — расширения в :data:`EXTENSIONS` и правила в
-:data:`_RULES`.
+Python разбирается модулем :mod:`ast` (точно: вложенность, диапазон строк,
+докстринги, использования имён и импорты); остальные языки — построчными
+регулярными выражениями (быстро, без зависимостей, но эвристично: диапазон строк
+неизвестен, вложенность почти не отслеживается, использований нет). Новый язык —
+расширения в :data:`EXTENSIONS` и правила в :data:`_RULES`.
 """
 
 from __future__ import annotations
 
 import ast
+import builtins
 import re
-from dataclasses import dataclass
-from pathlib import PurePath
+from dataclasses import dataclass, field
+from pathlib import PurePath, PurePosixPath
 
 MAX_SYMBOLS_PER_FILE = 2000
+MAX_REFS_PER_FILE = 20_000
 _MAX_SIGNATURE = 200
 _MAX_SIGNATURE_LINES = 6
+_MAX_DOC = 120
 
 EXTENSIONS: dict[str, str] = {
     ".py": "python",
@@ -83,10 +86,46 @@ class Symbol:
     parent: str = ""  # объемлющее определение (``Class`` для метода)
     depth: int = 0  # уровень вложенности (для оглавления)
     signature: str = ""
+    doc: str = ""  # первая строка докстринга
+    col: int = 0  # столбец имени в строке (в символах, с 0) — позиция для LSP
 
     @property
     def qualname(self) -> str:
         return f"{self.parent}.{self.name}" if self.parent else self.name
+
+
+@dataclass(frozen=True)
+class Ref:
+    """Использование имени: вызов (``call``), атрибут (``attr``) или имя (``name``)."""
+
+    name: str
+    kind: str
+    line: int
+    col: int  # в символах, с 0
+    scope: str = ""  # объемлющее определение (``Class.method``; "" — уровень модуля)
+
+
+@dataclass(frozen=True)
+class Import:
+    """``import module`` (``name`` пустое) или ``from module import name``.
+
+    Относительный импорт разрешается по пути файла в абсолютный; не разрешённый
+    (выше корня проекта) остаётся с ведущими точками.
+    """
+
+    module: str
+    name: str
+    alias: str  # имя, под которым импортированное доступно в файле
+    line: int
+
+
+@dataclass(frozen=True)
+class FileFacts:
+    """Всё, что индекс знает о файле."""
+
+    symbols: list[Symbol]
+    refs: list[Ref] = field(default_factory=list)
+    imports: list[Import] = field(default_factory=list)
 
 
 def language_of(path: str | PurePath) -> str | None:
@@ -95,20 +134,44 @@ def language_of(path: str | PurePath) -> str | None:
     return FILENAMES.get(p.name) or EXTENSIONS.get(p.suffix.lower())
 
 
-def extract_symbols(text: str, language: str | None) -> list[Symbol]:
-    """Символы файла в порядке появления (не больше :data:`MAX_SYMBOLS_PER_FILE`)."""
+def module_parts(path: str) -> list[str] | None:
+    """Имя Python-модуля по пути от корня: ``a/b/c.py`` → ``[a, b, c]``.
+
+    ``a/b/__init__.py`` — пакет ``[a, b]``; не Python-файл — None. Корень пакетов
+    (``src/``) не угадывается: модули сопоставляются файлам по суффиксу пути.
+    """
+    p = PurePosixPath(path)
+    if p.suffix not in (".py", ".pyi"):
+        return None
+    parts = list(p.parent.parts)
+    if p.stem != "__init__":
+        parts.append(p.stem)
+    return parts
+
+
+def extract(text: str, language: str | None, path: str = "") -> FileFacts:
+    """Факты о файле. ``path`` (от корня проекта) нужен для относительных импортов."""
     if language == "python":
         try:
-            symbols = _python_symbols(text)
+            tree = ast.parse(text)
+            lines = text.splitlines()
+            symbols = _python_symbols(tree, lines)
+            refs, imports = _python_refs(tree, lines, path)
         except (SyntaxError, ValueError, RecursionError):
-            symbols = _regex_symbols(text, _RULES["python"])
-    elif language == "markdown":
+            return FileFacts(_regex_symbols(text, _RULES["python"])[:MAX_SYMBOLS_PER_FILE])
+        return FileFacts(symbols[:MAX_SYMBOLS_PER_FILE], refs, imports)
+    if language == "markdown":
         symbols = _markdown_symbols(text)
     elif language in _RULES:
         symbols = _regex_symbols(text, _RULES[language])
     else:
-        return []
-    return symbols[:MAX_SYMBOLS_PER_FILE]
+        symbols = []
+    return FileFacts(symbols[:MAX_SYMBOLS_PER_FILE])
+
+
+def extract_symbols(text: str, language: str | None) -> list[Symbol]:
+    """Символы файла в порядке появления (не больше :data:`MAX_SYMBOLS_PER_FILE`)."""
+    return extract(text, language).symbols
 
 
 def _clip(signature: str) -> str:
@@ -119,9 +182,36 @@ def _clip(signature: str) -> str:
 
 
 # --------------------------------- Python --------------------------------- #
-def _python_symbols(text: str) -> list[Symbol]:
-    tree = ast.parse(text)
-    lines = text.splitlines()
+def _char_col(line: str, byte_col: int) -> int:
+    """Столбец в символах по смещению ``ast`` (в байтах UTF-8)."""
+    if line.isascii():
+        return byte_col
+    return len(line.encode("utf-8")[:byte_col].decode("utf-8", errors="ignore"))
+
+
+def _line(lines: list[str], lineno: int) -> str:
+    return lines[lineno - 1] if 0 < lineno <= len(lines) else ""
+
+
+def _doc(node: ast.AST) -> str:
+    try:
+        doc = ast.get_docstring(node)  # type: ignore[arg-type]
+    except TypeError:
+        return ""
+    if not doc:
+        return ""
+    first = next((s.strip() for s in doc.splitlines() if s.strip()), "")
+    return first if len(first) <= _MAX_DOC else first[: _MAX_DOC - 1] + "…"
+
+
+def _def_name_col(lines: list[str], node: ast.AST, name: str) -> int:
+    line = _line(lines, node.lineno)  # type: ignore[attr-defined]
+    start = _char_col(line, node.col_offset)  # type: ignore[attr-defined]
+    m = re.compile(rf"\b(?:def|class)\s+({re.escape(name)})\b").search(line, start)
+    return m.start(1) if m else start
+
+
+def _python_symbols(tree: ast.Module, lines: list[str]) -> list[Symbol]:
     out: list[Symbol] = []
 
     def signature(node: ast.AST) -> str:
@@ -160,6 +250,7 @@ def _python_symbols(text: str) -> list[Symbol]:
                                 line=node.lineno,
                                 end_line=node.end_lineno,
                                 signature=_clip(lines[node.lineno - 1]),
+                                col=_char_col(_line(lines, t.lineno), t.col_offset),
                             )
                         )
                 continue
@@ -174,6 +265,8 @@ def _python_symbols(text: str) -> list[Symbol]:
                     parent=parent,
                     depth=depth,
                     signature=signature(node),
+                    doc=_doc(node),
+                    col=_def_name_col(lines, node, node.name),
                 )
             )
             if kind == "class":  # вложенные функции — шум; методы и вложенные классы — нет
@@ -182,6 +275,171 @@ def _python_symbols(text: str) -> list[Symbol]:
 
     visit(tree.body, "", 0, False)
     return out
+
+
+# Имена, использования которых не интересны: встроенные и self/cls.
+_SKIP_NAMES = frozenset(dir(builtins)) | {"self", "cls"}
+
+
+def _local_names(fn: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda) -> frozenset[str]:
+    """Имена, локальные для функции: параметры, присваивания, импорты, вложенные def.
+
+    Обращения к ним — не использования определений проекта. Вложенные функции
+    учитываются вместе с внешней (их имена реже совпадают с глобальными, чем
+    экономится обход); ``global``/``nonlocal`` исключаются.
+    """
+    a = fn.args
+    names = {x.arg for x in (*a.posonlyargs, *a.args, *a.kwonlyargs)}
+    names.update(x.arg for x in (a.vararg, a.kwarg) if x is not None)
+    declared: set[str] = set()
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Name):
+            if not isinstance(node.ctx, ast.Load):
+                names.add(node.id)
+        elif isinstance(node, (ast.Global, ast.Nonlocal)):
+            declared.update(node.names)
+        elif isinstance(node, ast.alias):
+            names.add(node.asname or node.name.split(".")[0])
+        elif isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)):
+            if node.name:
+                names.add(node.name)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if node is not fn:
+                names.add(node.name)
+    return frozenset(names - declared)
+
+
+def _absolute_module(module: str | None, level: int, path: str) -> str:
+    if not level:
+        return module or ""
+    package = list(PurePosixPath(path).parent.parts) if path else None
+    if package is None or level - 1 > len(package):
+        return "." * level + (module or "")
+    base = package[: len(package) - (level - 1)]
+    return ".".join([*base, *([module] if module else [])])
+
+
+class _RefCollector(ast.NodeVisitor):
+    """Использования имён и импорты. Область — объемлющее индексируемое определение
+    (класс или функция уровня модуля/класса; вложенные функции — в своей внешней).
+    """
+
+    def __init__(self, lines: list[str], path: str):
+        self.lines = lines
+        self.path = path
+        self.refs: list[Ref] = []
+        self.imports: list[Import] = []
+        self._seen: set[tuple[str, str, int, str]] = set()
+        self._scope: list[str] = []
+        self._locals: list[frozenset[str]] = []
+        self._in_function = 0
+
+    def _add(self, name: str, kind: str, line: int, byte_col: int) -> None:
+        if len(name) < 2 or name in _SKIP_NAMES or (name.startswith("__") and name.endswith("__")):
+            return
+        scope = ".".join(self._scope)
+        key = (name, kind, line, scope)
+        if key in self._seen or len(self.refs) >= MAX_REFS_PER_FILE:
+            return
+        self._seen.add(key)
+        col = _char_col(_line(self.lines, line), byte_col)
+        self.refs.append(Ref(name=name, kind=kind, line=line, col=col, scope=scope))
+
+    def _local(self, name: str) -> bool:
+        return bool(self._locals) and name in self._locals[-1]
+
+    def _with_locals(self, node: ast.AST, names: frozenset[str]) -> None:
+        outer = self._locals[-1] if self._locals else frozenset()
+        self._locals.append(outer | names)
+        self.generic_visit(node)
+        self._locals.pop()
+
+    # ------------------------------ области ------------------------------ #
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        indexed = not self._in_function
+        if indexed:
+            self._scope.append(node.name)
+        self.generic_visit(node)
+        if indexed:
+            self._scope.pop()
+
+    def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        indexed = not self._in_function
+        if indexed:
+            self._scope.append(node.name)
+        self._in_function += 1
+        self._with_locals(node, _local_names(node))
+        self._in_function -= 1
+        if indexed:
+            self._scope.pop()
+
+    visit_FunctionDef = _visit_function
+    visit_AsyncFunctionDef = _visit_function
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        self._with_locals(node, _local_names(node))
+
+    def _visit_comprehension(self, node: ast.AST) -> None:
+        names = frozenset(
+            n.id
+            for gen in node.generators  # type: ignore[attr-defined]
+            for n in ast.walk(gen.target)
+            if isinstance(n, ast.Name)
+        )
+        self._with_locals(node, names)
+
+    visit_ListComp = _visit_comprehension
+    visit_SetComp = _visit_comprehension
+    visit_DictComp = _visit_comprehension
+    visit_GeneratorExp = _visit_comprehension
+
+    # ---------------------------- использования --------------------------- #
+    def visit_Name(self, node: ast.Name) -> None:
+        if isinstance(node.ctx, ast.Load) and not self._local(node.id):
+            self._add(node.id, "name", node.lineno, node.col_offset)
+
+    def _attr(self, node: ast.Attribute, kind: str) -> None:
+        end = node.end_col_offset or 0
+        line = node.end_lineno or node.lineno
+        self._add(node.attr, kind, line, end - len(node.attr.encode("utf-8")))
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        self._attr(node, "attr")
+        self.visit(node.value)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        func = node.func
+        if isinstance(func, ast.Name):
+            if not self._local(func.id):
+                self._add(func.id, "call", func.lineno, func.col_offset)
+        elif isinstance(func, ast.Attribute):
+            self._attr(func, "call")
+            self.visit(func.value)
+        else:
+            self.visit(func)
+        for arg in node.args:
+            self.visit(arg)
+        for kw in node.keywords:
+            self.visit(kw)
+
+    # ------------------------------ импорты ------------------------------ #
+    def visit_Import(self, node: ast.Import) -> None:
+        for a in node.names:
+            alias = a.asname or a.name.split(".")[0]
+            self.imports.append(Import(module=a.name, name="", alias=alias, line=node.lineno))
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        module = _absolute_module(node.module, node.level, self.path)
+        for a in node.names:
+            self.imports.append(
+                Import(module=module, name=a.name, alias=a.asname or a.name, line=node.lineno)
+            )
+
+
+def _python_refs(tree: ast.Module, lines: list[str], path: str) -> tuple[list[Ref], list[Import]]:
+    collector = _RefCollector(lines, path)
+    collector.visit(tree)
+    return collector.refs, collector.imports
 
 
 # -------------------------------- Markdown -------------------------------- #
@@ -381,6 +639,7 @@ def _regex_symbols(text: str, rules: list[_Rule]) -> list[Symbol]:
                     parent=groups.get("parent") or "",
                     depth=1 if indent else 0,
                     signature=_clip(line),
+                    col=m.start("name"),
                 )
             )
             break

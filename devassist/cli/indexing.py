@@ -24,6 +24,10 @@ def _symbols(n: int) -> str:
     return f"{n} {plural(n, 'определение', 'определения', 'определений')}"
 
 
+def _refs(n: int) -> str:
+    return f"{n} {plural(n, 'использование', 'использования', 'использований')}"
+
+
 def _size(n: int) -> str:
     if n >= 1024 * 1024:
         return f"{n / 1024 / 1024:.1f} МБ"
@@ -109,8 +113,9 @@ def describe_index(refreshed: RefreshStats, stats: IndexStats) -> str:
         if refreshed.changed
         else "изменений нет"
     )
+    refs = f", {_refs(stats.refs)}" if stats.refs else ""
     return (
-        f"индекс проекта: {_files(stats.files)}, {_symbols(stats.symbols)}\n"
+        f"индекс проекта: {_files(stats.files)}, {_symbols(stats.symbols)}{refs}\n"
         f"  языки: {languages}\n"
         f"  {changes} ({refreshed.duration_s:.1f} с); "
         f"размер {_size(stats.db_bytes)}"

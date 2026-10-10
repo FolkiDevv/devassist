@@ -1,4 +1,5 @@
-"""Индекс проекта: файлы и определения (символы) в ``.devassist/index/``.
+"""Индекс проекта: файлы, определения (символы), использования и импорты в
+``.devassist/index/``.
 
 Индекс — база SQLite (stdlib): выборки и точечные правки не требуют загружать его
 целиком в память, поэтому он годится и для больших кодовых баз. Обновление
@@ -12,6 +13,10 @@
 
 Файлы с секретами (``.env``) не индексируются; большие и бинарные файлы попадают
 в список файлов без разбора содержимого.
+
+Использования (:meth:`ProjectIndex.find_refs`) — по имени, без вывода типов:
+результат ранжируется по тому, насколько вероятно, что имя ссылается на найденное
+определение (файл импортирует модуль определения > тот же файл > только имя).
 """
 
 from __future__ import annotations
@@ -24,10 +29,10 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from devassist.project.files import glob_match, is_excluded, is_secret_path, walk_files
-from devassist.project.symbols import Symbol, extract_symbols, language_of
+from devassist.project.symbols import Symbol, extract, language_of, module_parts
 from devassist.project.workspace import Workspace
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 INDEX_FILE_NAME = "index.sqlite3"
 MAX_INDEX_FILE_BYTES = 1_000_000  # крупнее — сгенерированное/дампы: без разбора
 _BINARY_PROBE = 8192
@@ -74,11 +79,39 @@ CREATE TABLE symbols (
     line INTEGER NOT NULL,
     end_line INTEGER,
     depth INTEGER NOT NULL,
-    signature TEXT NOT NULL
+    signature TEXT NOT NULL,
+    doc TEXT NOT NULL,
+    col INTEGER NOT NULL
 );
 CREATE INDEX symbols_name ON symbols (name_lower);
 CREATE INDEX symbols_path ON symbols (path);
+CREATE TABLE refs (
+    path TEXT NOT NULL,
+    name TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    line INTEGER NOT NULL,
+    col INTEGER NOT NULL,
+    scope TEXT NOT NULL
+);
+CREATE INDEX refs_name ON refs (name);
+CREATE INDEX refs_path ON refs (path);
+CREATE TABLE imports (
+    path TEXT NOT NULL,
+    module TEXT NOT NULL,
+    name TEXT NOT NULL,
+    alias TEXT NOT NULL,
+    line INTEGER NOT NULL
+);
+CREATE INDEX imports_path ON imports (path);
+CREATE INDEX imports_module ON imports (module);
 """
+
+# Уровни разрешения использования — от надёжного к эвристике.
+RESOLVED_IMPORT = "import"  # файл импортирует модуль, где имя определено
+RESOLVED_SAME_FILE = "same_file"
+RESOLVED_NAME = "name_only"
+_RESOLUTION_ORDER = {RESOLVED_IMPORT: 0, RESOLVED_SAME_FILE: 1, RESOLVED_NAME: 2}
+REF_IMPORT = "import"  # вид использования: строка импорта
 
 # Состояния файла в индексе.
 STATUS_INDEXED = "indexed"
@@ -94,6 +127,8 @@ class RefreshStats:
     updated: int = 0
     removed: int = 0
     duration_s: float = 0.0
+    changed_paths: tuple[str, ...] = ()  # добавленные и изменённые
+    removed_paths: tuple[str, ...] = ()
 
     @property
     def changed(self) -> int:
@@ -104,6 +139,7 @@ class RefreshStats:
 class IndexStats:
     files: int
     symbols: int
+    refs: int
     languages: list[tuple[str, int]]  # (язык, файлов) по убыванию
     complete: bool
     updated_at: float | None  # время последнего полного обновления (epoch)
@@ -123,6 +159,33 @@ class FileEntry:
 class SymbolHit:
     path: str
     symbol: Symbol
+
+
+@dataclass(frozen=True)
+class RefHit:
+    """Использование имени. ``kind``: call, attr, name или import (строка импорта)."""
+
+    path: str
+    line: int
+    col: int
+    kind: str
+    scope: str
+    resolution: str  # RESOLVED_*
+
+
+@dataclass(frozen=True)
+class RefsResult:
+    definitions: list[SymbolHit]
+    hits: list[RefHit]  # первые ``limit``
+    total: int
+
+
+@dataclass(frozen=True)
+class ImportEntry:
+    module: str
+    name: str
+    line: int
+    target: str | None  # файл проекта, куда ведёт импорт (None — внешний/не найден)
 
 
 def _escape_like(text: str) -> str:
@@ -156,6 +219,7 @@ class ProjectIndex:
     def __init__(self, workspace: Workspace):
         self._ws = workspace
         self._conn: sqlite3.Connection | None = None
+        self._modules: dict[str, str | None] = {}  # кэш resolve_module до refresh
 
     # ------------------------------------------------------------------ #
     @property
@@ -284,6 +348,7 @@ class ProjectIndex:
         }
         scanned = added = updated = pending = 0
         seen: set[str] = set()
+        changed: list[str] = []
         try:
             if full:
                 with db:
@@ -309,6 +374,7 @@ class ProjectIndex:
                 if old == (st.st_size, st.st_mtime_ns):
                     continue
                 self._index_file(rel, path, st)
+                changed.append(rel)
                 if rel not in known:
                     added += 1
                 else:
@@ -320,8 +386,8 @@ class ProjectIndex:
             gone = [p for p in known if p not in seen]
             for chunk in _chunks(gone, 500):
                 marks = ",".join("?" * len(chunk))
-                db.execute(f"DELETE FROM symbols WHERE path IN ({marks})", chunk)
-                db.execute(f"DELETE FROM files WHERE path IN ({marks})", chunk)
+                for table in ("symbols", "refs", "imports", "files"):
+                    db.execute(f"DELETE FROM {table} WHERE path IN ({marks})", chunk)
             if full:
                 self._set_meta("complete", "1")
                 self._set_meta("updated_at", str(time.time()))
@@ -329,17 +395,21 @@ class ProjectIndex:
         except BaseException:
             db.rollback()
             raise
+        finally:
+            self._modules.clear()
         return RefreshStats(
             scanned=scanned,
             added=added,
             updated=updated,
             removed=len(gone),
             duration_s=time.monotonic() - started,
+            changed_paths=tuple(changed),
+            removed_paths=tuple(gone),
         )
 
     def _index_file(self, rel: str, path: Path, st) -> None:
         language = language_of(rel)
-        status, lines, symbols = STATUS_INDEXED, 0, []
+        status, lines, facts = STATUS_INDEXED, 0, None
         if st.st_size > MAX_INDEX_FILE_BYTES:
             status = STATUS_LARGE
         else:
@@ -353,17 +423,20 @@ class ProjectIndex:
                 text = data.decode("utf-8", errors="replace")
                 lines = _count_lines(text)
                 try:
-                    symbols = extract_symbols(text, language)
+                    facts = extract(text, language, rel)
                 except Exception:  # разбор — эвристика: сбой на одном файле не валит индекс
                     status = STATUS_ERROR
         db = self._db
-        db.execute("DELETE FROM symbols WHERE path = ?", (rel,))
+        for table in ("symbols", "refs", "imports"):
+            db.execute(f"DELETE FROM {table} WHERE path = ?", (rel,))
         db.execute(
             "INSERT OR REPLACE INTO files VALUES (?, ?, ?, ?, ?, ?)",
             (rel, st.st_size, st.st_mtime_ns, language, lines, status),
         )
+        if facts is None:
+            return
         db.executemany(
-            "INSERT INTO symbols VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO symbols VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 (
                     rel,
@@ -376,9 +449,19 @@ class ProjectIndex:
                     s.end_line,
                     s.depth,
                     s.signature,
+                    s.doc,
+                    s.col,
                 )
-                for s in symbols
+                for s in facts.symbols
             ],
+        )
+        db.executemany(
+            "INSERT INTO refs VALUES (?, ?, ?, ?, ?, ?)",
+            [(rel, r.name, r.kind, r.line, r.col, r.scope) for r in facts.refs],
+        )
+        db.executemany(
+            "INSERT INTO imports VALUES (?, ?, ?, ?, ?)",
+            [(rel, i.module, i.name, i.alias, i.line) for i in facts.imports],
         )
 
     def rebuild(self, *, progress: Callable[[int], None] | None = None) -> RefreshStats:
@@ -393,6 +476,7 @@ class ProjectIndex:
         db = self._db
         files = db.execute("SELECT COUNT(*) FROM files").fetchone()[0]
         symbols = db.execute("SELECT COUNT(*) FROM symbols").fetchone()[0]
+        refs = db.execute("SELECT COUNT(*) FROM refs").fetchone()[0]
         languages = [
             (lang, n)
             for lang, n in db.execute(
@@ -412,6 +496,7 @@ class ProjectIndex:
         return IndexStats(
             files=files,
             symbols=symbols,
+            refs=refs,
             languages=languages,
             complete=self._meta("complete") == "1",
             updated_at=float(updated) if updated else None,
@@ -449,7 +534,7 @@ class ProjectIndex:
             where.append(f"kind IN ({','.join('?' * len(kinds))})")
             args += list(kinds)
         sql = (
-            "SELECT path, name, kind, line, end_line, parent, depth, signature, "
+            "SELECT path, name, kind, line, end_line, parent, depth, signature, doc, col, "
             "CASE WHEN name_lower = ? THEN 0 WHEN name_lower LIKE ? ESCAPE '\\' THEN 1 "
             "ELSE 2 END AS rank "
             f"FROM symbols WHERE {' AND '.join(where)} "
@@ -463,7 +548,7 @@ class ProjectIndex:
                 continue
             total += 1
             if len(hits) < limit:
-                hits.append(SymbolHit(row[0], _symbol(row[1:8])))
+                hits.append(SymbolHit(row[0], _symbol(row[1:10])))
             if total >= _COUNT_CAP:
                 break
         return hits, total
@@ -482,11 +567,140 @@ class ProjectIndex:
     def outline(self, rel_path: str) -> list[Symbol]:
         """Определения файла в порядке строк."""
         rows = self._db.execute(
-            "SELECT name, kind, line, end_line, parent, depth, signature FROM symbols "
+            "SELECT name, kind, line, end_line, parent, depth, signature, doc, col FROM symbols "
             "WHERE path = ? ORDER BY line, depth",
             (rel_path,),
         )
         return [_symbol(r) for r in rows]
+
+    # ------------------------- использования, импорты ------------------------- #
+    def resolve_module(self, module: str) -> str | None:
+        """Файл проекта с модулем ``a.b.c``: ``…/a/b/c.py``, ``.pyi`` или ``…/__init__.py``.
+
+        Совпадение — по суффиксу пути (корень пакетов, например ``src/``, не нужен);
+        из нескольких — ближайший к корню, ``.py`` раньше ``.pyi``.
+        """
+        if module in self._modules:
+            return self._modules[module]
+        found: str | None = None
+        if module and not module.startswith("."):
+            base = module.replace(".", "/")
+            candidates = []
+            for suffix in (f"{base}.py", f"{base}/__init__.py", f"{base}.pyi"):
+                rows = self._db.execute(
+                    "SELECT path FROM files WHERE path = ? OR path LIKE ? ESCAPE '\\'",
+                    (suffix, f"%/{_escape_like(suffix)}"),
+                )
+                # LIKE не различает регистр ASCII — сверяем точно
+                candidates += [r[0] for r in rows if r[0] == suffix or r[0].endswith(f"/{suffix}")]
+            if candidates:
+                found = min(candidates, key=lambda p: (p.count("/"), p.endswith(".pyi"), p))
+        self._modules[module] = found
+        return found
+
+    def _import_target(self, module: str, name: str) -> str | None:
+        """Куда ведёт импорт: ``from pkg import mod`` — подмодуль, иначе сам модуль."""
+        if name and name != "*":
+            sub = self.resolve_module(f"{module}.{name}" if module else name)
+            if sub is not None:
+                return sub
+        return self.resolve_module(module)
+
+    def imports_of(self, rel_path: str) -> list[ImportEntry]:
+        """Импорты файла с разрешёнными целями, в порядке строк."""
+        rows = self._db.execute(
+            "SELECT module, name, line FROM imports WHERE path = ? ORDER BY line", (rel_path,)
+        ).fetchall()
+        return [
+            ImportEntry(module, name, line, self._import_target(module, name))
+            for module, name, line in rows
+        ]
+
+    def imported_by(self, rel_path: str) -> list[tuple[str, int]]:
+        """Файлы проекта, импортирующие ``rel_path``: (путь, первая строка импорта)."""
+        parts = module_parts(rel_path)
+        if not parts:
+            return []
+        modules = _module_suffixes(parts)
+        parents = _module_suffixes(parts[:-1]) if len(parts) > 1 else [""]
+        marks = ",".join("?" * len(modules))
+        pmarks = ",".join("?" * len(parents))
+        rows = self._db.execute(
+            "SELECT path, module, name, line FROM imports "
+            f"WHERE module IN ({marks}) OR (module IN ({pmarks}) AND name = ?) "
+            "ORDER BY path, line",
+            [*modules, *parents, parts[-1]],
+        )
+        found: dict[str, int] = {}
+        for path, module, name, line in rows:
+            if path != rel_path and path not in found:
+                if self._import_target(module, name) == rel_path:
+                    found[path] = line
+        return sorted(found.items())
+
+    def find_refs(
+        self,
+        query: str,
+        *,
+        kind: str | None = None,
+        path_glob: str | None = None,
+        limit: int = 50,
+    ) -> RefsResult:
+        """Использования определения ``query`` (``name`` или ``Class.method``).
+
+        Определения ищутся без учёта регистра (точное имя), использования — по
+        точному имени найденных определений (или по самому запросу, если их нет).
+        ``kind``: call, attr, name, import; None — все.
+        """
+        query = query.strip()
+        if not query.strip("."):
+            raise ValueError("пустой запрос")
+        name = query.rsplit(".", 1)[-1] if "." in query.strip(".") else query.strip(".")
+        hits, _ = self.find_symbols(query, limit=_COUNT_CAP)
+        definitions = [h for h in hits if h.symbol.name.lower() == name.lower()]
+        names = sorted({h.symbol.name for h in definitions}) or [name]
+        def_paths = {h.path for h in definitions}
+        kinds = None if not kind else {kind.strip().lower()}
+
+        marks = ",".join("?" * len(names))
+        imported = self._db.execute(
+            f"SELECT path, line, alias FROM imports WHERE name IN ({marks})", names
+        ).fetchall()
+        rows: list[tuple[str, int, int, str, str]] = []
+        if kinds is None or kinds - {REF_IMPORT}:
+            rows += self._db.execute(
+                f"SELECT path, line, col, kind, scope FROM refs WHERE name IN ({marks})", names
+            ).fetchall()
+            # `from m import f as g` — в этом файле f используется как g
+            for path, alias in {(p, a) for p, _, a in imported if a not in names}:
+                rows += self._db.execute(
+                    "SELECT path, line, col, kind, scope FROM refs WHERE name = ? AND path = ?",
+                    (alias, path),
+                ).fetchall()
+        if kinds is None or REF_IMPORT in kinds:
+            rows += [(path, line, 0, REF_IMPORT, "") for path, line, _ in imported]
+
+        imports_def: dict[str, bool] = {}
+
+        def resolution(path: str) -> str:
+            if path in def_paths:
+                return RESOLVED_SAME_FILE
+            if path not in imports_def:
+                imports_def[path] = any(e.target in def_paths for e in self.imports_of(path))
+            return RESOLVED_IMPORT if imports_def[path] else RESOLVED_NAME
+
+        out: list[RefHit] = []
+        for path, line, col, ref_kind, scope in rows:
+            if kinds is not None and ref_kind not in kinds:
+                continue
+            if path_glob and not glob_match(path, path_glob):
+                continue
+            # строка определения — не использование
+            if any(h.path == path and h.symbol.line == line for h in definitions):
+                continue
+            out.append(RefHit(path, line, col, ref_kind, scope, resolution(path)))
+        out.sort(key=lambda h: (_RESOLUTION_ORDER[h.resolution], h.path, h.line, h.col))
+        return RefsResult(definitions=definitions[:limit], hits=out[:limit], total=len(out))
 
     def files_under(self, rel_dir: str) -> Iterator[FileEntry]:
         """Файлы каталога (рекурсивно) с числом символов, по пути."""
@@ -502,8 +716,13 @@ class ProjectIndex:
             yield FileEntry(path, language, lines, status, symbols=count)
 
 
+def _module_suffixes(parts: list[str]) -> list[str]:
+    """``[a, b, c]`` → ``a.b.c``, ``b.c``, ``c`` (корень пакетов неизвестен)."""
+    return [".".join(parts[i:]) for i in range(len(parts))]
+
+
 def _symbol(row) -> Symbol:
-    name, kind, line, end_line, parent, depth, signature = row
+    name, kind, line, end_line, parent, depth, signature, doc, col = row
     return Symbol(
         name=name,
         kind=kind,
@@ -512,6 +731,8 @@ def _symbol(row) -> Symbol:
         parent=parent,
         depth=depth,
         signature=signature,
+        doc=doc,
+        col=col,
     )
 
 
