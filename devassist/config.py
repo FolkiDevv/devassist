@@ -210,6 +210,9 @@ class Config:
     # Предлагать замер окна незамеренной модели (пробы оплачиваются); False — только
     # по --test-context.
     auto_measure: bool = True
+    # Точная навигация по Python-коду через ty (LSP-сервер, запускается лениво);
+    # False — только индекс проекта.
+    ty: bool = True
 
     @classmethod
     def load(
@@ -270,6 +273,7 @@ class Config:
             / 100,
             save_chats=save_chats and _env_bool(env, "DEVASSIST_SAVE_CHATS", True),
             auto_measure=_env_bool(env, "DEVASSIST_AUTO_MEASURE", True),
+            ty=_env_bool(env, "DEVASSIST_TY", True),
         )
 
     @property

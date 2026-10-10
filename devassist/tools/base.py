@@ -19,7 +19,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Generic, Literal, TypeVar
+from typing import Any, Literal
 
 from pydantic import BaseModel
 
@@ -40,8 +40,6 @@ __all__ = [
     "build_default_registry",
 ]
 
-P = TypeVar("P", bound=BaseModel)
-
 
 @dataclass(frozen=True)
 class ToolContext:
@@ -50,13 +48,15 @@ class ToolContext:
     Намеренно не содержит Config: инструментам не нужны (и не должны быть
     доступны) реквизиты API. ``ask_user`` — способ задать вопрос пользователю
     (None — спросить некого). ``get_mode``/``set_mode`` — текущий режим разрешений
-    агента (None — агента нет, например в тестах инструмента).
+    агента (None — агента нет, например в тестах инструмента). ``semantic`` —
+    разрешена ли точная навигация через ty (``DEVASSIST_TY``).
     """
 
     workspace: Workspace
     ask_user: AskUser | None = None
     get_mode: Callable[[], PermissionMode] | None = None
     set_mode: Callable[[PermissionMode], None] | None = None
+    semantic: bool = True
 
     @property
     def root(self) -> Path:
@@ -141,7 +141,7 @@ def _clean_schema(model: type[BaseModel]) -> dict[str, Any]:
     return schema
 
 
-class Tool(ABC, Generic[P]):
+class Tool[P: BaseModel](ABC):
     name: str = ""
     description: str = ""
     Params: type[BaseModel] = BaseModel
@@ -238,7 +238,12 @@ def build_default_registry() -> ToolRegistry:
         WriteFileTool,
     )
     from devassist.tools.git import GitTool
-    from devassist.tools.index import FileOutlineTool, FindSymbolTool
+    from devassist.tools.index import FileOutlineTool, FindSymbolTool, RepoMapTool
+    from devassist.tools.navigation import (
+        CallHierarchyTool,
+        FindReferencesTool,
+        GotoDefinitionTool,
+    )
     from devassist.tools.plan import ExitPlanModeTool
     from devassist.tools.search import SearchContentTool
     from devassist.tools.shell import RunShellTool
@@ -252,7 +257,11 @@ def build_default_registry() -> ToolRegistry:
         FindFilesTool(),
         SearchContentTool(),
         FindSymbolTool(),
+        FindReferencesTool(),
+        GotoDefinitionTool(),
+        CallHierarchyTool(),
         FileOutlineTool(),
+        RepoMapTool(),
         RunShellTool(),
         GitTool(),
         AskUserTool(),

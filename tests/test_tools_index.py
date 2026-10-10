@@ -150,9 +150,41 @@ def test_broken_index_becomes_tool_error(ctx, monkeypatch):
 def test_file_outline_reports_parse_errors(ctx, monkeypatch):
     from devassist.project import index as index_mod
 
-    def boom(text, language):
+    def boom(text, language, path):
         raise RuntimeError("сбой разбора")
 
-    monkeypatch.setattr(index_mod, "extract_symbols", boom)
+    monkeypatch.setattr(index_mod, "extract", boom)
     with pytest.raises(ToolError, match="Не удалось разобрать"):
         _outline(ctx, "app/agent.py")
+
+
+# ------------------------------ импорты и докстринги ------------------------------ #
+def _cli(ctx):
+    _make(
+        ctx.root,
+        "app/cli.py",
+        "from app.agent import Agent, helper\n\n\n"
+        "def main(text):\n"
+        "    Agent().run_turn(text)\n"
+        "    helper()\n",
+    )
+    _make(ctx.root, "scripts/x.py", "def other(bot):\n    bot.run_turn()\n")
+
+
+def test_file_outline_shows_project_imports(ctx):
+    _cli(ctx)
+    cli = _outline(ctx, "app/cli.py").content.splitlines()
+    assert cli[:2] == [
+        "app/cli.py (python, строк: 6, определений: 1)",
+        "импортирует из проекта: app/agent.py",
+    ]
+    agent = _outline(ctx, "app/agent.py").content.splitlines()
+    assert agent[1] == "импортируется в (1): app/cli.py"
+
+
+def test_find_symbol_and_outline_show_docstring(ctx):
+    _make(ctx.root, "app/doc.py", 'def documented():\n    """Делает дело.\n\n    Подробно."""\n')
+    assert _find(ctx, query="documented").content.endswith("  # Делает дело.")
+    assert _outline(ctx, "app/doc.py").content.splitlines()[1] == (
+        "1-4  def documented():  # Делает дело."
+    )

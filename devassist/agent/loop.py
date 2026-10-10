@@ -123,6 +123,7 @@ class Agent:
             ask_user=self._events.ask_user,
             get_mode=lambda: self._mode,
             set_mode=self.set_mode,
+            semantic=config.ty,
         )
         self._conversation = Conversation() if conversation is None else conversation
         self._model = config.model

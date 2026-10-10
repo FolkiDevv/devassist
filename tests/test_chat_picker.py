@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import io
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
 from prompt_toolkit.input import create_pipe_input
@@ -124,7 +124,7 @@ def test_format_when():
     assert format_when(datetime(2026, 3, 1, 8, 0, tzinfo=NOW.tzinfo), NOW) == "01.03 08:00"
     assert format_when(datetime(2025, 3, 1, tzinfo=NOW.tzinfo), NOW) == "01.03.2025"
     # время в другом поясе приводится к местному; наивное считается местным
-    assert format_when(NOW.astimezone(timezone.utc), NOW) == "только что"
+    assert format_when(NOW.astimezone(UTC), NOW) == "только что"
     assert format_when(datetime.now(), None) == "только что"
 
 

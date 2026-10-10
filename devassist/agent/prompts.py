@@ -6,7 +6,9 @@ from collections.abc import Sequence
 
 from devassist.permissions import PermissionMode
 from devassist.project.files import TREE_TRUNCATED, build_file_tree
+from devassist.project.index import INDEX_ERRORS, ProjectIndex
 from devassist.project.instructions import InstructionFile, load_instructions
+from devassist.project.repomap import DEFAULT_MAP_CHARS, build_repo_map
 from devassist.project.workspace import Workspace
 
 SYSTEM_PROMPT = """\
@@ -23,9 +25,12 @@ SYSTEM_PROMPT = """\
 - Прежде чем редактировать файл, ОБЯЗАТЕЛЬНО прочитай его (read_file) в этом же \
 диалоге, чтобы скопировать old_string дословно — точные отступы, пробелы и \
 переносы строк.
-- Навигация по коду: где определён класс/функцию — find_symbol, структура файла или \
-каталога — file_outline; затем читай read_file только нужный диапазон строк. \
-Использования и произвольный текст ищи через search_content.
+- Навигация по коду: главное в проекте или вокруг нужных файлов — repo_map, где \
+определён класс/функцию — find_symbol, где используется — find_references, кто \
+вызывает функцию или что вызывает она сама — call_hierarchy, куда ведёт имя в \
+конкретной строке (и его тип) — goto_definition, структура файла или каталога (и \
+его импорты) — file_outline; затем читай read_file только нужный диапазон строк. \
+Произвольный текст ищи через search_content.
 - Делай минимальные точечные изменения через edit_file; перезаписывай файл целиком \
 (write_file) только когда это оправдано.
 - ОДИН вызов инструмента за один ответ. Вызвал — дождись результата (наблюдения) — \
@@ -139,7 +144,27 @@ def build_project_context(workspace: Workspace) -> str:
                 "(Проект крупный, дерево неполное: обзор каталога — file_outline, "
                 "поиск файлов — find_files, определений — find_symbol.)"
             )
+            repo_map = _repo_map(workspace)
+            if repo_map:
+                parts.append(
+                    "\nКарта проекта — ключевые определения, ранжированные по связям "
+                    "(карта под задачу — repo_map, файл целиком — file_outline):\n"
+                    f"{repo_map}"
+                )
     return "\n".join(parts)
+
+
+def _repo_map(workspace: Workspace) -> str:
+    """Карта по готовому индексу ("" — индекса нет или он недостроен: не строим)."""
+    index = ProjectIndex(workspace)
+    try:
+        if not index.is_complete():
+            return ""
+        return build_repo_map(index, max_chars=DEFAULT_MAP_CHARS).text
+    except INDEX_ERRORS:
+        return ""
+    finally:
+        index.close()
 
 
 NESTED_HEADER = "=== ИНСТРУКЦИИ ПОДКАТАЛОГОВ ==="

@@ -1,22 +1,27 @@
-"""Извлечение определений (символов) из исходников для индекса проекта.
+"""Извлечение фактов о файле для индекса проекта: определения, использования, импорты.
 
-Python разбирается модулем :mod:`ast` (точно: вложенность, диапазон строк);
-остальные языки — построчными регулярными выражениями (быстро, без
-зависимостей, но эвристично: диапазон строк неизвестен, вложенность почти не
-отслеживается). Новый язык — расширения в :data:`EXTENSIONS` и правила в
-:data:`_RULES`.
+Python разбирается модулем :mod:`ast` (точно: вложенность, диапазон строк,
+докстринги, использования имён и импорты); JS/TS, Go, Rust, Java, Kotlin, C#, Ruby,
+PHP, C/C++, shell, Scala и Swift — tree-sitter (:mod:`devassist.project.treesitter`:
+определения с диапазоном и вложенностью, вызовы). Построчные регулярные выражения —
+запасной путь, если грамматика не загрузилась. Новый язык — расширения в
+:data:`EXTENSIONS` и таблицы в ``treesitter.SPECS`` (правила в :data:`_RULES` —
+по желанию).
 """
 
 from __future__ import annotations
 
 import ast
+import builtins
 import re
-from dataclasses import dataclass
-from pathlib import PurePath
+from dataclasses import dataclass, field
+from pathlib import PurePath, PurePosixPath
 
 MAX_SYMBOLS_PER_FILE = 2000
+MAX_REFS_PER_FILE = 20_000
 _MAX_SIGNATURE = 200
 _MAX_SIGNATURE_LINES = 6
+_MAX_DOC = 120
 
 EXTENSIONS: dict[str, str] = {
     ".py": "python",
@@ -83,10 +88,54 @@ class Symbol:
     parent: str = ""  # объемлющее определение (``Class`` для метода)
     depth: int = 0  # уровень вложенности (для оглавления)
     signature: str = ""
+    doc: str = ""  # первая строка докстринга
+    col: int = 0  # столбец имени в строке (в символах, с 0) — позиция для LSP
 
     @property
     def qualname(self) -> str:
         return f"{self.parent}.{self.name}" if self.parent else self.name
+
+
+@dataclass(frozen=True)
+class Ref:
+    """Использование имени: вызов (``call``), атрибут (``attr``) или имя (``name``)."""
+
+    name: str
+    kind: str
+    line: int
+    col: int  # в символах, с 0
+    scope: str = ""  # объемлющее определение (``Class.method``; "" — уровень модуля)
+
+
+@dataclass(frozen=True)
+class Import:
+    """``import module`` (``name`` пустое) или ``from module import name``.
+
+    Относительный импорт разрешается по пути файла в абсолютный; не разрешённый
+    (выше корня проекта) остаётся с ведущими точками.
+    """
+
+    module: str
+    name: str
+    alias: str  # имя, под которым импортированное доступно в файле
+    line: int
+
+
+@dataclass(frozen=True)
+class FileFacts:
+    """Всё, что индекс знает о файле."""
+
+    symbols: list[Symbol]
+    refs: list[Ref] = field(default_factory=list)
+    imports: list[Import] = field(default_factory=list)
+
+
+def split_lines(text: str) -> list[str]:
+    """Строки как их нумеруют ``ast``, tree-sitter и LSP: разрыв — только ``\\n``,
+    ``\\r\\n`` или ``\\r``. ``str.splitlines`` режет ещё и по ``\\f``, ``\\v``,
+    ``\\u2028``… — номера строк после таких символов разъезжаются.
+    """
+    return text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
 
 
 def language_of(path: str | PurePath) -> str | None:
@@ -95,23 +144,60 @@ def language_of(path: str | PurePath) -> str | None:
     return FILENAMES.get(p.name) or EXTENSIONS.get(p.suffix.lower())
 
 
-def extract_symbols(text: str, language: str | None) -> list[Symbol]:
-    """Символы файла в порядке появления (не больше :data:`MAX_SYMBOLS_PER_FILE`)."""
+def module_parts(path: str) -> list[str] | None:
+    """Имя Python-модуля по пути от корня: ``a/b/c.py`` → ``[a, b, c]``.
+
+    ``a/b/__init__.py`` — пакет ``[a, b]``; не Python-файл — None. Корень пакетов
+    (``src/``) не угадывается: модули сопоставляются файлам по суффиксу пути.
+    """
+    p = PurePosixPath(path)
+    if p.suffix not in (".py", ".pyi"):
+        return None
+    parts = list(p.parent.parts)
+    if p.stem != "__init__":
+        parts.append(p.stem)
+    return parts
+
+
+def extract(text: str, language: str | None, path: str = "") -> FileFacts:
+    """Факты о файле. ``path`` (от корня проекта) нужен для относительных импортов.
+
+    Python — ``ast`` (при неудаче — tree-sitter, затем регэкспы); Markdown —
+    заголовки; остальные языки — tree-sitter, без грамматики — регэкспы.
+    """
+    # импорт здесь: treesitter сам опирается на типы этого модуля
+    from devassist.project import treesitter
+
     if language == "python":
         try:
-            symbols = _python_symbols(text)
+            tree = ast.parse(text)
+            lines = split_lines(text)
+            symbols = _python_symbols(tree, lines)
+            refs, imports = _python_refs(tree, lines, path)
         except (SyntaxError, ValueError, RecursionError):
-            symbols = _regex_symbols(text, _RULES["python"])
-    elif language == "markdown":
-        symbols = _markdown_symbols(text)
-    elif language in _RULES:
-        symbols = _regex_symbols(text, _RULES[language])
-    else:
-        return []
-    return symbols[:MAX_SYMBOLS_PER_FILE]
+            facts = treesitter.extract(text, language, path)
+            if facts is not None:
+                return facts
+            return FileFacts(_regex_symbols(text, _RULES["python"])[:MAX_SYMBOLS_PER_FILE])
+        return FileFacts(symbols[:MAX_SYMBOLS_PER_FILE], refs, imports)
+    if language == "markdown":
+        return FileFacts(_markdown_symbols(text)[:MAX_SYMBOLS_PER_FILE])
+    if language is not None and treesitter.supports(language):
+        facts = treesitter.extract(text, language, path)
+        if facts is not None:
+            return facts
+    if language in _RULES:
+        return FileFacts(_regex_symbols(text, _RULES[language])[:MAX_SYMBOLS_PER_FILE])
+    return FileFacts([])
 
 
-def _clip(signature: str) -> str:
+def extract_symbols(text: str, language: str | None) -> list[Symbol]:
+    """Символы файла в порядке появления (не больше :data:`MAX_SYMBOLS_PER_FILE`)."""
+    return extract(text, language).symbols
+
+
+def clip_signature(signature: str) -> str:
+    """Сигнатура в одну строку, не длиннее :data:`_MAX_SIGNATURE`."""
     signature = " ".join(signature.split())
     if len(signature) > _MAX_SIGNATURE:
         signature = signature[: _MAX_SIGNATURE - 1] + "…"
@@ -119,9 +205,36 @@ def _clip(signature: str) -> str:
 
 
 # --------------------------------- Python --------------------------------- #
-def _python_symbols(text: str) -> list[Symbol]:
-    tree = ast.parse(text)
-    lines = text.splitlines()
+def _char_col(line: str, byte_col: int) -> int:
+    """Столбец в символах по смещению ``ast`` (в байтах UTF-8)."""
+    if line.isascii():
+        return byte_col
+    return len(line.encode("utf-8")[:byte_col].decode("utf-8", errors="ignore"))
+
+
+def _line(lines: list[str], lineno: int) -> str:
+    return lines[lineno - 1] if 0 < lineno <= len(lines) else ""
+
+
+def _doc(node: ast.AST) -> str:
+    try:
+        doc = ast.get_docstring(node)  # type: ignore[arg-type]
+    except TypeError:
+        return ""
+    if not doc:
+        return ""
+    first = next((s.strip() for s in doc.splitlines() if s.strip()), "")
+    return first if len(first) <= _MAX_DOC else first[: _MAX_DOC - 1] + "…"
+
+
+def _def_name_col(lines: list[str], node: ast.AST, name: str) -> int:
+    line = _line(lines, node.lineno)  # type: ignore[attr-defined]
+    start = _char_col(line, node.col_offset)  # type: ignore[attr-defined]
+    m = re.compile(rf"\b(?:def|class)\s+({re.escape(name)})\b").search(line, start)
+    return m.start(1) if m else start
+
+
+def _python_symbols(tree: ast.Module, lines: list[str]) -> list[Symbol]:
     out: list[Symbol] = []
 
     def signature(node: ast.AST) -> str:
@@ -129,8 +242,9 @@ def _python_symbols(text: str) -> list[Symbol]:
         body = getattr(node, "body", None)
         last = body[0].lineno - 1 if body else start
         last = min(max(last, start), start + _MAX_SIGNATURE_LINES - 1)
-        sig = " ".join(lines[i - 1].strip() for i in range(start, last + 1) if i <= len(lines))
-        return _clip(sig)
+        parts = (lines[i - 1].strip() for i in range(start, last + 1) if i <= len(lines))
+        # строки-комментарии между заголовком и телом — не часть сигнатуры
+        return clip_signature(" ".join(part for part in parts if not part.startswith("#")))
 
     def visit(body: list[ast.stmt], parent: str, depth: int, in_class: bool) -> None:
         for node in body:
@@ -159,7 +273,8 @@ def _python_symbols(text: str) -> list[Symbol]:
                                 kind="constant",
                                 line=node.lineno,
                                 end_line=node.end_lineno,
-                                signature=_clip(lines[node.lineno - 1]),
+                                signature=clip_signature(lines[node.lineno - 1]),
+                                col=_char_col(_line(lines, t.lineno), t.col_offset),
                             )
                         )
                 continue
@@ -174,6 +289,8 @@ def _python_symbols(text: str) -> list[Symbol]:
                     parent=parent,
                     depth=depth,
                     signature=signature(node),
+                    doc=_doc(node),
+                    col=_def_name_col(lines, node, node.name),
                 )
             )
             if kind == "class":  # вложенные функции — шум; методы и вложенные классы — нет
@@ -182,6 +299,227 @@ def _python_symbols(text: str) -> list[Symbol]:
 
     visit(tree.body, "", 0, False)
     return out
+
+
+# Имена, использования которых не интересны: встроенные и self/cls.
+_SKIP_NAMES = frozenset(dir(builtins)) | {"self", "cls"}
+
+
+_COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+
+
+def _local_names(
+    fn: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda,
+) -> tuple[frozenset[str], frozenset[str]]:
+    """(локальные, объявленные ``global``) имена самой функции.
+
+    Локальные — параметры, присваивания, ``except … as``, ``match`` (в том числе
+    ``case {**rest}``), имена вложенных ``def``/``class``: обращения к ним — не
+    использования определений проекта. Не локальные: импорты (вызов
+    импортированного имени — использование), связывания внутри вложенных функций,
+    классов и включений (у них своя область; ``:=`` во включении связывает имя в
+    функции), объявленные ``global`` (они же снимают одноимённые локальные внешних
+    функций) и ``nonlocal`` (они остаются локальными — внешней функции).
+    """
+    a = fn.args
+    names = {x.arg for x in (*a.posonlyargs, *a.args, *a.kwonlyargs)}
+    names.update(x.arg for x in (a.vararg, a.kwarg) if x is not None)
+    declared: set[str] = set()
+    nonlocal_: set[str] = set()
+    stack: list[ast.AST] = list(fn.body) if isinstance(fn.body, list) else [fn.body]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)  # тело — своя область
+            continue
+        if isinstance(node, ast.Lambda):
+            continue
+        if isinstance(node, ast.Name):
+            if not isinstance(node.ctx, ast.Load):
+                names.add(node.id)
+        elif isinstance(node, ast.Global):
+            declared.update(node.names)
+        elif isinstance(node, ast.Nonlocal):
+            nonlocal_.update(node.names)
+        elif isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)):
+            if node.name:
+                names.add(node.name)
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            names.add(node.rest)  # `case {**rest}` — строка, а не узел Name
+        if isinstance(node, _COMPREHENSIONS):  # цели включения — его область
+            for gen in node.generators:
+                stack.append(gen.iter)
+                stack.extend(gen.ifs)
+            stack.extend(
+                child
+                for child in (getattr(node, f, None) for f in ("elt", "key", "value"))
+                if child is not None
+            )
+            continue
+        stack.extend(ast.iter_child_nodes(node))
+    return frozenset(names - declared - nonlocal_), frozenset(declared)
+
+
+def _absolute_module(module: str | None, level: int, path: str) -> str:
+    if not level:
+        return module or ""
+    package = list(PurePosixPath(path).parent.parts) if path else None
+    if package is None or level - 1 > len(package):
+        return "." * level + (module or "")
+    base = package[: len(package) - (level - 1)]
+    return ".".join([*base, *([module] if module else [])])
+
+
+class _RefCollector(ast.NodeVisitor):
+    """Использования имён и импорты. Область — объемлющее индексируемое определение
+    (класс или функция уровня модуля/класса; вложенные функции — в своей внешней).
+    """
+
+    def __init__(self, lines: list[str], path: str):
+        self.lines = lines
+        self.path = path
+        self.refs: list[Ref] = []
+        self.imports: list[Import] = []
+        self._seen: set[tuple[str, str, int, int, str]] = set()
+        self._scope: list[str] = []
+        self._locals: list[frozenset[str]] = []
+        self._in_function = 0
+
+    def _add(self, name: str, kind: str, line: int, byte_col: int) -> None:
+        if len(name) < 2 or name in _SKIP_NAMES or (name.startswith("__") and name.endswith("__")):
+            return
+        scope = ".".join(self._scope)
+        col = _char_col(_line(self.lines, line), byte_col)
+        key = (name, kind, line, col, scope)  # `a.run(); b.run()` — два использования
+        if key in self._seen or len(self.refs) >= MAX_REFS_PER_FILE:
+            return
+        self._seen.add(key)
+        self.refs.append(Ref(name=name, kind=kind, line=line, col=col, scope=scope))
+
+    def _local(self, name: str) -> bool:
+        return bool(self._locals) and name in self._locals[-1]
+
+    def _with_locals(self, node: ast.AST, names: frozenset[str]) -> None:
+        outer = self._locals[-1] if self._locals else frozenset()
+        self._locals.append(outer | names)
+        self.generic_visit(node)
+        self._locals.pop()
+
+    # ------------------------------ области ------------------------------ #
+    def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        indexed = not self._in_function
+        if indexed:
+            self._scope.append(node.name)
+        self.generic_visit(node)
+        if indexed:
+            self._scope.pop()
+
+    def _visit_function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+        indexed = not self._in_function
+        if indexed:
+            self._scope.append(node.name)
+        a = node.args
+        params = (*a.posonlyargs, *a.args, *a.kwonlyargs, a.vararg, a.kwarg)
+        # декораторы, значения по умолчанию и аннотации вычисляются в объемлющей
+        # области: `def convert(Model: Model) -> Model` — использования Model
+        for expr in (
+            *node.decorator_list,
+            *a.defaults,
+            *(d for d in a.kw_defaults if d),
+            *(p.annotation for p in params if p is not None and p.annotation is not None),
+            *([node.returns] if node.returns is not None else []),
+            *node.type_params,
+        ):
+            self.visit(expr)
+        self._in_function += 1
+        own, declared = _local_names(node)
+        outer = self._locals[-1] if self._locals else frozenset()
+        self._locals.append((outer - declared) | own)
+        for stmt in node.body:
+            self.visit(stmt)
+        self._locals.pop()
+        self._in_function -= 1
+        if indexed:
+            self._scope.pop()
+
+    visit_FunctionDef = _visit_function
+    visit_AsyncFunctionDef = _visit_function
+
+    def visit_Lambda(self, node: ast.Lambda) -> None:
+        self._with_locals(node, _local_names(node)[0])
+
+    def _visit_comprehension(self, node: ast.AST) -> None:
+        generators: list[ast.comprehension] = node.generators  # type: ignore[attr-defined]
+        # первый итерируемый вычисляется в объемлющей области: [x for x in x]
+        self.visit(generators[0].iter)
+        names = frozenset(
+            n.id for gen in generators for n in ast.walk(gen.target) if isinstance(n, ast.Name)
+        )
+        outer = self._locals[-1] if self._locals else frozenset()
+        self._locals.append(outer | names)
+        for i, gen in enumerate(generators):
+            if i:
+                self.visit(gen.iter)
+            for cond in gen.ifs:
+                self.visit(cond)
+        for part in ("elt", "key", "value"):
+            child = getattr(node, part, None)
+            if child is not None:
+                self.visit(child)
+        self._locals.pop()
+
+    visit_ListComp = _visit_comprehension
+    visit_SetComp = _visit_comprehension
+    visit_DictComp = _visit_comprehension
+    visit_GeneratorExp = _visit_comprehension
+
+    # ---------------------------- использования --------------------------- #
+    def visit_Name(self, node: ast.Name) -> None:
+        if isinstance(node.ctx, ast.Load) and not self._local(node.id):
+            self._add(node.id, "name", node.lineno, node.col_offset)
+
+    def _attr(self, node: ast.Attribute, kind: str) -> None:
+        end = node.end_col_offset or 0
+        line = node.end_lineno or node.lineno
+        self._add(node.attr, kind, line, end - len(node.attr.encode("utf-8")))
+
+    def visit_Attribute(self, node: ast.Attribute) -> None:
+        self._attr(node, "attr")
+        self.visit(node.value)
+
+    def visit_Call(self, node: ast.Call) -> None:
+        func = node.func
+        if isinstance(func, ast.Name):
+            if not self._local(func.id):
+                self._add(func.id, "call", func.lineno, func.col_offset)
+        elif isinstance(func, ast.Attribute):
+            self._attr(func, "call")
+            self.visit(func.value)
+        else:
+            self.visit(func)
+        for arg in node.args:
+            self.visit(arg)
+        for kw in node.keywords:
+            self.visit(kw)
+
+    # ------------------------------ импорты ------------------------------ #
+    def visit_Import(self, node: ast.Import) -> None:
+        for a in node.names:
+            alias = a.asname or a.name.split(".")[0]
+            self.imports.append(Import(module=a.name, name="", alias=alias, line=node.lineno))
+
+    def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+        module = _absolute_module(node.module, node.level, self.path)
+        for a in node.names:
+            self.imports.append(
+                Import(module=module, name=a.name, alias=a.asname or a.name, line=node.lineno)
+            )
+
+
+def _python_refs(tree: ast.Module, lines: list[str], path: str) -> tuple[list[Ref], list[Import]]:
+    collector = _RefCollector(lines, path)
+    collector.visit(tree)
+    return collector.refs, collector.imports
 
 
 # -------------------------------- Markdown -------------------------------- #
@@ -194,7 +532,7 @@ def _markdown_symbols(text: str) -> list[Symbol]:
     out: list[Symbol] = []
     stack: list[tuple[int, str]] = []  # (уровень, заголовок)
     fence = ""  # открывающая ограда блока кода ("```", "~~~~"…), пусто — вне блока
-    for i, line in enumerate(text.splitlines(), start=1):
+    for i, line in enumerate(split_lines(text), start=1):
         m = _FENCE_RE.match(line)
         if fence:
             # закрывает только ограда того же символа, не короче, без текста после
@@ -218,7 +556,7 @@ def _markdown_symbols(text: str) -> list[Symbol]:
                 line=i,
                 parent=stack[-1][1] if stack else "",
                 depth=len(stack),
-                signature=_clip(line),
+                signature=clip_signature(line),
             )
         )
         stack.append((level, title))
@@ -361,7 +699,7 @@ _RULES: dict[str, list[_Rule]] = {
 
 def _regex_symbols(text: str, rules: list[_Rule]) -> list[Symbol]:
     out: list[Symbol] = []
-    for i, line in enumerate(text.splitlines(), start=1):
+    for i, line in enumerate(split_lines(text), start=1):
         if not line.strip() or len(line) > 1000:
             continue
         for kind, regex in rules:
@@ -380,7 +718,8 @@ def _regex_symbols(text: str, rules: list[_Rule]) -> list[Symbol]:
                     line=i,
                     parent=groups.get("parent") or "",
                     depth=1 if indent else 0,
-                    signature=_clip(line),
+                    signature=clip_signature(line),
+                    col=m.start("name"),
                 )
             )
             break

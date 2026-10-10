@@ -70,9 +70,9 @@ def test_build_creates_data_dir_and_marks_complete(index, project):
 def test_incremental_refresh_reparses_only_changes(index, project, monkeypatch):
     index.refresh()
     parsed = []
-    real = index_mod.extract_symbols
+    real = index_mod.extract
     monkeypatch.setattr(
-        index_mod, "extract_symbols", lambda text, lang: parsed.append(lang) or real(text, lang)
+        index_mod, "extract", lambda text, lang, path: parsed.append(lang) or real(text, lang, path)
     )
     assert index.refresh().changed == 0 and parsed == []
 
@@ -232,3 +232,120 @@ def test_symlinks_to_secrets_and_excluded_files_are_not_indexed(index, project):
     assert "settings.py" not in paths and "lib_link.py" not in paths
     assert index.find_symbols("SECRET")[1] == 0
     assert index.find_symbols("vendored")[1] == 0
+
+
+# ------------------------- использования и импорты ------------------------- #
+@pytest.fixture
+def refs_project(tmp_path):
+    _make(tmp_path, "pkg/__init__.py", "")
+    _make(
+        tmp_path,
+        "pkg/core.py",
+        "def helper():\n    pass\n\n\ndef use():\n    return helper()\n",
+    )
+    _make(
+        tmp_path,
+        "pkg/user.py",
+        "from pkg.core import helper as hp\n\n\ndef go():\n    return hp()\n",
+    )
+    _make(tmp_path, "pkg/rel.py", "from .core import helper\n\n\ndef go():\n    helper()\n")
+    _make(tmp_path, "other.py", "def run(x):\n    return x.helper()\n")
+    with ProjectIndex(Workspace(tmp_path)) as ix:
+        ix.refresh()
+        yield ix
+
+
+def test_find_refs_ranks_by_resolution(refs_project):
+    result = refs_project.find_refs("HELPER")  # определение — без учёта регистра
+    assert [(d.path, d.symbol.name) for d in result.definitions] == [("pkg/core.py", "helper")]
+    got = [(h.path, h.line, h.kind, h.resolution) for h in result.hits]
+    assert got == [
+        ("pkg/rel.py", 1, "import", "import"),
+        ("pkg/rel.py", 5, "call", "import"),
+        ("pkg/user.py", 1, "import", "import"),
+        ("pkg/user.py", 5, "call", "import"),  # через псевдоним hp
+        ("pkg/core.py", 6, "call", "same_file"),
+        ("other.py", 2, "call", "name_only"),
+    ]
+    assert result.total == 6
+    assert refs_project.find_refs("helper", kind="import").total == 2
+    calls = refs_project.find_refs("helper", kind="call", path_glob="pkg/**", limit=1)
+    assert calls.total == 3 and len(calls.hits) == 1
+    assert refs_project.find_refs("pkg.rel.go").hits == []  # без использований
+    with pytest.raises(ValueError):
+        refs_project.find_refs(" . ")
+
+
+def test_find_refs_without_definition_searches_by_name(refs_project):
+    result = refs_project.find_refs("hp")
+    assert result.definitions == []
+    assert [(h.path, h.line, h.resolution) for h in result.hits] == [
+        ("pkg/user.py", 5, "name_only")
+    ]
+
+
+def test_imports_resolve_to_project_files(tmp_path):
+    _make(tmp_path, "src/pkg/__init__.py", "")
+    _make(tmp_path, "src/pkg/b.py", "B = 1\n")
+    _make(tmp_path, "tests/fake/pkg/b.py", "B = 2\n")  # тот же суффикс глубже — не он
+    _make(
+        tmp_path,
+        "src/pkg/a.py",
+        "import os\nfrom pkg import b\nfrom . import b as bb\nimport pkg.b\nfrom pkg.b import B\n",
+    )
+    with ProjectIndex(Workspace(tmp_path)) as ix:
+        ix.refresh()
+        assert ix.resolve_module("pkg.b") == "src/pkg/b.py"
+        assert ix.resolve_module("pkg") == "src/pkg/__init__.py"
+        assert ix.resolve_module("os") is None and ix.resolve_module("..x") is None
+        entries = ix.imports_of("src/pkg/a.py")
+        assert [(e.module, e.name, e.target) for e in entries] == [
+            ("os", "", None),
+            ("pkg", "b", "src/pkg/b.py"),  # подмодуль, а не атрибут пакета
+            ("src.pkg", "b", "src/pkg/b.py"),
+            ("pkg.b", "", "src/pkg/b.py"),
+            ("pkg.b", "B", "src/pkg/b.py"),
+        ]
+        assert ix.imported_by("src/pkg/b.py") == [("src/pkg/a.py", 2)]
+        assert ix.imported_by("src/pkg/__init__.py") == []
+        assert ix.imported_by("README.md") == []
+
+
+def test_refs_and_imports_follow_incremental_refresh(index, project):
+    stats = index.refresh()
+    assert set(stats.added_paths) == {"app/agent.py", "app/events.py", "web/store.ts", "README.md"}
+    _make(project, "app/main.py", "from app.agent import Agent\n\nAgent().run_turn()\n")
+    stats = index.refresh()
+    assert (stats.added_paths, stats.updated_paths, stats.removed_paths) == (
+        ("app/main.py",),
+        (),
+        (),
+    )
+    _bump(project / "app/main.py", "from app.agent import Agent\n\nAgent().run_turn(1)\n")
+    assert index.refresh().updated_paths == ("app/main.py",)
+    assert index.find_refs("Agent.run_turn").total == 1
+    assert index.stats().refs == 2
+
+    (project / "app/main.py").unlink()
+    stats = index.refresh()
+    assert stats.removed_paths == ("app/main.py",)
+    assert index.find_refs("Agent").total == 0
+    assert index.imported_by("app/agent.py") == []
+    assert index.stats().refs == 0
+
+
+def test_stub_only_package_resolves(tmp_path):
+    _make(tmp_path, "stubs/pkg/__init__.pyi", "def f() -> int: ...\n")
+    _make(tmp_path, "app.py", "from pkg import f\n\nf()\n")
+    with ProjectIndex(Workspace(tmp_path)) as ix:
+        ix.refresh()
+        assert ix.resolve_module("pkg") == "stubs/pkg/__init__.pyi"
+        assert ix.imported_by("stubs/pkg/__init__.pyi") == [("app.py", 1)]
+
+
+def test_recursive_call_on_definition_line_is_a_reference(tmp_path):
+    _make(tmp_path, "m.py", "def fact(n): return 1 if n < 2 else n * fact(n - 1)\n")
+    with ProjectIndex(Workspace(tmp_path)) as ix:
+        ix.refresh()
+        hits = ix.find_refs("fact").hits
+        assert [(h.line, h.kind, h.scope) for h in hits] == [(1, "call", "fact")]
