@@ -473,3 +473,29 @@ def test_python_signature_skips_comment_lines_before_body():
     src = "class Conversation:\n    # пояснение к полям\n    # ещё строка\n    items: list = []\n"
     (sym,) = extract_symbols(src, "python")
     assert sym.signature == "class Conversation:"
+
+
+def test_python_scopes_of_comprehensions_imports_and_defaults():
+    facts = _facts(
+        """\
+        values = [items for items in items]
+
+
+        def run(factory=factory(), *, mode=MODE):
+            from pkg.mod import helper as lazy
+            lazy()
+            helper()
+            return [helper for helper in range(3)]
+
+
+        @decorate(option)
+        def other(option):
+            return option
+        """
+    )
+    got = {(r.name, r.kind, r.scope) for r in facts.refs}
+    assert ("items", "name", "") in got  # первый итерируемый — в объемлющей области
+    assert ("factory", "call", "run") in got and ("MODE", "name", "run") in got
+    assert ("lazy", "call", "run") in got  # локальный импорт — использование
+    assert ("helper", "call", "run") in got  # переменная включения не скрывает глобальное
+    assert ("decorate", "call", "other") in got and ("option", "name", "other") in got

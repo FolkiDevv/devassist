@@ -297,31 +297,49 @@ def _python_symbols(tree: ast.Module, lines: list[str]) -> list[Symbol]:
 _SKIP_NAMES = frozenset(dir(builtins)) | {"self", "cls"}
 
 
-def _local_names(fn: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda) -> frozenset[str]:
-    """Имена, локальные для функции: параметры, присваивания, импорты, вложенные def.
+_COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
 
-    Обращения к ним — не использования определений проекта. Вложенные функции
-    учитываются вместе с внешней (их имена реже совпадают с глобальными, чем
-    экономится обход); ``global``/``nonlocal`` исключаются.
+
+def _local_names(fn: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda) -> frozenset[str]:
+    """Имена, связанные в самой функции: параметры, присваивания, ``except … as``,
+    ``match``, имена вложенных ``def``/``class``.
+
+    Обращения к ним — не использования определений проекта. Не локальные:
+    импорты (вызов импортированного имени — использование), связывания внутри
+    вложенных функций, классов и включений (у них своя область; ``:=`` во включении
+    связывает имя в функции), объявленные ``global``/``nonlocal``.
     """
     a = fn.args
     names = {x.arg for x in (*a.posonlyargs, *a.args, *a.kwonlyargs)}
     names.update(x.arg for x in (a.vararg, a.kwarg) if x is not None)
     declared: set[str] = set()
-    for node in ast.walk(fn):
+    stack: list[ast.AST] = list(fn.body) if isinstance(fn.body, list) else [fn.body]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)  # тело — своя область
+            continue
+        if isinstance(node, ast.Lambda):
+            continue
         if isinstance(node, ast.Name):
             if not isinstance(node.ctx, ast.Load):
                 names.add(node.id)
         elif isinstance(node, (ast.Global, ast.Nonlocal)):
             declared.update(node.names)
-        elif isinstance(node, ast.alias):
-            names.add(node.asname or node.name.split(".")[0])
         elif isinstance(node, (ast.ExceptHandler, ast.MatchAs, ast.MatchStar)):
             if node.name:
                 names.add(node.name)
-        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            if node is not fn:
-                names.add(node.name)
+        if isinstance(node, _COMPREHENSIONS):  # цели включения — его область
+            for gen in node.generators:
+                stack.append(gen.iter)
+                stack.extend(gen.ifs)
+            stack.extend(
+                child
+                for child in (getattr(node, f, None) for f in ("elt", "key", "value"))
+                if child is not None
+            )
+            continue
+        stack.extend(ast.iter_child_nodes(node))
     return frozenset(names - declared)
 
 
@@ -383,8 +401,22 @@ class _RefCollector(ast.NodeVisitor):
         indexed = not self._in_function
         if indexed:
             self._scope.append(node.name)
+        a = node.args
+        # декораторы и значения по умолчанию вычисляются в объемлющей области
+        for expr in (*node.decorator_list, *a.defaults, *(d for d in a.kw_defaults if d)):
+            self.visit(expr)
         self._in_function += 1
-        self._with_locals(node, _local_names(node))
+        outer = self._locals[-1] if self._locals else frozenset()
+        self._locals.append(outer | _local_names(node))
+        params = (*a.posonlyargs, *a.args, *a.kwonlyargs, a.vararg, a.kwarg)
+        for expr in (
+            *(p.annotation for p in params if p is not None and p.annotation is not None),
+            *([node.returns] if node.returns is not None else []),
+            *node.type_params,
+            *node.body,
+        ):
+            self.visit(expr)
+        self._locals.pop()
         self._in_function -= 1
         if indexed:
             self._scope.pop()
@@ -396,13 +428,24 @@ class _RefCollector(ast.NodeVisitor):
         self._with_locals(node, _local_names(node))
 
     def _visit_comprehension(self, node: ast.AST) -> None:
+        generators: list[ast.comprehension] = node.generators  # type: ignore[attr-defined]
+        # первый итерируемый вычисляется в объемлющей области: [x for x in x]
+        self.visit(generators[0].iter)
         names = frozenset(
-            n.id
-            for gen in node.generators  # type: ignore[attr-defined]
-            for n in ast.walk(gen.target)
-            if isinstance(n, ast.Name)
+            n.id for gen in generators for n in ast.walk(gen.target) if isinstance(n, ast.Name)
         )
-        self._with_locals(node, names)
+        outer = self._locals[-1] if self._locals else frozenset()
+        self._locals.append(outer | names)
+        for i, gen in enumerate(generators):
+            if i:
+                self.visit(gen.iter)
+            for cond in gen.ifs:
+                self.visit(cond)
+        for part in ("elt", "key", "value"):
+            child = getattr(node, part, None)
+            if child is not None:
+                self.visit(child)
+        self._locals.pop()
 
     visit_ListComp = _visit_comprehension
     visit_SetComp = _visit_comprehension

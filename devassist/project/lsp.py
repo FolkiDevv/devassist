@@ -3,7 +3,9 @@
 Ровно столько, сколько нужно для запросов навигации к одному серверу: запрос с
 таймаутом, уведомление, ответы на запросы сервера. Поток-читатель разбирает
 сообщения и раскладывает ответы по ожидающим запросам; уведомления сервера
-(диагностика, прогресс) игнорируются.
+(диагностика, прогресс) игнорируются. Пишет в сервер отдельный поток: если сервер
+перестал читать и канал переполнен, запрос всё равно завершится по таймауту, а
+:meth:`LspClient.close` — убьёт процесс.
 
 Сервер запускается в своей группе процессов: Ctrl+C в терминале (SIGINT всей
 группе переднего плана) его не убивает — прерывается только ожидание ответа.
@@ -56,7 +58,8 @@ class LspClient:
         self._stderr_path = stderr_path
         self._handlers = dict(handlers or {})
         self._proc: subprocess.Popen[bytes] | None = None
-        self._write_lock = threading.Lock()
+        self._outbox: queue.Queue[bytes | None] = queue.Queue()
+        self._writer: threading.Thread | None = None
         self._pending: dict[int, queue.Queue[object]] = {}
         self._pending_lock = threading.Lock()
         self._next_id = 0
@@ -89,6 +92,8 @@ class LspClient:
             if stderr is not subprocess.DEVNULL:
                 stderr.close()  # у процесса своя копия дескриптора
         threading.Thread(target=self._read_loop, name="lsp-reader", daemon=True).start()
+        self._writer = threading.Thread(target=self._write_loop, name="lsp-writer", daemon=True)
+        self._writer.start()
 
     def request(self, method: str, params: Any = None, *, timeout: float) -> Any:
         """Запрос и ожидание ответа. LspError — ошибка сервера, LspTimeout — нет ответа."""
@@ -114,8 +119,9 @@ class LspClient:
             raise LspError(f"{method}: сервер завершился")
         assert isinstance(reply, dict)
         if "error" in reply:
-            err = reply["error"] or {}
-            raise LspError(f"{method}: {err.get('message', 'ошибка сервера')}")
+            err = reply["error"]
+            message = err.get("message") if isinstance(err, dict) else None
+            raise LspError(f"{method}: {message or 'ошибка сервера'}")
         return reply.get("result")
 
     def notify(self, method: str, params: Any = None) -> None:
@@ -138,6 +144,10 @@ class LspClient:
             except subprocess.TimeoutExpired:
                 pass
         finally:
+            # процесс завершён — застрявшая запись получает EPIPE, поток-писатель выходит
+            self._outbox.put(None)
+            if self._writer is not None:
+                self._writer.join(timeout=timeout)
             for stream in (proc.stdin, proc.stdout):
                 if stream is not None:
                     try:
@@ -155,17 +165,26 @@ class LspClient:
             pass
 
     def _send(self, message: dict[str, Any]) -> None:
-        proc = self._proc
-        if proc is None or proc.stdin is None or self._dead.is_set():
+        """Ставит сообщение в очередь писателя — не блокирует, даже если сервер не читает."""
+        if self._proc is None or self._dead.is_set():
             raise LspError("сервер не запущен")
         data = json.dumps(message, ensure_ascii=False).encode("utf-8")
-        header = f"Content-Length: {len(data)}\r\n\r\n".encode("ascii")
-        try:
-            with self._write_lock:
-                proc.stdin.write(header + data)
+        self._outbox.put(f"Content-Length: {len(data)}\r\n\r\n".encode("ascii") + data)
+
+    def _write_loop(self) -> None:
+        proc = self._proc
+        assert proc is not None and proc.stdin is not None
+        while True:
+            chunk = self._outbox.get()
+            if chunk is None:
+                return
+            try:
+                proc.stdin.write(chunk)
                 proc.stdin.flush()
-        except (OSError, ValueError) as e:  # ValueError — запись в закрытый поток
-            raise LspError(f"сервер недоступен: {e}") from e
+            except (OSError, ValueError):  # ValueError — запись в закрытый поток
+                self._dead.set()
+                self._wake_all()
+                return
 
     def _read_message(self, stream) -> dict[str, Any] | None:
         length = None
@@ -202,13 +221,17 @@ class LspClient:
             pass  # оборванный или испорченный поток — как завершение сервера
         finally:
             self._dead.set()
-            with self._pending_lock:
-                waiting = list(self._pending.values())
-            for slot in waiting:
-                try:
-                    slot.put_nowait(_DIED)
-                except queue.Full:
-                    pass
+            self._wake_all()
+
+    def _wake_all(self) -> None:
+        """Сервер недоступен: ожидающие запросы получают отказ сразу, а не по таймауту."""
+        with self._pending_lock:
+            waiting = list(self._pending.values())
+        for slot in waiting:
+            try:
+                slot.put_nowait(_DIED)
+            except queue.Full:
+                pass
 
     def _dispatch(self, message: dict[str, Any]) -> None:
         method = message.get("method")

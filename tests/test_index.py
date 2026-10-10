@@ -332,3 +332,20 @@ def test_refs_and_imports_follow_incremental_refresh(index, project):
     assert index.find_refs("Agent").total == 0
     assert index.imported_by("app/agent.py") == []
     assert index.stats().refs == 0
+
+
+def test_stub_only_package_resolves(tmp_path):
+    _make(tmp_path, "stubs/pkg/__init__.pyi", "def f() -> int: ...\n")
+    _make(tmp_path, "app.py", "from pkg import f\n\nf()\n")
+    with ProjectIndex(Workspace(tmp_path)) as ix:
+        ix.refresh()
+        assert ix.resolve_module("pkg") == "stubs/pkg/__init__.pyi"
+        assert ix.imported_by("stubs/pkg/__init__.pyi") == [("app.py", 1)]
+
+
+def test_recursive_call_on_definition_line_is_a_reference(tmp_path):
+    _make(tmp_path, "m.py", "def fact(n): return 1 if n < 2 else n * fact(n - 1)\n")
+    with ProjectIndex(Workspace(tmp_path)) as ix:
+        ix.refresh()
+        hits = ix.find_refs("fact").hits
+        assert [(h.line, h.kind, h.scope) for h in hits] == [(1, "call", "fact")]

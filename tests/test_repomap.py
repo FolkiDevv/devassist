@@ -147,3 +147,13 @@ def test_system_prompt_has_repo_map_only_for_large_indexed_projects(tmp_path):
         _make(tmp_path, f"pkg/m{i:03}.py", "from core.engine import Engine\n")
     prompt = build_system_prompt(ws)
     assert "Карта проекта" in prompt and "class Engine:" in prompt
+
+
+def test_repo_map_tool_explains_too_small_budget(tmp_path, project, monkeypatch):
+    from devassist.project.repomap import RepoMap
+    from devassist.tools import index as tools_index
+
+    monkeypatch.setattr(tools_index, "build_repo_map", lambda *a, **kw: RepoMap("", 0, 0, 7))
+    ctx = ToolContext(workspace=Workspace(tmp_path), semantic=False)
+    content = RepoMapTool().run(RepoMapParams(max_tokens=200), ctx).content
+    assert content == "(определения не поместились в объём карты — увеличьте max_tokens)"

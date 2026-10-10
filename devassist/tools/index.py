@@ -328,7 +328,11 @@ class RepoMapTool(Tool):
                 max_chars=tokens * CHARS_PER_TOKEN,
             )
         if not repo_map.text:
-            body = "(в индексе нет определений)"
+            body = (
+                "(в индексе нет определений)"
+                if repo_map.total == 0
+                else "(определения не поместились в объём карты — увеличьте max_tokens)"
+            )
         else:
             body = (
                 f"карта проекта: определений {repo_map.definitions} из {repo_map.total}, "

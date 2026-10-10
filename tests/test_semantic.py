@@ -41,3 +41,26 @@ def test_status_lifecycle(tmp_path, monkeypatch):
     with pytest.raises(semantic.SemanticUnavailable):
         semantic.server_for(ws)
     semantic.shutdown_all()
+
+
+def test_location_decodes_uri_once(tmp_path):
+    server = TyServer(tmp_path, binary="ty")
+    target = tmp_path / "a%41.py"  # «%41» в имени файла — не «A»
+    target.write_text("x = 1\n", encoding="utf-8")
+    loc = server._location(target.as_uri(), {"line": 0, "character": 0}, semantic._Lines())
+    assert (loc.path, loc.in_project) == ("a%41.py", True)
+
+
+def test_interrupted_start_does_not_leave_server(tmp_path, monkeypatch):
+    closed = []
+
+    def interrupted(self):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(semantic, "find_binary", lambda: "ty")
+    monkeypatch.setattr(TyServer, "start", interrupted)
+    monkeypatch.setattr(TyServer, "close", lambda self: closed.append(self))
+    with pytest.raises(KeyboardInterrupt):
+        semantic.server_for(Workspace(tmp_path))
+    assert len(closed) == 1
+    semantic.shutdown_all()

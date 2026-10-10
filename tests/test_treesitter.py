@@ -283,3 +283,23 @@ def test_unloadable_grammar_returns_none(monkeypatch):
     assert [s.name for s in extract("package x\nfunc main() {}\n", "go").symbols] == ["main"]
     assert treesitter.extract("x", "cobol") is None
     assert treesitter.supports("rust") and not treesitter.supports("markdown")
+
+
+def test_csharp_namespaces_keep_full_name_and_file_scope():
+    facts = extract(
+        "namespace Company.App;\n\nclass Service { void Run() { Log.Write(); } }\n", "csharp"
+    )
+    assert [(s.qualname, s.depth) for s in facts.symbols] == [
+        ("Company.App", 0),
+        ("Company.App.Service", 1),
+        ("Company.App.Service.Run", 2),
+    ]
+    assert [(r.name, r.scope) for r in facts.refs] == [("Write", "Company.App.Service.Run")]
+    block = extract("namespace A.B { class S {} }\nclass Outside {}\n", "csharp")
+    assert [s.qualname for s in block.symbols] == ["A.B", "A.B.S", "Outside"]
+
+
+def test_js_private_members_are_called():
+    facts = extract("class A {\n  #persist() {}\n  save() { this.#persist(); }\n}\n", "javascript")
+    assert [s.qualname for s in facts.symbols] == ["A", "A.#persist", "A.save"]
+    assert [(r.name, r.scope) for r in facts.refs] == [("#persist", "A.save")]

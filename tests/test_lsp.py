@@ -12,7 +12,7 @@ from devassist.project.lsp import LspClient, LspError, LspTimeout
 # Поддельный сервер: echo, ошибка, зависание, запрос к клиенту, внезапный выход.
 FAKE_SERVER = textwrap.dedent(
     r"""
-    import json, sys
+    import json, sys, time
 
     def read():
         length = None
@@ -48,6 +48,10 @@ FAKE_SERVER = textwrap.dedent(
             send({"jsonrpc": "2.0", "id": mid, "result": answer})
         elif method == "fail":
             send({"jsonrpc": "2.0", "id": mid, "error": {"code": -1, "message": "плохо"}})
+        elif method == "badfail":
+            send({"jsonrpc": "2.0", "id": mid, "error": "не объект"})
+        elif method == "stall":
+            time.sleep(60)  # перестал читать stdin
         elif method == "hang":
             pass
         elif method == "die":
@@ -115,3 +119,22 @@ def test_start_fails_for_missing_program(tmp_path):
     with pytest.raises(OSError):
         c.start()
     c.close()
+
+
+def test_malformed_error_object_is_lsp_error(client):
+    with pytest.raises(LspError, match="badfail: ошибка сервера"):
+        client.request("badfail", None, timeout=5)
+
+
+def test_stalled_server_cannot_block_requests_or_close(client):
+    import time
+
+    with pytest.raises(LspTimeout):
+        client.request("stall", None, timeout=0.2)
+    # сервер не читает: запись в переполненный канал не должна вешать запрос
+    started = time.monotonic()
+    with pytest.raises(LspTimeout):
+        client.request("echo", "x" * 2_000_000, timeout=0.5)
+    client.close(timeout=1)
+    assert not client.alive
+    assert time.monotonic() - started < 10

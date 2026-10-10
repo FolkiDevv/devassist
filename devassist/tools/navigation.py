@@ -272,23 +272,24 @@ class FindReferencesTool(Tool):
 
         Строки импорта ty не возвращает — они остаются как есть.
         """
-        found = {(loc.path, loc.line) for loc in locations if loc.in_project}
+        # сопоставление по позиции: `a.refresh(); b.refresh()` — два разных использования
+        found = {(loc.path, loc.line, loc.col) for loc in locations if loc.in_project}
         merged = [
             replace(h, resolution=RESOLVED_TY)
-            if (h.path, h.line) in found and h.kind != "import"
+            if (h.path, h.line, h.col) in found and h.kind != "import"
             else h
             for h in hits
         ]
-        known = {(h.path, h.line) for h in merged}
-        def_lines = {(d.path, d.symbol.line) for d in definitions}
+        known = {(h.path, h.line, h.col) for h in merged}
+        def_positions = {(d.path, d.symbol.line, d.symbol.col) for d in definitions}
         names = {d.symbol.name for d in definitions}
         for loc in locations:
-            key = (loc.path, loc.line)
-            if not loc.in_project or key in known or key in def_lines:
+            key = (loc.path, loc.line, loc.col)
+            if not loc.in_project or key in known or key in def_positions:
                 continue
             if path_glob and not glob_match(loc.path, path_glob):
                 continue
-            info = index.ref_at(loc.path, loc.line, names)
+            info = index.ref_at(loc.path, loc.line, names, col=loc.col)
             if info is None:
                 symbol = index.symbol_at(loc.path, loc.line)
                 info = ("name", symbol.qualname if symbol is not None else "")

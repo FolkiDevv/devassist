@@ -393,7 +393,10 @@ def _definition(node: Node, kind: str, language: str) -> tuple[Node | None, str,
             kind = "enum"
     if language == "swift" and t == "class_declaration":
         kind = _keyword(node, _SWIFT_KINDS) or "class"
-    return _leaf_name(node.child_by_field_name("name")), kind, ""
+    name = node.child_by_field_name("name")
+    if kind == "namespace":  # `namespace Company.App` — имя целиком, а не последняя часть
+        return name, kind, ""
+    return _leaf_name(name), kind, ""
 
 
 def _walk(node: Node):
@@ -458,7 +461,8 @@ def extract(text: str, language: str, path: str = "") -> FileFacts | None:
         if name_node is None or len(refs) >= MAX_REFS_PER_FILE:
             return
         name = _text(name_node)
-        if len(name) < 2 or not (name[0].isalpha() or name[0] in "_$"):
+        # однобуквенные — шум (как у Python); `#name` — приватные члены JS
+        if len(name) < 2 or not (name[0].isalpha() or name[0] in "_$#"):
             return
         scope = scopes[-1][1] if scopes else ""
         line = name_node.start_point[0] + 1
@@ -514,7 +518,9 @@ def extract(text: str, language: str, path: str = "") -> FileFacts | None:
                 named = node.named_children
                 target = named[0] if named else None
             add_ref(_leaf_name(target))
-        if opened:
+        # `namespace App;` (C#) действует до конца файла: объявления после него — его
+        # соседи в дереве, поэтому область не закрывается вместе с узлом
+        if opened and t != "file_scoped_namespace_declaration":
             stack.append((node, True))
         stack.extend((child, False) for child in reversed(node.named_children))
     return FileFacts(symbols=symbols, refs=refs)

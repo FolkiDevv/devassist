@@ -216,7 +216,7 @@ class TyServer:
         parsed = urlparse(uri)
         if parsed.scheme != "file":  # встроенные заглушки ty и т.п.
             return Location(unquote(uri), line, units, in_project=False)
-        abs_path = Path(url2pathname(unquote(parsed.path)))
+        abs_path = Path(url2pathname(parsed.path))  # url2pathname сам раскодирует %XX
         col = _from_units(lines.get(abs_path, line), units, self._encoding)
         try:
             rel = abs_path.relative_to(self.root).as_posix()
@@ -343,6 +343,9 @@ def server_for(workspace: Workspace, env: Mapping[str, str] | None = None) -> Ty
             server.close()
             _count_failure(session, f"не запустился: {e}")
             raise SemanticUnavailable(session.disabled or f"ty не запустился: {e}") from e
+        except BaseException:  # Ctrl+C посреди запуска — процесс не должен остаться
+            server.close()
+            raise
         session.server = server
         return server
 

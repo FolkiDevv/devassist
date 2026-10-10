@@ -610,17 +610,21 @@ class ProjectIndex:
         ).fetchone()
         return _symbol(row) if row else None
 
-    def ref_at(self, rel_path: str, line: int, names: Iterable[str]) -> tuple[str, str] | None:
-        """(вид, область) использования одного из ``names`` в строке; вызов — первым."""
+    def ref_at(
+        self, rel_path: str, line: int, names: Iterable[str], *, col: int | None = None
+    ) -> tuple[str, str] | None:
+        """(вид, область) использования одного из ``names`` в строке (и столбце, если
+        задан); из нескольких — вызов первым."""
         names = list(names)
         if not names:
             return None
         marks = ",".join("?" * len(names))
+        at_col = "" if col is None else " AND col = ?"
         row = self._db.execute(
             "SELECT kind, scope FROM refs "
-            f"WHERE path = ? AND line = ? AND name IN ({marks}) "
+            f"WHERE path = ? AND line = ? AND name IN ({marks}){at_col} "
             "ORDER BY CASE kind WHEN 'call' THEN 0 WHEN 'attr' THEN 1 ELSE 2 END, col LIMIT 1",
-            (rel_path, line, *names),
+            (rel_path, line, *names, *([] if col is None else [col])),
         ).fetchone()
         return (row[0], row[1]) if row else None
 
@@ -646,7 +650,12 @@ class ProjectIndex:
         if module and not module.startswith("."):
             base = module.replace(".", "/")
             candidates = []
-            for suffix in (f"{base}.py", f"{base}/__init__.py", f"{base}.pyi"):
+            for suffix in (
+                f"{base}.py",
+                f"{base}/__init__.py",
+                f"{base}.pyi",
+                f"{base}/__init__.pyi",
+            ):
                 rows = self._db.execute(
                     "SELECT path FROM files WHERE path = ? OR path LIKE ? ESCAPE '\\'",
                     (suffix, f"%/{_escape_like(suffix)}"),
@@ -763,14 +772,15 @@ class ProjectIndex:
                 imports_def[path] = any(e.target in def_paths for e in self.imports_of(path))
             return RESOLVED_IMPORT if imports_def[path] else RESOLVED_NAME
 
+        def_positions = {(h.path, h.symbol.line, h.symbol.col) for h in definitions}
         out: list[RefHit] = []
         for path, line, col, ref_kind, scope in rows:
             if kinds is not None and ref_kind not in kinds:
                 continue
             if path_glob and not glob_match(path, path_glob):
                 continue
-            # строка определения — не использование
-            if any(h.path == path and h.symbol.line == line for h in definitions):
+            # имя в самом определении — не использование (рекурсивный вызов в той же строке — да)
+            if (path, line, col) in def_positions:
                 continue
             out.append(RefHit(path, line, col, ref_kind, scope, resolution(path)))
         out.sort(key=lambda h: (_RESOLUTION_ORDER[h.resolution], h.path, h.line, h.col))

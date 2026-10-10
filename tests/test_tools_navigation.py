@@ -320,3 +320,22 @@ def test_ty_server_runs_in_own_process_group(typed):
     pid = server._client._proc.pid  # noqa: SLF001
     assert os.getpgid(pid) != os.getpgid(0)  # Ctrl+C терминала серверу не достаётся
     assert semantic.status(typed.workspace) == "работает"
+
+
+def test_merge_matches_by_position_not_line(root):
+    line = "    a.run_turn('x'); b.run_turn('y')"
+    _make(root, "app/two.py", f"from app.agent import Agent\n\n\ndef both(a: Agent, b):\n{line}\n")
+    first, second = line.index("run_turn"), line.rindex("run_turn")
+    with ProjectIndex(Workspace(root)) as index:
+        index.refresh()
+        definitions = index.definitions("Agent.run_turn")
+        hits = [h for h in index.find_refs("Agent.run_turn").hits if h.path == "app/two.py"]
+        assert [h.col for h in hits] == [first]  # индекс хранит одно использование имени на строку
+        # ty подтвердил только b.run_turn: a.run_turn не помечается, b добавляется
+        merged = FindReferencesTool._merge(
+            index, hits, [Location("app/two.py", 5, second)], definitions, None, None
+        )
+        assert [(h.col, h.resolution) for h in merged] == [
+            (first, RESOLVED_IMPORT),
+            (second, RESOLVED_TY),
+        ]
