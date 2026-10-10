@@ -48,13 +48,15 @@ class ToolContext:
     Намеренно не содержит Config: инструментам не нужны (и не должны быть
     доступны) реквизиты API. ``ask_user`` — способ задать вопрос пользователю
     (None — спросить некого). ``get_mode``/``set_mode`` — текущий режим разрешений
-    агента (None — агента нет, например в тестах инструмента).
+    агента (None — агента нет, например в тестах инструмента). ``semantic`` —
+    разрешена ли точная навигация через ty (``DEVASSIST_TY``).
     """
 
     workspace: Workspace
     ask_user: AskUser | None = None
     get_mode: Callable[[], PermissionMode] | None = None
     set_mode: Callable[[PermissionMode], None] | None = None
+    semantic: bool = True
 
     @property
     def root(self) -> Path:
@@ -236,7 +238,12 @@ def build_default_registry() -> ToolRegistry:
         WriteFileTool,
     )
     from devassist.tools.git import GitTool
-    from devassist.tools.index import FileOutlineTool, FindReferencesTool, FindSymbolTool
+    from devassist.tools.index import FileOutlineTool, FindSymbolTool
+    from devassist.tools.navigation import (
+        CallHierarchyTool,
+        FindReferencesTool,
+        GotoDefinitionTool,
+    )
     from devassist.tools.plan import ExitPlanModeTool
     from devassist.tools.search import SearchContentTool
     from devassist.tools.shell import RunShellTool
@@ -251,6 +258,8 @@ def build_default_registry() -> ToolRegistry:
         SearchContentTool(),
         FindSymbolTool(),
         FindReferencesTool(),
+        GotoDefinitionTool(),
+        CallHierarchyTool(),
         FileOutlineTool(),
         RunShellTool(),
         GitTool(),

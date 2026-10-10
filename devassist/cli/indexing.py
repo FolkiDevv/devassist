@@ -103,8 +103,8 @@ def ensure_index(
         )
 
 
-def describe_index(refreshed: RefreshStats, stats: IndexStats) -> str:
-    """Текст для ``/index``: состав индекса и итог обновления."""
+def describe_index(refreshed: RefreshStats, stats: IndexStats, ty_status: str = "") -> str:
+    """Текст для ``/index``: состав индекса, итог обновления и состояние ty."""
     languages = ", ".join(f"{lang} {n}" for lang, n in stats.languages[:8]) or "—"
     if len(stats.languages) > 8:
         languages += ", …"
@@ -118,5 +118,5 @@ def describe_index(refreshed: RefreshStats, stats: IndexStats) -> str:
         f"индекс проекта: {_files(stats.files)}, {_symbols(stats.symbols)}{refs}\n"
         f"  языки: {languages}\n"
         f"  {changes} ({refreshed.duration_s:.1f} с); "
-        f"размер {_size(stats.db_bytes)}"
+        f"размер {_size(stats.db_bytes)}" + (f"\n  ty: {ty_status}" if ty_status else "")
     )

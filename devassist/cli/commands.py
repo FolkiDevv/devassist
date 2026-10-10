@@ -21,6 +21,7 @@ from devassist.cli.models import ModelCatalog, describe_model, ensure_context_wi
 from devassist.cli.prompt import KEY_HELP
 from devassist.llm.base import LLMError
 from devassist.permissions import MODE_CYCLE, PermissionMode, parse_mode
+from devassist.project import semantic
 from devassist.project.index import ProjectIndex
 from devassist.ui.console import Console
 
@@ -241,10 +242,12 @@ def _index(ctx: CommandContext, arg: str) -> bool:
     if arg not in ("", "rebuild"):
         ctx.ui.error("использование: /index [rebuild]")
         return True
-    index = ProjectIndex(ctx.agent.workspace)
+    workspace = ctx.agent.workspace
+    index = ProjectIndex(workspace)
     result = run_indexing(index, ctx.ui, ctx.interrupt, rebuild=arg == "rebuild")
     if result is not None:
-        ctx.ui.info(describe_index(*result))
+        ty = semantic.status(workspace) if ctx.agent.config.ty else "выключен (DEVASSIST_TY=0)"
+        ctx.ui.info(describe_index(*result, ty_status=ty))
     return True
 
 

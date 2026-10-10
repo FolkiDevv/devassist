@@ -313,15 +313,16 @@ def test_imports_resolve_to_project_files(tmp_path):
 
 def test_refs_and_imports_follow_incremental_refresh(index, project):
     stats = index.refresh()
-    assert set(stats.changed_paths) == {
-        "app/agent.py",
-        "app/events.py",
-        "web/store.ts",
-        "README.md",
-    }
+    assert set(stats.added_paths) == {"app/agent.py", "app/events.py", "web/store.ts", "README.md"}
     _make(project, "app/main.py", "from app.agent import Agent\n\nAgent().run_turn()\n")
     stats = index.refresh()
-    assert stats.changed_paths == ("app/main.py",) and stats.removed_paths == ()
+    assert (stats.added_paths, stats.updated_paths, stats.removed_paths) == (
+        ("app/main.py",),
+        (),
+        (),
+    )
+    _bump(project / "app/main.py", "from app.agent import Agent\n\nAgent().run_turn(1)\n")
+    assert index.refresh().updated_paths == ("app/main.py",)
     assert index.find_refs("Agent.run_turn").total == 1
     assert index.stats().refs == 2
 

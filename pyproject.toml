@@ -20,6 +20,7 @@ dependencies = [
     "pydantic>=2.5",
     "rich>=13.0",
     "prompt_toolkit>=3.0.43",  # placeholder, create_pipe_input
+    "ty==0.0.86",  # LSP-сервер для точной навигации по Python; бета — пин точный
 ]
 
 [dependency-groups]

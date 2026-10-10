@@ -42,6 +42,35 @@ _COUNT_CAP = 10_000  # дальше совпадения не досчитыва
 # Ошибки, которые вызывающий код ловит при работе с индексом.
 INDEX_ERRORS: tuple[type[BaseException], ...] = (sqlite3.Error, OSError)
 
+# Подписчики на изменения файлов, замеченные обновлением индекса (корень проекта,
+# добавленные, изменённые и удалённые пути) — например, LSP-сервер, который сам за
+# файлами не следит. Обновление индекса — единственный детектор изменений.
+ChangeListener = Callable[[Path, tuple[str, ...], tuple[str, ...], tuple[str, ...]], None]
+_change_listeners: list[ChangeListener] = []
+
+
+def add_change_listener(listener: ChangeListener) -> None:
+    if listener not in _change_listeners:
+        _change_listeners.append(listener)
+
+
+def remove_change_listener(listener: ChangeListener) -> None:
+    if listener in _change_listeners:
+        _change_listeners.remove(listener)
+
+
+def _notify_changes(
+    root: Path, added: tuple[str, ...], updated: tuple[str, ...], removed: tuple[str, ...]
+) -> None:
+    if not (added or updated or removed):
+        return
+    for listener in list(_change_listeners):
+        try:
+            listener(root, added, updated, removed)
+        except Exception:  # подписчик не должен ломать обновление индекса
+            pass
+
+
 # Обобщённые виды для фильтра: "function" находит и методы и т.п.
 KIND_GROUPS: dict[str, tuple[str, ...]] = {
     "function": ("function", "method"),
@@ -127,7 +156,8 @@ class RefreshStats:
     updated: int = 0
     removed: int = 0
     duration_s: float = 0.0
-    changed_paths: tuple[str, ...] = ()  # добавленные и изменённые
+    added_paths: tuple[str, ...] = ()
+    updated_paths: tuple[str, ...] = ()
     removed_paths: tuple[str, ...] = ()
 
     @property
@@ -184,6 +214,7 @@ class RefsResult:
 class ImportEntry:
     module: str
     name: str
+    alias: str
     line: int
     target: str | None  # файл проекта, куда ведёт импорт (None — внешний/не найден)
 
@@ -348,7 +379,9 @@ class ProjectIndex:
         }
         scanned = added = updated = pending = 0
         seen: set[str] = set()
+        new: list[str] = []
         changed: list[str] = []
+        gone: list[str] = []
         try:
             if full:
                 with db:
@@ -374,7 +407,7 @@ class ProjectIndex:
                 if old == (st.st_size, st.st_mtime_ns):
                     continue
                 self._index_file(rel, path, st)
-                changed.append(rel)
+                (changed if rel in known else new).append(rel)
                 if rel not in known:
                     added += 1
                 else:
@@ -397,13 +430,16 @@ class ProjectIndex:
             raise
         finally:
             self._modules.clear()
+            # и при прерывании: лишнее уведомление безвредно, пропущенное — нет
+            _notify_changes(self.root, tuple(new), tuple(changed), tuple(gone))
         return RefreshStats(
             scanned=scanned,
             added=added,
             updated=updated,
             removed=len(gone),
             duration_s=time.monotonic() - started,
-            changed_paths=tuple(changed),
+            added_paths=tuple(new),
+            updated_paths=tuple(changed),
             removed_paths=tuple(gone),
         )
 
@@ -564,6 +600,30 @@ class ProjectIndex:
         ).fetchone()[0]
         return FileEntry(*row, symbols=count)
 
+    def symbol_at(self, rel_path: str, line: int) -> Symbol | None:
+        """Определение в строке ``line``, иначе самое вложенное, содержащее её."""
+        row = self._db.execute(
+            "SELECT name, kind, line, end_line, parent, depth, signature, doc, col FROM symbols "
+            "WHERE path = ? AND (line = ? OR (line < ? AND end_line >= ?)) "
+            "ORDER BY line = ? DESC, line DESC, depth DESC LIMIT 1",
+            (rel_path, line, line, line, line),
+        ).fetchone()
+        return _symbol(row) if row else None
+
+    def ref_at(self, rel_path: str, line: int, names: Iterable[str]) -> tuple[str, str] | None:
+        """(вид, область) использования одного из ``names`` в строке; вызов — первым."""
+        names = list(names)
+        if not names:
+            return None
+        marks = ",".join("?" * len(names))
+        row = self._db.execute(
+            "SELECT kind, scope FROM refs "
+            f"WHERE path = ? AND line = ? AND name IN ({marks}) "
+            "ORDER BY CASE kind WHEN 'call' THEN 0 WHEN 'attr' THEN 1 ELSE 2 END, col LIMIT 1",
+            (rel_path, line, *names),
+        ).fetchone()
+        return (row[0], row[1]) if row else None
+
     def outline(self, rel_path: str) -> list[Symbol]:
         """Определения файла в порядке строк."""
         rows = self._db.execute(
@@ -609,11 +669,12 @@ class ProjectIndex:
     def imports_of(self, rel_path: str) -> list[ImportEntry]:
         """Импорты файла с разрешёнными целями, в порядке строк."""
         rows = self._db.execute(
-            "SELECT module, name, line FROM imports WHERE path = ? ORDER BY line", (rel_path,)
+            "SELECT module, name, alias, line FROM imports WHERE path = ? ORDER BY line",
+            (rel_path,),
         ).fetchall()
         return [
-            ImportEntry(module, name, line, self._import_target(module, name))
-            for module, name, line in rows
+            ImportEntry(module, name, alias, line, self._import_target(module, name))
+            for module, name, alias, line in rows
         ]
 
     def imported_by(self, rel_path: str) -> list[tuple[str, int]]:
@@ -638,6 +699,23 @@ class ProjectIndex:
                     found[path] = line
         return sorted(found.items())
 
+    def definitions(self, query: str) -> list[SymbolHit]:
+        """Определения с точным именем (без учёта регистра): ``name`` или ``Class.method``."""
+        if not query.strip(" ."):
+            raise ValueError("пустой запрос")
+        name = _last_name(query)
+        hits, _ = self.find_symbols(query.strip(), limit=_COUNT_CAP)
+        return [h for h in hits if h.symbol.name.lower() == name.lower()]
+
+    def calls_in(self, rel_path: str, scope: str) -> list[tuple[str, int]]:
+        """Вызовы внутри определения ``scope`` (qualname): (имя, строка) по порядку."""
+        rows = self._db.execute(
+            "SELECT name, line FROM refs WHERE path = ? AND scope = ? AND kind = 'call' "
+            "ORDER BY line, col",
+            (rel_path, scope),
+        )
+        return [(name, line) for name, line in rows]
+
     def find_refs(
         self,
         query: str,
@@ -652,12 +730,8 @@ class ProjectIndex:
         точному имени найденных определений (или по самому запросу, если их нет).
         ``kind``: call, attr, name, import; None — все.
         """
-        query = query.strip()
-        if not query.strip("."):
-            raise ValueError("пустой запрос")
-        name = query.rsplit(".", 1)[-1] if "." in query.strip(".") else query.strip(".")
-        hits, _ = self.find_symbols(query, limit=_COUNT_CAP)
-        definitions = [h for h in hits if h.symbol.name.lower() == name.lower()]
+        definitions = self.definitions(query)
+        name = _last_name(query)
         names = sorted({h.symbol.name for h in definitions}) or [name]
         def_paths = {h.path for h in definitions}
         kinds = None if not kind else {kind.strip().lower()}
@@ -714,6 +788,11 @@ class ProjectIndex:
         )
         for path, language, lines, status, count in rows:
             yield FileEntry(path, language, lines, status, symbols=count)
+
+
+def _last_name(query: str) -> str:
+    query = query.strip().strip(".")
+    return query.rsplit(".", 1)[-1]
 
 
 def _module_suffixes(parts: list[str]) -> list[str]:

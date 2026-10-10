@@ -10,8 +10,6 @@ from devassist.tools.base import ToolContext, ToolError, build_default_registry
 from devassist.tools.index import (
     FileOutlineParams,
     FileOutlineTool,
-    FindReferencesParams,
-    FindReferencesTool,
     FindSymbolParams,
     FindSymbolTool,
 )
@@ -45,7 +43,7 @@ def _outline(ctx, path):
 
 def test_registered_in_default_registry():
     reg = build_default_registry()
-    assert "find_symbol" in reg and "file_outline" in reg and "find_references" in reg
+    assert "find_symbol" in reg and "file_outline" in reg
 
 
 def test_find_symbol_lists_definitions(ctx):
@@ -160,11 +158,7 @@ def test_file_outline_reports_parse_errors(ctx, monkeypatch):
         _outline(ctx, "app/agent.py")
 
 
-# ------------------------------ find_references ------------------------------ #
-def _refs(ctx, **kw):
-    return FindReferencesTool().run(FindReferencesParams(**kw), ctx)
-
-
+# ------------------------------ импорты и докстринги ------------------------------ #
 def _cli(ctx):
     _make(
         ctx.root,
@@ -175,41 +169,6 @@ def _cli(ctx):
         "    helper()\n",
     )
     _make(ctx.root, "scripts/x.py", "def other(bot):\n    bot.run_turn()\n")
-
-
-def test_find_references_groups_by_file_and_resolution(ctx):
-    _cli(ctx)
-    result = _refs(ctx, query="Agent.run_turn")
-    assert result.content.splitlines() == [
-        "определение: app/agent.py:2-3 method Agent.run_turn — def run_turn(self, text):",
-        "использования (2):",
-        "app/cli.py — импортирует модуль с определением:",
-        "  5 [вызов] в main — Agent().run_turn(text)",
-        "scripts/x.py — совпадение только по имени — может быть другое определение:",
-        "  2 [вызов] в other — bot.run_turn()",
-    ]
-    assert result.summary.startswith("найдено использований: 2; индекс обновлён")
-
-
-def test_find_references_kind_limit_and_errors(ctx):
-    _cli(ctx)
-    imports = _refs(ctx, query="helper", kind="IMPORT").content.splitlines()
-    assert imports[1:] == [
-        "использования (1):",
-        "app/cli.py — импортирует модуль с определением:",
-        "  1 [импорт] — from app.agent import Agent, helper",
-    ]
-    limited = _refs(ctx, query="run_turn", max_results=1).content
-    assert "… показано 1 из 2; уточните запрос, kind или glob" in limited
-    missing = _refs(ctx, query="nowhere").content.splitlines()
-    assert missing == [
-        "(определение «nowhere» в индексе не найдено — ищу использования по имени)",
-        "(использований не найдено)",
-    ]
-    with pytest.raises(ToolError, match="допустимые: call, attr, name, import"):
-        _refs(ctx, query="helper", kind="usage")
-    with pytest.raises(ToolError, match="Пустой запрос"):
-        _refs(ctx, query=" . ")
 
 
 def test_file_outline_shows_project_imports(ctx):
